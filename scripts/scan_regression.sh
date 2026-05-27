@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DCG="${PROJECT_DIR}/target/release/dcg"
-FIXTURES_DIR="${PROJECT_DIR}/tests/fixtures/scan"
+FIXTURES_DIR="${PROJECT_DIR}/crates/dcg-cli/tests/fixtures/scan"
 EXPECTED="${FIXTURES_DIR}/expected_output.json"
 ACTUAL="/tmp/dcg_scan_regression_actual.json"
 
