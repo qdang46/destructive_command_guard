@@ -199,15 +199,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-fuzz-smoke-
 
-      - name: Run heredoc fuzz smoke
+      - name: Run fuzz smoke test
         run: |
           cd fuzz
-          # Build/run the fuzzer for the gnu host target. AddressSanitizer is
-          # incompatible with musl's statically-linked libc (crt-static) and
-          # fails with "sanitizer is incompatible with statically linked libc";
-          # the default x86_64-unknown-linux-gnu (dynamic glibc) is the
-          # supported ASan target.
-          cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=30
+          cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
 
   coverage:
     runs-on: ubuntu-latest
@@ -659,7 +654,7 @@ jobs:
         id: bats
         run: |
           set +e
-          bats --tap tests/install/*.bats 2>&1 | tee bats-output.log
+          bats --tap crates/dcg-cli/tests/install/*.bats 2>&1 | tee bats-output.log
           EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
