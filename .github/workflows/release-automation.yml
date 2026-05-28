@@ -16,12 +16,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read version from Cargo.toml
+      - name: Read version from dcg-cli Cargo.toml
         id: version
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/dcg-cli/Cargo.toml | head -1)
           if [ -z "$version" ]; then
-            echo "::error::Unable to parse version from Cargo.toml"
+            echo "::error::Unable to parse version from crates/dcg-cli/Cargo.toml"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
