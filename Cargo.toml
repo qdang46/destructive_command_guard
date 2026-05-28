@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/dcg-core", "crates/dcg-cli"]
+members = ["crates/dcg-core", "crates/dcg-cli", "fuzz"]
 resolver = "2"
 
 # Workspace-level shared profiles. Cargo applies these to every member
