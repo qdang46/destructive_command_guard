@@ -6,8 +6,14 @@
 # - install.sh function extraction
 # - Utility functions for isolated testing
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# Compute the dir containing this file. When sourced by bats, BASH_SOURCE[0]
+# points here. Fall back to $0 (the bats invocation) for bare `bash test_helper.bash`.
+_sourced="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd "$(dirname "$_sourced")" && pwd)"
+
+# PROJECT_ROOT is four levels up from tests/install:
+#   tests/install -> dcg-cli -> crates -> <repo root>
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 INSTALL_SCRIPT="$PROJECT_ROOT/install.sh"
 UNINSTALL_SCRIPT="$PROJECT_ROOT/uninstall.sh"
 
