@@ -26,6 +26,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-05-25
           components: rustfmt, clippy
 
       - name: Install cargo-nextest
@@ -176,6 +177,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-05-25
           # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
           # because libFuzzer + AddressSanitizer require statically-linked
           # libc; without this target installed, the build fails with
@@ -212,6 +214,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-05-25
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -365,6 +368,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -483,6 +488,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -556,6 +563,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -630,6 +639,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -690,6 +701,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -827,6 +840,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -903,6 +918,8 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
         uses: actions/cache@v5
@@ -1066,6 +1083,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-05-25
           components: llvm-tools-preview
           # See fuzz-smoke job above — cargo-fuzz needs the musl target to
           # link libFuzzer + AddressSanitizer with a statically-linked libc.
