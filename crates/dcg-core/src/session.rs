@@ -64,6 +64,10 @@ pub struct Session {
     allow_once_cache: HashMap<String, AllowOnceEntry>,
     /// Command hash → number of times this exact command was denied.
     deny_counter: HashMap<String, u32>,
+    /// Number of consecutive denials since last allow.
+    consecutive_denials: u32,
+    /// Total number of denials in this session.
+    total_denials: u32,
 }
 
 impl Default for Session {
@@ -82,6 +86,8 @@ impl Session {
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             allow_once_cache: HashMap::new(),
             deny_counter: HashMap::new(),
+            consecutive_denials: 0,
+            total_denials: 0,
         }
     }
 
@@ -94,6 +100,8 @@ impl Session {
             working_dir,
             allow_once_cache: HashMap::new(),
             deny_counter: HashMap::new(),
+            consecutive_denials: 0,
+            total_denials: 0,
         }
     }
 
@@ -105,6 +113,8 @@ impl Session {
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             allow_once_cache: HashMap::new(),
             deny_counter: HashMap::new(),
+            consecutive_denials: 0,
+            total_denials: 0,
         }
     }
 
@@ -179,9 +189,41 @@ impl Session {
     /// Increments the deny counter for `command` and returns the new count.
     pub fn bump_deny_counter(&mut self, command: &str) -> u32 {
         let key = hash_command(command);
-        let entry = self.deny_counter.entry(key).or_insert(0);
-        *entry += 1;
-        *entry
+        let count = {
+            let entry = self.deny_counter.entry(key).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        self.bump_consecutive_denials();
+        count
+    }
+
+    /// Resets the consecutive denials counter to zero.
+    pub fn reset_consecutive_denials(&mut self) {
+        self.consecutive_denials = 0;
+    }
+
+    /// Returns the number of consecutive denials since last allow.
+    #[must_use]
+    pub fn consecutive_denials(&self) -> u32 {
+        self.consecutive_denials
+    }
+
+    /// Returns the total number of denials in this session.
+    #[must_use]
+    pub fn total_denials(&self) -> u32 {
+        self.total_denials
+    }
+
+    /// Increments both consecutive and total denial counters.
+    pub fn bump_consecutive_denials(&mut self) {
+        self.consecutive_denials += 1;
+        self.total_denials += 1;
+    }
+
+    /// Resets consecutive denials to zero (called on allow).
+    pub fn reset_on_allow(&mut self) {
+        self.consecutive_denials = 0;
     }
 
     /// Returns the deny counter for `command` without modifying it.

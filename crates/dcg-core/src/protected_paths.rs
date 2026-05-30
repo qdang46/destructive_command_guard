@@ -11,10 +11,39 @@
 
 use std::path::{Path, PathBuf};
 
-/// Compiled list of protected-path prefixes.
+/// Severity level for protected paths.
+///
+/// Controls whether a path prompts even in `BypassPermissions` mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProtectedSeverity {
+    /// Prompt always, even in `BypassPermissions` mode (e.g., ~/.ssh/, credentials/)
+    PromptAlways,
+    /// Prompt in non-bypass modes, allow in `BypassPermissions`
+    PromptInNonBypass,
+    /// Allow in `BypassPermissions`, deny in strict modes
+    AllowInBypass,
+}
+
+/// A single protected path entry with its associated severity level.
+#[derive(Clone, Debug)]
+pub struct ProtectedPathEntry {
+    /// The path prefix to match against.
+    pub prefix: PathBuf,
+    /// The severity level determining behavior in `BypassPermissions` mode.
+    pub severity: ProtectedSeverity,
+}
+
+impl ProtectedPathEntry {
+    /// Create a new entry with the given prefix and severity.
+    pub fn new(prefix: PathBuf, severity: ProtectedSeverity) -> Self {
+        Self { prefix, severity }
+    }
+}
+
+/// Compiled list of protected-path prefixes with severity levels.
 #[derive(Debug, Clone, Default)]
 pub struct ProtectedPaths {
-    prefixes: Vec<PathBuf>,
+    entries: Vec<ProtectedPathEntry>,
 }
 
 impl ProtectedPaths {
@@ -24,6 +53,8 @@ impl ProtectedPaths {
     /// `<working_dir>/.git`). `~/...` entries expand using
     /// [`dirs::home_dir`]; if the home directory cannot be determined, the
     /// raw entry is kept verbatim as a best-effort fallback.
+    ///
+    /// All entries default to `ProtectedSeverity::PromptInNonBypass`.
     #[must_use]
     pub fn new<I, S>(entries: I, working_dir: &Path) -> Self
     where
@@ -31,45 +62,85 @@ impl ProtectedPaths {
         S: AsRef<str>,
     {
         let home = dirs::home_dir();
-        let prefixes = entries
+        let entries: Vec<ProtectedPathEntry> = entries
             .into_iter()
-            .map(|s| expand(s.as_ref(), working_dir, home.as_deref()))
+            .map(|s| {
+                let prefix = expand(s.as_ref(), working_dir, home.as_deref());
+                ProtectedPathEntry::new(prefix, ProtectedSeverity::PromptInNonBypass)
+            })
             .collect();
-        Self { prefixes }
+        Self { entries }
+    }
+
+    /// Build from explicit entries with severity levels.
+    #[must_use]
+    pub fn with_entries(entries: Vec<ProtectedPathEntry>) -> Self {
+        Self { entries }
     }
 
     /// Replace the working-dir anchor for already-loaded entries. Useful when
     /// a consumer wants to switch project root without rebuilding.
     pub fn rebuild(&mut self, raw_entries: &[String], working_dir: &Path) {
         let home = dirs::home_dir();
-        self.prefixes = raw_entries
+        self.entries = raw_entries
             .iter()
-            .map(|s| expand(s.as_str(), working_dir, home.as_deref()))
+            .map(|s| {
+                let prefix = expand(s.as_str(), working_dir, home.as_deref());
+                ProtectedPathEntry::new(prefix, ProtectedSeverity::PromptInNonBypass)
+            })
             .collect();
     }
 
     /// Returns the compiled prefix list. Mostly for diagnostics.
     #[must_use]
-    pub fn prefixes(&self) -> &[PathBuf] {
-        &self.prefixes
+    pub fn prefixes(&self) -> Vec<PathBuf> {
+        self.entries.iter().map(|e| e.prefix.clone()).collect()
     }
 
     /// `true` if `path` lies inside any protected prefix.
     ///
     /// Comparison is done on canonicalized paths when canonicalization
     /// succeeds; otherwise the raw paths are compared component-wise.
+    ///
+    /// Note: This method returns `true` for any protected path.
+    /// For severity-aware checking, use [`Self::check_severity`].
     #[must_use]
     pub fn contains(&self, path: &Path) -> bool {
-        if self.prefixes.is_empty() {
-            return false;
+        self.check_severity(path).is_some()
+    }
+
+    /// Check the severity of a path if it matches any protected entry.
+    ///
+    /// Returns `Some(ProtectedSeverity)` if the path matches a protected entry,
+    /// or `None` if the path is not protected.
+    ///
+    /// This is the primary method for determining how to handle a path
+    /// in `BypassPermissions` mode.
+    #[must_use]
+    pub fn check_severity(&self, path: &Path) -> Option<ProtectedSeverity> {
+        if self.entries.is_empty() {
+            return None;
         }
         let canon = path.canonicalize().ok();
         let target: &Path = canon.as_deref().unwrap_or(path);
-        self.prefixes.iter().any(|prefix| {
-            let prefix_canon = prefix.canonicalize().ok();
-            let prefix_target: &Path = prefix_canon.as_deref().unwrap_or(prefix);
-            starts_with_path(target, prefix_target)
+        self.entries.iter().find_map(|entry| {
+            let prefix_canon = entry.prefix.canonicalize().ok();
+            let prefix_target: &Path = prefix_canon.as_deref().unwrap_or(&entry.prefix);
+            if starts_with_path(target, prefix_target) {
+                Some(entry.severity)
+            } else {
+                None
+            }
         })
+    }
+
+    /// Check if a path matches any protected entry with `PromptAlways` severity.
+    ///
+    /// This is a convenience method for the common case of checking whether
+    /// a path should prompt even in `BypassPermissions` mode.
+    #[must_use]
+    pub fn is_prompt_always(&self, path: &Path) -> bool {
+        self.check_severity(path) == Some(ProtectedSeverity::PromptAlways)
     }
 }
 

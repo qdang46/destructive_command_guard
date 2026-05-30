@@ -111,6 +111,15 @@ impl ToolCall {
             method: method.into(),
         }
     }
+
+    /// Returns the command string if this is a Bash call.
+    #[must_use]
+    pub fn command_string(&self) -> Option<&str> {
+        match self {
+            Self::Bash { cmd } => Some(cmd),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

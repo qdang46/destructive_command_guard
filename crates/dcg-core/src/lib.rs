@@ -41,18 +41,26 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dangerous_patterns;
 pub mod decision;
 pub mod effect;
 pub mod engine;
+pub mod escalation;
 pub mod mode;
 pub mod protected_paths;
+pub mod safe_whitelist;
 pub mod session;
+pub mod strictness;
 pub mod tool_call;
 
+pub use dangerous_patterns::{DangerousMatch, DangerousPatternRegistry, Severity};
 pub use decision::Decision;
 pub use effect::{Effect, is_subset as is_effect_subset};
 pub use engine::{Engine, EngineConfig, EngineConfigBuilder};
+pub use escalation::DenialConfig;
 pub use mode::{Mode, ModePreCheck};
-pub use protected_paths::ProtectedPaths;
+pub use protected_paths::{ProtectedPathEntry, ProtectedPaths, ProtectedSeverity};
+pub use safe_whitelist::SafeCommandWhitelist;
 pub use session::{ALLOW_ONCE_CODE_LEN, ALLOW_ONCE_TTL, AllowOnceEntry, Session};
+pub use strictness::{apply_strictness, Strictness};
 pub use tool_call::ToolCall;
