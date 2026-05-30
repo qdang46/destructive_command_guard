@@ -4983,6 +4983,7 @@ mod tests {
             Some("containers.docker"),
             Some("image-prune"),
             Some(crate::packs::Severity::Medium),
+            None,
         );
         assert_eq!(
             mode,
@@ -4995,6 +4996,7 @@ mod tests {
             Some("core.git"),
             Some("reset-hard"),
             Some(crate::packs::Severity::Critical),
+            None,
         );
         assert_eq!(
             critical_mode,

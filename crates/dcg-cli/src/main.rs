@@ -642,7 +642,7 @@ fn main() {
         MatchSource::Pack | MatchSource::HeredocAst => {
             config
                 .policy()
-                .resolve_mode(pack, info.pattern_name.as_deref(), info.severity)
+                .resolve_mode(pack, info.pattern_name.as_deref(), info.severity, None)
         }
         // Never downgrade explicit blocks.
         MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,

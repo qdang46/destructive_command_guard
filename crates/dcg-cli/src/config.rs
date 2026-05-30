@@ -1436,6 +1436,13 @@ pub struct PolicyConfig {
     /// Takes precedence over pack-level and global overrides.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub rules: std::collections::HashMap<String, PolicyMode>,
+
+    /// Per-tool mode overrides.
+    /// Key is the tool kind (e.g., "bash", "edit", "write", "read", "network").
+    /// Value is the mode to use for all rules triggered by that tool kind.
+    /// Takes precedence over pack-level and rule-level overrides for the matching tool.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub tools: std::collections::HashMap<String, PolicyMode>,
 }
 
 /// Policy mode for overriding default decision behavior.
@@ -1476,8 +1483,9 @@ impl PolicyConfig {
         pack_id: Option<&str>,
         pattern_name: Option<&str>,
         severity: Option<crate::packs::Severity>,
+        tool_kind: Option<&str>,
     ) -> crate::packs::DecisionMode {
-        self.resolve_mode_at(Utc::now(), pack_id, pattern_name, severity)
+        self.resolve_mode_at(Utc::now(), pack_id, pattern_name, severity, tool_kind)
     }
 
     #[must_use]
@@ -1487,8 +1495,20 @@ impl PolicyConfig {
         pack_id: Option<&str>,
         pattern_name: Option<&str>,
         severity: Option<crate::packs::Severity>,
+        tool_kind: Option<&str>,
     ) -> crate::packs::DecisionMode {
-        // 1. Rule-specific override
+        // 1. Per-tool override applies to all rules triggered by that tool kind.
+        // This is the strongest override — tool-level config overrides everything
+        // except the Critical safety floor (Critical always denies regardless).
+        if let Some(tool) = tool_kind {
+            if let Some(mode) = self.tools.get(tool) {
+                if !matches!(severity, Some(crate::packs::Severity::Critical)) {
+                    return mode.to_decision_mode();
+                }
+            }
+        }
+
+        // 2. Rule-specific override
         if let (Some(pack), Some(pattern)) = (pack_id, pattern_name) {
             let rule_id = format!("{pack}:{pattern}");
             if let Some(mode) = self.rules.get(&rule_id) {
@@ -1502,14 +1522,14 @@ impl PolicyConfig {
             return crate::packs::DecisionMode::Deny;
         }
 
-        // 2. Pack-specific override
+        // 3. Pack-specific override
         if let Some(pack) = pack_id {
             if let Some(mode) = self.packs.get(pack) {
                 return mode.to_decision_mode();
             }
         }
 
-        // 3. Global default (optionally gated by observe_until)
+        // 4. Global default (optionally gated by observe_until)
         let effective_default_mode = self
             .observe_until
             .as_ref()
@@ -1526,7 +1546,7 @@ impl PolicyConfig {
             return mode.to_decision_mode();
         }
 
-        // 4. Severity-based default
+        // 5. Severity-based default
         severity.map_or(crate::packs::DecisionMode::Deny, |s| s.default_mode())
     }
 }
@@ -6529,6 +6549,7 @@ enabled = false
             Some("core.git"),
             Some("reset-hard"),
             Some(crate::packs::Severity::High),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Log);
     }
@@ -6541,11 +6562,11 @@ enabled = false
             ..Default::default()
         };
 
-        // No rule override, so pack override wins
         let mode = policy.resolve_mode(
             Some("core.git"),
             Some("push-force"),
             Some(crate::packs::Severity::High),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Warn);
     }
@@ -6557,11 +6578,11 @@ enabled = false
             ..Default::default()
         };
 
-        // No pack override, so global default wins
         let mode = policy.resolve_mode(
             Some("containers.docker"),
             Some("prune"),
             Some(crate::packs::Severity::Medium),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Log);
     }
@@ -6570,27 +6591,27 @@ enabled = false
     fn test_policy_resolve_mode_severity_default_when_nothing_set() {
         let policy = PolicyConfig::default();
 
-        // High severity defaults to Deny
         let mode_high = policy.resolve_mode(
             Some("core.git"),
             Some("reset-hard"),
             Some(crate::packs::Severity::High),
+            None,
         );
         assert_eq!(mode_high, crate::packs::DecisionMode::Deny);
 
-        // Medium severity defaults to Warn
         let mode_medium = policy.resolve_mode(
             Some("core.git"),
             Some("something"),
             Some(crate::packs::Severity::Medium),
+            None,
         );
         assert_eq!(mode_medium, crate::packs::DecisionMode::Warn);
 
-        // Low severity defaults to Log
         let mode_low = policy.resolve_mode(
             Some("core.git"),
             Some("something"),
             Some(crate::packs::Severity::Low),
+            None,
         );
         assert_eq!(mode_low, crate::packs::DecisionMode::Log);
     }
@@ -6602,11 +6623,11 @@ enabled = false
             .packs
             .insert("core.git".to_string(), PolicyMode::Warn);
 
-        // Critical severity should ALWAYS be Deny, even with pack override
         let mode = policy.resolve_mode(
             Some("core.git"),
             Some("reset-hard"),
             Some(crate::packs::Severity::Critical),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Deny);
     }
@@ -6618,11 +6639,11 @@ enabled = false
             ..Default::default()
         };
 
-        // Critical severity should ALWAYS be Deny, even with global override
         let mode = policy.resolve_mode(
             Some("core.git"),
             Some("reset-hard"),
             Some(crate::packs::Severity::Critical),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Deny);
     }
@@ -6634,11 +6655,11 @@ enabled = false
             .rules
             .insert("core.git:reset-hard".to_string(), PolicyMode::Warn);
 
-        // Critical CAN be loosened via explicit per-rule override
         let mode = policy.resolve_mode(
             Some("core.git"),
             Some("reset-hard"),
             Some(crate::packs::Severity::Critical),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Warn);
     }
@@ -6647,8 +6668,36 @@ enabled = false
     fn test_policy_resolve_mode_no_severity_defaults_to_deny() {
         let policy = PolicyConfig::default();
 
-        // No severity provided should default to Deny
-        let mode = policy.resolve_mode(Some("core.git"), Some("pattern"), None);
+        let mode = policy.resolve_mode(Some("core.git"), Some("pattern"), None, None);
+        assert_eq!(mode, crate::packs::DecisionMode::Deny);
+    }
+
+    #[test]
+    fn test_policy_resolve_mode_tool_override_wins_over_pack() {
+        let mut policy = PolicyConfig::default();
+        policy.packs.insert("core.git".to_string(), PolicyMode::Warn);
+        policy.tools.insert("bash".to_string(), PolicyMode::Log);
+
+        let mode = policy.resolve_mode(
+            Some("core.git"),
+            Some("reset-hard"),
+            Some(crate::packs::Severity::High),
+            Some("bash"),
+        );
+        assert_eq!(mode, crate::packs::DecisionMode::Log);
+    }
+
+    #[test]
+    fn test_policy_resolve_mode_tool_override_respects_critical_floor() {
+        let mut policy = PolicyConfig::default();
+        policy.tools.insert("bash".to_string(), PolicyMode::Warn);
+
+        let mode = policy.resolve_mode(
+            Some("core.git"),
+            Some("reset-hard"),
+            Some(crate::packs::Severity::Critical),
+            Some("bash"),
+        );
         assert_eq!(mode, crate::packs::DecisionMode::Deny);
     }
 

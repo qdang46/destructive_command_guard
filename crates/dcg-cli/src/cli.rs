@@ -3772,7 +3772,7 @@ fn resolve_mode_for_cli(
 
     let mut mode = match info.source {
         MatchSource::Pack | MatchSource::HeredocAst => {
-            config.policy().resolve_mode(pack, pattern, info.severity)
+            config.policy().resolve_mode(pack, pattern, info.severity, None)
         }
         MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
     };

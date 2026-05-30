@@ -532,7 +532,7 @@ fn resolve_severity_and_rule_id(
         MatchSource::Pack | MatchSource::HeredocAst => {
             config
                 .policy()
-                .resolve_mode(Some(pack_id), Some(pattern_name), severity)
+                .resolve_mode(Some(pack_id), Some(pattern_name), severity, None)
         }
         MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
     };
