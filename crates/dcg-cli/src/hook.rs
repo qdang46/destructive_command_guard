@@ -558,12 +558,32 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return HookProtocol::Codex;
     }
 
+    // PowerShell tool names ("powershell"/"pwsh") are only ever emitted by
+    // Codex-style payloads -- Claude Code's shell tool is always "Bash" (or
+    // "launch-process"), never a PowerShell name, so this cannot collide with
+    // Claude Code. On Windows, Codex drives commands through PowerShell but
+    // does not always populate `turn_id` (issue #125), so the turn_id-gated
+    // check above misses it and the destructive command would otherwise slip
+    // through as a non-blocking ClaudeCompatible result (exit 0 + JSON that
+    // Codex's strict parser drops). Classify a PowerShell tool name as Codex
+    // unconditionally so the exit-2 deny path -- the one that actually blocks
+    // under Codex -- is used. (`bash`/`launch-process` stay turn_id-gated
+    // because Claude Code legitimately uses those names.)
+    let is_powershell_tool = matches!(tool_name.as_str(), "powershell" | "pwsh");
+    if is_powershell_tool {
+        return HookProtocol::Codex;
+    }
+
     // --- Claude-compatible indicators ---
     // Claude Code uses tool_name="Bash" or "launch-process"; Codex-style
-    // shell payloads can also use PowerShell names. These tool names are not
-    // Gemini's shell tool names, so check them before Gemini envelope fields.
-    // Claude Code payloads also include session_id/cwd/transcript_path, which
-    // would otherwise trigger a false Gemini classification (issue #77).
+    // shell payloads can also use PowerShell names (handled above). These
+    // tool names are not Gemini's shell tool names, so check them before
+    // Gemini envelope fields. Claude Code payloads also include
+    // session_id/cwd/transcript_path, which would otherwise trigger a false
+    // Gemini classification (issue #77).
+    // NOTE: "powershell"/"pwsh" are included in is_claude_compatible_shell_tool
+    // but will never reach this branch because they are unconditionally
+    // classified as Codex by the PowerShell-specific check above.
     if is_claude_compatible_shell_tool {
         return HookProtocol::ClaudeCompatible;
     }
@@ -1646,6 +1666,50 @@ mod tests {
         }"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_powershell_tool_without_turn_id_is_codex() {
+        // issue #125: on Windows, Codex drives shell commands through
+        // PowerShell but does not always send `turn_id`. Without the
+        // PowerShell-name fallback this payload would be classified as
+        // ClaudeCompatible (exit 0 + JSON that Codex's strict parser drops),
+        // letting the destructive command through. A PowerShell tool name is
+        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so it
+        // must classify as Codex even with no turn_id.
+        for tool in ["powershell", "pwsh", "PowerShell", "PWSH"] {
+            let json = format!(
+                r#"{{"tool_name":"{tool}","tool_input":{{"command":"git reset --hard HEAD~1"}}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::Codex,
+                "PowerShell tool_name {tool:?} must be treated as Codex (issue #125)"
+            );
+            assert_eq!(
+                extract_command(&input),
+                Some("git reset --hard HEAD~1".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_bash_without_turn_id_stays_claude_compatible() {
+        // Regression guard for the #125 fix: only PowerShell names get the
+        // unconditional-Codex treatment. `bash`/`launch-process` are shared
+        // with Claude Code, so without a turn_id they must stay
+        // ClaudeCompatible rather than being mis-flipped to Codex.
+        for tool in ["Bash", "bash", "launch-process"] {
+            let json =
+                format!(r#"{{"tool_name":"{tool}","tool_input":{{"command":"git status"}}}}"#);
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::ClaudeCompatible,
+                "{tool:?} without turn_id must stay ClaudeCompatible"
+            );
+        }
     }
 
     #[test]
