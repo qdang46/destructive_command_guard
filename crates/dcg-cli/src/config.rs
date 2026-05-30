@@ -6542,6 +6542,7 @@ enabled = false
                 "core.git:reset-hard".to_string(),
                 PolicyMode::Log,
             )]),
+            tools: std::collections::HashMap::default(),
         };
 
         // Rule-specific override should win
@@ -6757,14 +6758,13 @@ enabled = false
             policy: Some(PolicyConfig {
                 default_mode: Some(PolicyMode::Warn),
                 observe_until: ObserveUntil::parse("2030-01-01T00:00:00Z"),
-                packs: std::collections::HashMap::from([(
-                    "containers.docker".to_string(),
-                    PolicyMode::Log,
-                )]),
-                rules: std::collections::HashMap::from([(
-                    "core.git:reset-hard".to_string(),
-                    PolicyMode::Log,
-                )]),
+                packs: std::collections::HashMap::from([
+                    ("containers.docker".to_string(), PolicyMode::Log),
+                ]),
+                rules: std::collections::HashMap::from([
+                    ("core.git:reset-hard".to_string(), PolicyMode::Log),
+                ]),
+                tools: std::collections::HashMap::default(),
             }),
             ..Default::default()
         };
@@ -6836,6 +6836,7 @@ enabled = false
             Some("core.git"),
             Some("push-force-long"),
             Some(crate::packs::Severity::High),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Warn);
     }
@@ -6857,6 +6858,7 @@ enabled = false
             Some("core.git"),
             Some("push-force-long"),
             Some(crate::packs::Severity::High),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Deny);
     }
@@ -6878,6 +6880,7 @@ enabled = false
             Some("core.git"),
             Some("reset-hard"),
             Some(crate::packs::Severity::Critical),
+            None,
         );
         assert_eq!(mode, crate::packs::DecisionMode::Deny);
     }
