@@ -71,3 +71,40 @@ reason = "allowed explicitly"
         "Expected empty output for allowed command"
     );
 }
+
+// Regression test for dcg#132: dcg used to block `ee preflight check --cmd
+// "<destructive>"` because it substring-matched the destructive verb inside
+// the analyzed argument. The argument is consumed as data by `ee`, not
+// executed, so the call must be allowed through built-in inspection-wrapper
+// exemption — WITHOUT requiring the user to maintain an allowlist entry.
+#[test]
+fn test_ee_preflight_check_with_destructive_cmd_argument_is_allowed_builtin() {
+    // No allowlist content — relying entirely on the built-in exemption.
+    let cmd = "ee preflight check --cmd \"git reset --hard HEAD~5\"";
+    let output = run_hook_with_allowlist(cmd, "");
+
+    assert!(
+        !output.contains("deny"),
+        "Built-in inspection-wrapper exemption should allow `ee preflight check --cmd <destructive>`, but got denial: {output}",
+    );
+    assert!(
+        output.is_empty(),
+        "Expected empty output for built-in inspection-wrapper exemption, got: {output}",
+    );
+}
+
+// Regression test for dcg#132 anti-bypass: chaining a real destructive
+// command after the inspected argument must still block, because at that
+// point the destructive verb is no longer purely data.
+#[test]
+fn test_ee_preflight_check_with_chained_destructive_tail_is_still_blocked() {
+    // No allowlist content — verifying default deny semantics still hold for
+    // a chained command after the inspection wrapper.
+    let cmd = "ee preflight check --cmd \"true\" ; rm -rf /";
+    let output = run_hook_with_allowlist(cmd, "");
+
+    assert!(
+        output.contains("deny") || output.contains("permissionDecision"),
+        "Chained destructive tail must still be blocked even after an inspection wrapper, but got: {output}",
+    );
+}
