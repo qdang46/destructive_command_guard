@@ -47,6 +47,7 @@ pub mod effect;
 pub mod engine;
 pub mod escalation;
 pub mod mode;
+pub mod network_policy;
 pub mod protected_paths;
 pub mod safe_whitelist;
 pub mod session;
@@ -59,6 +60,9 @@ pub use effect::{Effect, is_subset as is_effect_subset};
 pub use engine::{Engine, EngineConfig, EngineConfigBuilder};
 pub use escalation::DenialConfig;
 pub use mode::{Mode, ModePreCheck};
+pub use network_policy::{
+    default_policy, NetworkPolicy, NetworkSeverity,
+};
 pub use protected_paths::{ProtectedPathEntry, ProtectedPaths, ProtectedSeverity};
 pub use safe_whitelist::SafeCommandWhitelist;
 pub use session::{ALLOW_ONCE_CODE_LEN, ALLOW_ONCE_TTL, AllowOnceEntry, Session};

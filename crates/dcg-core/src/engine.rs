@@ -8,6 +8,7 @@ use crate::decision::Decision;
 use crate::effect::Effect;
 use crate::escalation::DenialConfig;
 use crate::mode::{Mode, ModePreCheck};
+use crate::network_policy::NetworkPolicy;
 use crate::protected_paths::ProtectedPaths;
 use crate::safe_whitelist::SafeCommandWhitelist;
 use crate::session::Session;
@@ -101,6 +102,7 @@ pub struct Engine {
     safe_whitelist: SafeCommandWhitelist,
     dangerous_registry: DangerousPatternRegistry,
     denial_config: DenialConfig,
+    network_policy: NetworkPolicy,
 }
 
 impl Engine {
@@ -110,23 +112,27 @@ impl Engine {
             config.protected_paths_raw.iter().cloned(),
             &config.working_dir,
         );
+        let network_policy = NetworkPolicy::new();
         Self {
             config: config.clone(),
             protected,
             safe_whitelist: SafeCommandWhitelist::new(),
             dangerous_registry: DangerousPatternRegistry::new(),
             denial_config: DenialConfig::default(),
+            network_policy,
         }
     }
 
     #[must_use]
     pub fn with_protected(config: EngineConfig, protected: ProtectedPaths) -> Self {
+        let network_policy = NetworkPolicy::new();
         Self {
             config: config.clone(),
             protected,
             safe_whitelist: SafeCommandWhitelist::new(),
             dangerous_registry: DangerousPatternRegistry::new(),
             denial_config: DenialConfig::default(),
+            network_policy,
         }
     }
 
@@ -143,6 +149,11 @@ impl Engine {
     #[must_use]
     pub fn strictness(&self) -> Strictness {
         self.config.strictness
+    }
+
+    #[must_use]
+    pub fn network_policy(&self) -> &NetworkPolicy {
+        &self.network_policy
     }
 
     pub fn evaluate(
@@ -205,6 +216,7 @@ impl Engine {
                 &self.safe_whitelist,
                 &self.dangerous_registry,
                 &self.denial_config,
+                &self.network_policy,
             ),
         }
     }
@@ -218,10 +230,57 @@ impl Engine {
         safe_whitelist: &SafeCommandWhitelist,
         dangerous_registry: &DangerousPatternRegistry,
         denial_config: &DenialConfig,
+        network_policy: &NetworkPolicy,
     ) -> Decision {
         let is_strict = strictness.is_strict();
         let strict_mode_active = is_strict && mode.fallthrough_allows();
         let is_network_effect = effects.iter().any(|e| *e == Effect::Network);
+
+        // =====================================================================
+        // Phase 2.8: Network policy check — runs before other fallthrough logic
+        // =====================================================================
+        if let ToolCall::Network { url, method } = tool {
+            let severity = network_policy.evaluate_url(url);
+            let short_code = format!("net:{}:{}", method.to_lowercase(), {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                url.hash(&mut h);
+                format!("{:x}", h.finish() & 0xFFFF)
+            });
+
+            match severity {
+                crate::network_policy::NetworkSeverity::Allowed => {
+                    session.reset_on_allow();
+                    return Decision::Allow;
+                }
+                crate::network_policy::NetworkSeverity::Suspicious => {
+                    session.bump_deny_counter(&tool_repr(tool));
+                    // network_escalates_to_prompt overrides strict mode to allow prompting instead of denying
+                    if strictness.network_escalates_to_prompt {
+                        return Decision::prompt(
+                            format!("network: suspicious destination ({url})"),
+                            short_code,
+                        );
+                    }
+                    if strict_mode_active {
+                        return Decision::deny(format!("network: suspicious destination ({url}) [strict mode]"));
+                    }
+                    return Decision::prompt(
+                        format!("network: suspicious destination ({url})"),
+                        short_code,
+                    );
+                }
+                crate::network_policy::NetworkSeverity::Dangerous => {
+                    session.bump_deny_counter(&tool_repr(tool));
+                    return Decision::deny(format!("network: denied destination ({url})"));
+                }
+                crate::network_policy::NetworkSeverity::Exfiltration => {
+                    session.bump_deny_counter(&tool_repr(tool));
+                    return Decision::deny(format!("network: exfiltration pattern detected ({url})"));
+                }
+            }
+        }
 
         if mode.fallthrough_allows() {
             if let Some(cmd) = tool.command_string() {
