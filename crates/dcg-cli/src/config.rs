@@ -6676,7 +6676,9 @@ enabled = false
     #[test]
     fn test_policy_resolve_mode_tool_override_wins_over_pack() {
         let mut policy = PolicyConfig::default();
-        policy.packs.insert("core.git".to_string(), PolicyMode::Warn);
+        policy
+            .packs
+            .insert("core.git".to_string(), PolicyMode::Warn);
         policy.tools.insert("bash".to_string(), PolicyMode::Log);
 
         let mode = policy.resolve_mode(
@@ -6758,12 +6760,14 @@ enabled = false
             policy: Some(PolicyConfig {
                 default_mode: Some(PolicyMode::Warn),
                 observe_until: ObserveUntil::parse("2030-01-01T00:00:00Z"),
-                packs: std::collections::HashMap::from([
-                    ("containers.docker".to_string(), PolicyMode::Log),
-                ]),
-                rules: std::collections::HashMap::from([
-                    ("core.git:reset-hard".to_string(), PolicyMode::Log),
-                ]),
+                packs: std::collections::HashMap::from([(
+                    "containers.docker".to_string(),
+                    PolicyMode::Log,
+                )]),
+                rules: std::collections::HashMap::from([(
+                    "core.git:reset-hard".to_string(),
+                    PolicyMode::Log,
+                )]),
                 tools: std::collections::HashMap::default(),
             }),
             ..Default::default()

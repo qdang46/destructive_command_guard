@@ -1,5 +1,5 @@
 //! Tests for denial escalation — Phase 2.3
-use dcg_core::{DenialConfig, Engine, EngineConfig, Mode, Session, ToolCall, Effect};
+use dcg_core::{DenialConfig, Effect, Engine, EngineConfig, Mode, Session, ToolCall};
 
 #[test]
 fn test_default_escalation_thresholds() {
@@ -37,7 +37,7 @@ fn test_session_consecutive_denials() {
     let mut session = Session::with_id("test");
     assert_eq!(session.consecutive_denials(), 0);
     assert_eq!(session.total_denials(), 0);
-    
+
     session.bump_consecutive_denials();
     session.bump_consecutive_denials();
     assert_eq!(session.consecutive_denials(), 2);
@@ -50,7 +50,7 @@ fn test_session_reset_on_allow() {
     session.bump_consecutive_denials();
     session.bump_consecutive_denials();
     assert_eq!(session.consecutive_denials(), 2);
-    
+
     session.reset_on_allow();
     assert_eq!(session.consecutive_denials(), 0);
     assert_eq!(session.total_denials(), 2);
@@ -58,19 +58,27 @@ fn test_session_reset_on_allow() {
 
 #[test]
 fn test_escalation_triggers_prompt() {
-    let config = EngineConfig::builder()
-        .working_dir("/work")
-        .build();
+    let config = EngineConfig::builder().working_dir("/work").build();
     let engine = Engine::new(config);
     let mut session = Session::with_id("test");
-    
+
     // 2 denials should not escalate
     for _ in 0..2 {
-        let d = engine.evaluate(&mut session, &ToolCall::bash("unknown-cmd"), Mode::DontAsk, &[Effect::Read]);
+        let d = engine.evaluate(
+            &mut session,
+            &ToolCall::bash("unknown-cmd"),
+            Mode::DontAsk,
+            &[Effect::Read],
+        );
         assert!(d.is_deny(), "Expected deny, got {d:?}");
     }
-    
+
     // 3rd denial should escalate to prompt (consecutive >= max_consecutive)
-    let d = engine.evaluate(&mut session, &ToolCall::bash("another-unknown"), Mode::DontAsk, &[Effect::Read]);
+    let d = engine.evaluate(
+        &mut session,
+        &ToolCall::bash("another-unknown"),
+        Mode::DontAsk,
+        &[Effect::Read],
+    );
     assert!(d.is_prompt(), "Expected prompt after escalation, got {d:?}");
 }

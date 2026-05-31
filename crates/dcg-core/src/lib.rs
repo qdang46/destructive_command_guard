@@ -62,5 +62,5 @@ pub use mode::{Mode, ModePreCheck};
 pub use protected_paths::{ProtectedPathEntry, ProtectedPaths, ProtectedSeverity};
 pub use safe_whitelist::SafeCommandWhitelist;
 pub use session::{ALLOW_ONCE_CODE_LEN, ALLOW_ONCE_TTL, AllowOnceEntry, Session};
-pub use strictness::{apply_strictness, Strictness};
+pub use strictness::{Strictness, apply_strictness};
 pub use tool_call::ToolCall;

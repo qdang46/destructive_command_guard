@@ -2,8 +2,8 @@
 //! `PromptAlways` paths like ~/.ssh/, credentials/, .env files.
 
 use dcg_core::{
-    Effect, Engine, EngineConfig, Mode, ProtectedPathEntry, ProtectedPaths,
-    ProtectedSeverity, Session, ToolCall,
+    Effect, Engine, EngineConfig, Mode, ProtectedPathEntry, ProtectedPaths, ProtectedSeverity,
+    Session, ToolCall,
 };
 
 fn engine_with_severity_entries() -> (Engine, Session) {
@@ -51,8 +51,12 @@ fn test_ssh_path_prompts_even_in_bypass() {
     let (engine, mut session) = engine_with_severity_entries();
 
     let tool = ToolCall::write("/home/test/.ssh/authorized_keys");
-    let decision =
-        engine.evaluate(&mut session, &tool, Mode::BypassPermissions, &[Effect::Write, Effect::Fs]);
+    let decision = engine.evaluate(
+        &mut session,
+        &tool,
+        Mode::BypassPermissions,
+        &[Effect::Write, Effect::Fs],
+    );
 
     assert!(
         decision.is_prompt(),
@@ -65,8 +69,12 @@ fn test_gnupg_path_prompts_even_in_bypass() {
     let (engine, mut session) = engine_with_severity_entries();
 
     let tool = ToolCall::write("/home/test/.gnupg/secring.gpg");
-    let decision =
-        engine.evaluate(&mut session, &tool, Mode::BypassPermissions, &[Effect::Write, Effect::Fs]);
+    let decision = engine.evaluate(
+        &mut session,
+        &tool,
+        Mode::BypassPermissions,
+        &[Effect::Write, Effect::Fs],
+    );
 
     assert!(
         decision.is_prompt(),
@@ -79,8 +87,12 @@ fn test_aws_path_prompts_even_in_bypass() {
     let (engine, mut session) = engine_with_severity_entries();
 
     let tool = ToolCall::write("/home/test/.aws/credentials");
-    let decision =
-        engine.evaluate(&mut session, &tool, Mode::BypassPermissions, &[Effect::Write, Effect::Fs]);
+    let decision = engine.evaluate(
+        &mut session,
+        &tool,
+        Mode::BypassPermissions,
+        &[Effect::Write, Effect::Fs],
+    );
 
     assert!(
         decision.is_prompt(),
@@ -93,8 +105,12 @@ fn test_tmp_allowed_in_bypass() {
     let (engine, mut session) = engine_with_severity_entries();
 
     let tool = ToolCall::write("/tmp/build/output.txt");
-    let decision =
-        engine.evaluate(&mut session, &tool, Mode::BypassPermissions, &[Effect::Write, Effect::Fs]);
+    let decision = engine.evaluate(
+        &mut session,
+        &tool,
+        Mode::BypassPermissions,
+        &[Effect::Write, Effect::Fs],
+    );
 
     assert!(
         decision.is_allow(),
@@ -107,8 +123,12 @@ fn test_git_dir_allowed_in_bypass() {
     let (engine, mut session) = engine_with_severity_entries();
 
     let tool = ToolCall::write("/home/test/.git/config");
-    let decision =
-        engine.evaluate(&mut session, &tool, Mode::BypassPermissions, &[Effect::Write, Effect::Fs]);
+    let decision = engine.evaluate(
+        &mut session,
+        &tool,
+        Mode::BypassPermissions,
+        &[Effect::Write, Effect::Fs],
+    );
 
     assert!(
         decision.is_allow(),
@@ -121,8 +141,12 @@ fn test_etc_allowed_in_bypass() {
     let (engine, mut session) = engine_with_severity_entries();
 
     let tool = ToolCall::write("/etc/passwd");
-    let decision =
-        engine.evaluate(&mut session, &tool, Mode::BypassPermissions, &[Effect::Write, Effect::Fs]);
+    let decision = engine.evaluate(
+        &mut session,
+        &tool,
+        Mode::BypassPermissions,
+        &[Effect::Write, Effect::Fs],
+    );
 
     assert!(
         decision.is_allow(),
@@ -135,8 +159,12 @@ fn test_bypass_allows_normal_paths() {
     let (engine, mut session) = engine_with_severity_entries();
 
     let tool = ToolCall::write("/home/test/work/src/main.rs");
-    let decision =
-        engine.evaluate(&mut session, &tool, Mode::BypassPermissions, &[Effect::Write, Effect::Fs]);
+    let decision = engine.evaluate(
+        &mut session,
+        &tool,
+        Mode::BypassPermissions,
+        &[Effect::Write, Effect::Fs],
+    );
 
     assert!(
         decision.is_allow(),

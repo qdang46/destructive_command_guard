@@ -18,9 +18,12 @@ impl Default for DenialConfig {
 
 impl DenialConfig {
     pub fn new(max_consecutive: u32, max_total: u32) -> Self {
-        Self { max_consecutive, max_total }
+        Self {
+            max_consecutive,
+            max_total,
+        }
     }
-    
+
     pub fn should_escalate(&self, consecutive: u32, total: u32) -> bool {
         consecutive >= self.max_consecutive || total >= self.max_total
     }

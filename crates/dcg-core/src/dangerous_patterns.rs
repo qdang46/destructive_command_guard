@@ -53,7 +53,9 @@ pub struct DangerousPatternRegistry {
 impl DangerousPatternRegistry {
     /// Create a new registry with all built-in dangerous patterns.
     pub fn new() -> Self {
-        Self { patterns: build_core_patterns() }
+        Self {
+            patterns: build_core_patterns(),
+        }
     }
 
     /// Check if a command matches any dangerous pattern.
