@@ -114,7 +114,7 @@ impl NetworkPolicy {
 
         let host = extract_host(url);
 
-        if self.host_matches(&host, &self.denied_hosts) {
+        if Self::host_matches(&host, &self.denied_hosts) {
             return NetworkSeverity::Dangerous;
         }
 
@@ -126,7 +126,7 @@ impl NetworkPolicy {
             }
         }
 
-        if self.host_matches(&host, &self.allowed_hosts) {
+        if Self::host_matches(&host, &self.allowed_hosts) {
             return NetworkSeverity::Allowed;
         }
 
@@ -139,10 +139,9 @@ impl NetworkPolicy {
         NetworkSeverity::Suspicious
     }
 
-    fn host_matches(&self, host: &str, patterns: &HashSet<String>) -> bool {
+    fn host_matches(host: &str, patterns: &HashSet<String>) -> bool {
         for pattern in patterns {
-            if pattern.starts_with("*.") {
-                let suffix = &pattern[2..];
+            if let Some(suffix) = pattern.strip_prefix("*.") {
                 // Match if host equals suffix or ends with "." + suffix (e.g., *.github.com matches api.github.com)
                 if host == suffix || host.ends_with(&format!(".{suffix}")) {
                     return true;
@@ -154,7 +153,7 @@ impl NetworkPolicy {
         false
     }
 
-    /// Evaluate a ToolCall::Network and return a Decision.
+    /// Evaluate a `ToolCall::Network` and return a Decision.
     pub fn evaluate(&self, tool: &ToolCall) -> Option<Decision> {
         match tool {
             ToolCall::Network { url, method } => {

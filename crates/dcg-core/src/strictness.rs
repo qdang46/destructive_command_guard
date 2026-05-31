@@ -61,15 +61,23 @@ impl Strictness {
 
 /// Apply strict mode to a mode.
 ///
-/// When strictness is enabled, modes that would normally fallthrough-allow
-/// (Default, Auto, AcceptEdits) effectively become stricter: unknown commands
-/// are denied rather than allowed, with escalation to Prompt after the
-/// configured thresholds are hit.
+/// **Note:** This function is intentionally a no-op — it returns the mode
+/// unchanged. The actual strictness behavior lives in `Engine::fallthrough()`,
+/// which checks `strictness.is_strict()` and `mode.fallthrough_allows()`
+/// inline. This function exists for API discoverability and forward
+/// compatibility — future versions may use it to transform modes directly.
 ///
-/// Modes that already deny/never-prompt (DontAsk, Plan) or bypass
-/// (BypassPermissions) are unchanged — bypass remains a security bypass,
-/// and protected-path PromptAlways entries still apply regardless of
-/// strictness. The strictness flag is consulted in Engine::fallthrough().
+/// When strictness is enabled, modes that would normally fallthrough-allow
+/// (`Default`, `Auto`, `AcceptEdits`) effectively become stricter: unknown
+/// commands are denied rather than allowed, with escalation to [`Decision::Prompt`]
+/// after the configured thresholds are hit.
+///
+/// Modes that already deny/never-prompt (`DontAsk`, `Plan`) or bypass
+/// (`BypassPermissions`) are unchanged — bypass remains a security bypass,
+/// and protected-path [`ProtectedSeverity::PromptAlways`](crate::ProtectedSeverity::PromptAlways)
+/// entries still apply regardless of strictness.
+#[deprecated = "strictness is enforced by Engine::fallthrough(), not by transforming the Mode. \
+                Use Strictness::is_strict() / mode_is_strictened() to query instead."]
 pub const fn apply_strictness(mode: Mode, strictness: Strictness) -> Mode {
     if !strictness.is_strict() {
         return mode;
@@ -104,6 +112,7 @@ mod tests {
         assert!(!s.is_strict());
     }
 
+    #[allow(deprecated)]
     #[test]
     fn apply_strictness_returns_mode_unchanged() {
         // Strictness does not change the mode value — it changes Engine::fallthrough behavior.

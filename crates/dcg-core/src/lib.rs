@@ -66,5 +66,6 @@ pub use network_policy::{
 pub use protected_paths::{ProtectedPathEntry, ProtectedPaths, ProtectedSeverity};
 pub use safe_whitelist::SafeCommandWhitelist;
 pub use session::{ALLOW_ONCE_CODE_LEN, ALLOW_ONCE_TTL, AllowOnceEntry, Session};
+#[allow(deprecated)]
 pub use strictness::{Strictness, apply_strictness};
 pub use tool_call::ToolCall;

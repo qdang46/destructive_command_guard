@@ -8,18 +8,24 @@ use crate::decision::Decision;
 use crate::effect::Effect;
 use crate::escalation::DenialConfig;
 use crate::mode::{Mode, ModePreCheck};
-use crate::network_policy::NetworkPolicy;
-use crate::protected_paths::ProtectedPaths;
+use crate::network_policy::{NetworkPolicy, default_policy};
+use crate::protected_paths::{ProtectedPathEntry, ProtectedPaths, ProtectedSeverity};
 use crate::safe_whitelist::SafeCommandWhitelist;
 use crate::session::Session;
 use crate::strictness::Strictness;
 use crate::tool_call::ToolCall;
+
+// ---------------------------------------------------------------------------
+// EngineConfig / EngineConfigBuilder
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub(crate) working_dir: PathBuf,
     pub(crate) protected_paths_raw: Vec<String>,
     pub(crate) strictness: Strictness,
+    /// Custom network policy. `None` means use [`default_policy`].
+    pub(crate) network_policy: Option<NetworkPolicy>,
 }
 
 impl EngineConfig {
@@ -49,6 +55,7 @@ pub struct EngineConfigBuilder {
     working_dir: Option<PathBuf>,
     protected_paths: Vec<String>,
     strictness: Strictness,
+    network_policy: Option<NetworkPolicy>,
 }
 
 impl EngineConfigBuilder {
@@ -76,6 +83,13 @@ impl EngineConfigBuilder {
         self
     }
 
+    /// Set a custom network policy. If not called, [`default_policy`] is used.
+    #[must_use]
+    pub fn network_policy(mut self, policy: NetworkPolicy) -> Self {
+        self.network_policy = Some(policy);
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> EngineConfig {
         let working_dir = self
@@ -85,6 +99,7 @@ impl EngineConfigBuilder {
             working_dir,
             protected_paths_raw: self.protected_paths,
             strictness: self.strictness,
+            network_policy: self.network_policy,
         }
     }
 }
@@ -94,6 +109,10 @@ impl Default for EngineConfig {
         Self::builder().build()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -106,13 +125,22 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Create a new engine from the given config.
+    ///
+    /// - Protected paths are merged with built-in defaults:
+    ///   credential paths (`~/.ssh`, `~/.aws`, `~/.gnupg`) always get
+    ///   [`ProtectedSeverity::PromptAlways`].
+    /// - The network policy defaults to [`default_policy`] unless overridden
+    ///   via [`EngineConfigBuilder::network_policy`].
+    /// - Strict mode uses a restricted safe-whitelist subset.
+    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn new(config: EngineConfig) -> Self {
-        let protected = ProtectedPaths::new(
-            config.protected_paths_raw.iter().cloned(),
+        let protected = build_protected_paths(
+            &config.protected_paths_raw,
             &config.working_dir,
         );
-        let network_policy = NetworkPolicy::new();
+        let network_policy = config.network_policy.clone().unwrap_or_else(default_policy);
         Self {
             config: config.clone(),
             protected,
@@ -123,9 +151,15 @@ impl Engine {
         }
     }
 
+    /// Create an engine with an externally-built `ProtectedPaths`.
+    ///
+    /// Note: this does **not** merge in the built-in default `PromptAlways`
+    /// entries — use [`Self::new`] for the full default experience, or
+    /// call [`build_protected_paths`] yourself.
+    #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn with_protected(config: EngineConfig, protected: ProtectedPaths) -> Self {
-        let network_policy = NetworkPolicy::new();
+        let network_policy = config.network_policy.clone().unwrap_or_else(default_policy);
         Self {
             config: config.clone(),
             protected,
@@ -156,6 +190,7 @@ impl Engine {
         &self.network_policy
     }
 
+    /// Evaluate a tool call and return the policy decision.
     pub fn evaluate(
         &self,
         session: &mut Session,
@@ -177,6 +212,8 @@ impl Engine {
 
         let pre_check = mode.pre_check(tool, effects, path_in_protected);
 
+        // BypassPermissions short-circuits to Allow, but PromptAlways
+        // protected paths (credentials) override even that.
         let final_pre_check =
             if pre_check == ModePreCheck::AllowImmediately && mode == Mode::BypassPermissions {
                 let path = tool.path().map(|p| {
@@ -207,159 +244,236 @@ impl Engine {
                 let code = session.generate_allow_once_code(&cmd_repr);
                 Decision::prompt(prompt_reason(mode, path_in_protected, effects), code)
             }
-            ModePreCheck::Continue => Self::fallthrough(
-                session,
-                tool,
-                mode,
-                effects,
-                self.config.strictness,
-                &self.safe_whitelist,
-                &self.dangerous_registry,
-                &self.denial_config,
-                &self.network_policy,
-            ),
+            ModePreCheck::Continue => self.evaluate_fallthrough(session, tool, mode, effects),
         }
     }
 
-    fn fallthrough(
+    /// Fallthrough evaluation when no mode-level short-circuit applied.
+    fn evaluate_fallthrough(
+        &self,
         session: &mut Session,
         tool: &ToolCall,
         mode: Mode,
         effects: &[Effect],
-        strictness: Strictness,
-        safe_whitelist: &SafeCommandWhitelist,
-        dangerous_registry: &DangerousPatternRegistry,
-        denial_config: &DenialConfig,
-        network_policy: &NetworkPolicy,
     ) -> Decision {
-        let is_strict = strictness.is_strict();
+        let is_strict = self.config.strictness.is_strict();
         let strict_mode_active = is_strict && mode.fallthrough_allows();
-        let is_network_effect = effects.iter().any(|e| *e == Effect::Network);
 
-        // =====================================================================
-        // Phase 2.8: Network policy check — runs before other fallthrough logic
-        // =====================================================================
-        if let ToolCall::Network { url, method } = tool {
-            let severity = network_policy.evaluate_url(url);
-            let short_code = format!("net:{}:{}", method.to_lowercase(), {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
-                url.hash(&mut h);
-                format!("{:x}", h.finish() & 0xFFFF)
-            });
+        // =================================================================
+        // Phase 2.8: Network policy check
+        // =================================================================
+        if let ToolCall::Network { url, .. } = tool {
+            return self.evaluate_network(session, tool, url, strict_mode_active);
+        }
 
-            match severity {
-                crate::network_policy::NetworkSeverity::Allowed => {
+        if mode.fallthrough_allows() {
+            if let Some(cmd) = tool.command_string() {
+                // In strict mode, use the restricted whitelist.
+                let is_safe = if strict_mode_active {
+                    self.safe_whitelist.is_known_safe_command_strict(cmd)
+                } else {
+                    self.safe_whitelist.is_known_safe_command(cmd)
+                };
+
+                if is_safe {
                     session.reset_on_allow();
                     return Decision::Allow;
                 }
-                crate::network_policy::NetworkSeverity::Suspicious => {
-                    session.bump_deny_counter(&tool_repr(tool));
-                    // network_escalates_to_prompt overrides strict mode to allow prompting instead of denying
-                    if strictness.network_escalates_to_prompt {
-                        return Decision::prompt(
-                            format!("network: suspicious destination ({url})"),
-                            short_code,
-                        );
-                    }
-                    if strict_mode_active {
-                        return Decision::deny(format!("network: suspicious destination ({url}) [strict mode]"));
-                    }
+                if let Some(decision) = evaluate_dangerous(&self.dangerous_registry, tool) {
+                    return decision;
+                }
+            }
+            // Strict mode: deny unknowns, with escalation.
+            if strict_mode_active {
+                return self.evaluate_strict_fallthrough(session, tool, mode, effects);
+            }
+            // Non-strict: allow unknown commands via fallthrough.
+            session.reset_on_allow();
+            Decision::Allow
+        } else {
+            // Non-fallthrough modes (DontAsk, Plan) — deny with escalation.
+            self.evaluate_non_fallthrough(session, tool, mode)
+        }
+    }
+
+    /// Evaluate a network tool call against the network policy.
+    fn evaluate_network(
+        &self,
+        session: &mut Session,
+        tool: &ToolCall,
+        url: &str,
+        strict_mode_active: bool,
+    ) -> Decision {
+        let severity = self.network_policy.evaluate_url(url);
+        let short_code = network_short_code(tool);
+
+        match severity {
+            crate::network_policy::NetworkSeverity::Allowed => {
+                session.reset_on_allow();
+                Decision::Allow
+            }
+            crate::network_policy::NetworkSeverity::Suspicious => {
+                session.bump_deny_counter(&tool_repr(tool));
+                if self.config.strictness.network_escalates_to_prompt {
                     return Decision::prompt(
                         format!("network: suspicious destination ({url})"),
                         short_code,
                     );
                 }
-                crate::network_policy::NetworkSeverity::Dangerous => {
-                    session.bump_deny_counter(&tool_repr(tool));
-                    return Decision::deny(format!("network: denied destination ({url})"));
-                }
-                crate::network_policy::NetworkSeverity::Exfiltration => {
-                    session.bump_deny_counter(&tool_repr(tool));
-                    return Decision::deny(format!("network: exfiltration pattern detected ({url})"));
-                }
-            }
-        }
-
-        if mode.fallthrough_allows() {
-            if let Some(cmd) = tool.command_string() {
-                if safe_whitelist.is_known_safe_command(cmd) {
-                    session.reset_on_allow();
-                    return Decision::Allow;
-                }
-                if let Some(decision) = evaluate_dangerous(dangerous_registry, tool) {
-                    return decision;
-                }
-            }
-            // In strict mode, unknown commands are denied and count toward escalation.
-            if strict_mode_active {
-                let cmd_repr = tool_repr(tool);
-                session.bump_deny_counter(&cmd_repr);
-
-                // Use strictness thresholds for escalation.
-                let should_escalate = session.consecutive_denials() >= strictness.max_consecutive
-                    || session.total_denials() >= strictness.max_total;
-
-                // Network operations: escalate to prompt if configured.
-                if strictness.network_escalates_to_prompt && is_network_effect {
-                    let code = session.generate_allow_once_code(&cmd_repr);
-                    return Decision::prompt(
-                        format!(
-                            "strict mode: network operation not on safe list (consecutive: {}, total: {})",
-                            session.consecutive_denials(),
-                            session.total_denials()
-                        ),
-                        code,
+                if strict_mode_active {
+                    return Decision::deny(
+                        format!("network: suspicious destination ({url}) [strict mode]"),
                     );
                 }
-
-                if should_escalate {
-                    let code = session.generate_allow_once_code(&cmd_repr);
-                    Decision::prompt(
-                        format!(
-                            "strict mode escalated: {} consecutive denials, {} total denials",
-                            session.consecutive_denials(),
-                            session.total_denials()
-                        ),
-                        code,
-                    )
-                } else {
-                    Decision::deny(format!(
-                        "strict mode: command not on safe list (mode: {})",
-                        mode.as_str()
-                    ))
-                }
-            } else {
-                session.reset_on_allow();
-                Decision::Allow
-            }
-        } else {
-            // Mode does not fallthrough-allow (DontAsk, Plan, etc.)
-            let cmd_repr = tool_repr(tool);
-            session.bump_deny_counter(&cmd_repr);
-
-            // Use denial_config for escalation in non-strictDontAsk mode.
-            if denial_config.should_escalate(session.consecutive_denials(), session.total_denials())
-            {
-                let code = session.generate_allow_once_code(&cmd_repr);
                 Decision::prompt(
-                    format!(
-                        "Escalated: {} consecutive denials, {} total denials",
-                        session.consecutive_denials(),
-                        session.total_denials()
-                    ),
-                    code,
+                    format!("network: suspicious destination ({url})"),
+                    short_code,
                 )
-            } else {
-                Decision::deny(format!(
-                    "tool call not on the explicit allow list (mode: {})",
-                    mode.as_str()
-                ))
+            }
+            crate::network_policy::NetworkSeverity::Dangerous => {
+                session.bump_deny_counter(&tool_repr(tool));
+                Decision::deny(format!("network: denied destination ({url})"))
+            }
+            crate::network_policy::NetworkSeverity::Exfiltration => {
+                session.bump_deny_counter(&tool_repr(tool));
+                Decision::deny(format!("network: exfiltration pattern detected ({url})"))
             }
         }
     }
+
+    /// Strict-mode fallthrough: deny unknowns, check escalation thresholds.
+    fn evaluate_strict_fallthrough(
+        &self,
+        session: &mut Session,
+        tool: &ToolCall,
+        mode: Mode,
+        effects: &[Effect],
+    ) -> Decision {
+        let cmd_repr = tool_repr(tool);
+        session.bump_deny_counter(&cmd_repr);
+
+        let is_network_effect = effects.contains(&Effect::Network);
+        if self.config.strictness.network_escalates_to_prompt && is_network_effect {
+            let code = session.generate_allow_once_code(&cmd_repr);
+            return Decision::prompt(
+                format!(
+                    "strict mode: network operation not on safe list (consecutive: {}, total: {})",
+                    session.consecutive_denials(),
+                    session.total_denials()
+                ),
+                code,
+            );
+        }
+
+        let should_escalate = session.consecutive_denials() >= self.config.strictness.max_consecutive
+            || session.total_denials() >= self.config.strictness.max_total;
+
+        if should_escalate {
+            let code = session.generate_allow_once_code(&cmd_repr);
+            Decision::prompt(
+                format!(
+                    "strict mode escalated: {} consecutive denials, {} total denials",
+                    session.consecutive_denials(),
+                    session.total_denials()
+                ),
+                code,
+            )
+        } else {
+            Decision::deny(format!(
+                "strict mode: command not on safe list (mode: {})",
+                mode.as_str()
+            ))
+        }
+    }
+
+    /// Non-fallthrough mode evaluation (`DontAsk`, Plan) — deny with escalation.
+    fn evaluate_non_fallthrough(
+        &self,
+        session: &mut Session,
+        tool: &ToolCall,
+        mode: Mode,
+    ) -> Decision {
+        let cmd_repr = tool_repr(tool);
+        session.bump_deny_counter(&cmd_repr);
+
+        if self.denial_config.should_escalate(session.consecutive_denials(), session.total_denials())
+        {
+            let code = session.generate_allow_once_code(&cmd_repr);
+            Decision::prompt(
+                format!(
+                    "Escalated: {} consecutive denials, {} total denials",
+                    session.consecutive_denials(),
+                    session.total_denials()
+                ),
+                code,
+            )
+        } else {
+            Decision::deny(format!(
+                "tool call not on the explicit allow list (mode: {})",
+                mode.as_str()
+            ))
+        }
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Protected-paths helpers
+// ---------------------------------------------------------------------------
+
+/// Build `ProtectedPaths` by merging user-supplied entries with built-in
+/// defaults that protect credential paths and project configuration files.
+fn build_protected_paths(user_entries: &[String], working_dir: &Path) -> ProtectedPaths {
+    let home = dirs::home_dir();
+    let mut entries: Vec<ProtectedPathEntry> = Vec::new();
+
+    // User-supplied entries — all get PromptInNonBypass by default.
+    for raw in user_entries {
+        let prefix = expand_path(raw, working_dir, home.as_deref());
+        entries.push(ProtectedPathEntry::new(prefix, ProtectedSeverity::PromptInNonBypass));
+    }
+
+    // Built-in PromptAlways entries — override even BypassPermissions.
+    if let Some(ref h) = home {
+        for dir in &[".ssh", ".aws", ".gnupg"] {
+            entries.push(ProtectedPathEntry::new(
+                h.join(dir),
+                ProtectedSeverity::PromptAlways,
+            ));
+        }
+    }
+
+    // Built-in PromptInNonBypass — always present for project config.
+    for raw in &[".env", ".env.local", ".env.production",
+        ".git", ".mcp.json", ".claude.json",
+        ".claude", ".vscode"] {
+        entries.push(ProtectedPathEntry::new(
+            working_dir.join(raw),
+            ProtectedSeverity::PromptInNonBypass,
+        ));
+    }
+
+    ProtectedPaths::with_entries(entries)
+}
+
+/// Expand `~` and relative paths. Extracted for reuse.
+fn expand_path(entry: &str, working_dir: &Path, home: Option<&Path>) -> PathBuf {
+    if let Some(rest) = entry.strip_prefix("~/") {
+        return home.map_or_else(|| PathBuf::from(entry), |h| h.join(rest));
+    }
+    if entry == "~" {
+        return home.map_or_else(|| PathBuf::from(entry), Path::to_path_buf);
+    }
+    let p = PathBuf::from(entry);
+    if p.is_absolute() {
+        p
+    } else {
+        working_dir.join(p)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decision helpers
+// ---------------------------------------------------------------------------
 
 fn plan_deny_reason(mode: Mode, effects: &[Effect]) -> String {
     if mode == Mode::Plan {
@@ -408,6 +522,23 @@ fn tool_repr(tool: &ToolCall) -> String {
     }
 }
 
+fn network_short_code(tool: &ToolCall) -> String {
+    match tool {
+        ToolCall::Network { url, method } => {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            url.hash(&mut h);
+            format!("net:{}:{:x}", method.to_lowercase(), h.finish() & 0xFFFF)
+        }
+        _ => String::new(),
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +551,10 @@ mod tests {
                 .build(),
         )
     }
+
+    // =======================================================================
+    // Existing tests — preserved
+    // =======================================================================
 
     #[test]
     fn bypass_always_allows() {
@@ -478,7 +613,7 @@ mod tests {
     fn accept_edits_prompts_in_protected_path() {
         let e = engine_with_protected(vec![".git".into()], "/work");
         let mut s = Session::with_id("test");
-        s.working_dir = std::path::PathBuf::from("/work");
+        s.working_dir = PathBuf::from("/work");
         let d = e.evaluate(
             &mut s,
             &ToolCall::write("/work/.git/config"),
@@ -487,9 +622,7 @@ mod tests {
         );
         assert!(d.is_prompt(), "got {d:?}");
         match d {
-            Decision::Prompt {
-                allow_once_code, ..
-            } => {
+            Decision::Prompt { allow_once_code, .. } => {
                 assert!(s.has_unused_allow_once(&allow_once_code));
             }
             _ => unreachable!(),
@@ -553,7 +686,7 @@ mod tests {
     fn protected_path_relative_to_session_working_dir() {
         let e = engine_with_protected(vec![".git".into()], "/work");
         let mut s = Session::with_id("test");
-        s.working_dir = std::path::PathBuf::from("/work");
+        s.working_dir = PathBuf::from("/work");
         let d = e.evaluate(
             &mut s,
             &ToolCall::write(".git/config"),
@@ -563,9 +696,9 @@ mod tests {
         assert!(d.is_prompt(), "got {d:?}");
     }
 
-    // =============================================================================
+    // =======================================================================
     // Strictness tests — Phase 2.5
-    // =============================================================================
+    // =======================================================================
 
     fn engine_with_strictness(paths: Vec<String>, work: &str, strictness: Strictness) -> Engine {
         Engine::new(
@@ -581,7 +714,6 @@ mod tests {
     fn strict_mode_denies_unknown_command() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // Unknown command in Default mode with strictness should deny.
         let d = e.evaluate(&mut s, &ToolCall::bash("rm -rf /"), Mode::Default, &[Effect::Fs]);
         assert!(d.is_deny(), "strict mode should deny unknown commands, got {d:?}");
     }
@@ -590,7 +722,6 @@ mod tests {
     fn strict_mode_allows_safe_whitelisted_command() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // git status is on the safe whitelist — should still be allowed.
         let d = e.evaluate(
             &mut s,
             &ToolCall::bash("git status"),
@@ -604,7 +735,6 @@ mod tests {
     fn strict_mode_dangerous_pattern_denies() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // git reset --hard matches a dangerous pattern — should deny even in strict mode.
         let d = e.evaluate(
             &mut s,
             &ToolCall::bash("git reset --hard"),
@@ -619,8 +749,6 @@ mod tests {
         let e = engine_with_strictness(vec![], "/work", Strictness::with_thresholds(3, 10));
         let mut s = Session::with_id("test");
 
-        // With max_consecutive=3, escalation happens AT the 3rd denial (>= 3).
-        // The first 2 denials stay as Deny; the 3rd escalates to Prompt.
         for i in 1..=3 {
             let d = e.evaluate(
                 &mut s,
@@ -636,7 +764,6 @@ mod tests {
             );
         }
 
-        // A 4th denial should still be Prompt (already escalated).
         let d = e.evaluate(
             &mut s,
             &ToolCall::bash("another-unknown"),
@@ -651,7 +778,6 @@ mod tests {
         let e = engine_with_strictness(vec![], "/work", Strictness::with_thresholds(10, 3));
         let mut s = Session::with_id("test");
 
-        // 3 denials should reach max_total=3 and escalate.
         for i in 1..=3 {
             let d = e.evaluate(
                 &mut s,
@@ -672,7 +798,7 @@ mod tests {
     fn strict_mode_network_denies_by_default() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // Network call not on safe list — should deny (network_escalates_to_prompt=false by default).
+        // evil.com is not on the default allowed-hosts list → Suspicious → strict deny
         let d = e.evaluate(
             &mut s,
             &ToolCall::network("https://evil.com", "GET"),
@@ -688,7 +814,6 @@ mod tests {
         strict.network_escalates_to_prompt = true;
         let e = engine_with_strictness(vec![], "/work", strict);
         let mut s = Session::with_id("test");
-        // Network call with network_escalates_to_prompt=true should prompt.
         let d = e.evaluate(
             &mut s,
             &ToolCall::network("https://example.com/api", "POST"),
@@ -702,7 +827,6 @@ mod tests {
     fn strict_mode_preserves_bypass_permissions() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // BypassPermissions should still bypass — strictness doesn't affect it.
         let d = e.evaluate(
             &mut s,
             &ToolCall::bash("rm -rf /"),
@@ -716,8 +840,6 @@ mod tests {
     fn strict_mode_accept_edits_denies_irreversible() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // AcceptEdits normally prompts on Irreversible; in strict mode it should still prompt
-        // (not use fallthrough-allow), and the dangerous pattern check also runs.
         let d = e.evaluate(
             &mut s,
             &ToolCall::bash("rm -rf ./build"),
@@ -731,7 +853,6 @@ mod tests {
     fn strict_mode_does_not_affect_dont_ask() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // DontAsk already denies non-whitelisted commands — strictness is a no-op for it.
         let d = e.evaluate(
             &mut s,
             &ToolCall::bash("some-unknown"),
@@ -745,7 +866,6 @@ mod tests {
     fn non_strict_mode_allows_unknown_with_fallthrough() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(false));
         let mut s = Session::with_id("test");
-        // Without strictness, unknown commands fall through to Allow.
         let d = e.evaluate(
             &mut s,
             &ToolCall::bash("random-unknown-cmd"),
@@ -757,12 +877,198 @@ mod tests {
 
     #[test]
     fn strict_mode_safe_list_restricted_allow() {
-        // In strict mode, only whitelisted commands are auto-allowed.
-        // Non-whitelisted commands (even safe-looking ones) are denied.
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        // "cd /tmp" — cd is on the whitelist, so allowed.
-        let d = e.evaluate(&mut s, &ToolCall::bash("cd /tmp"), Mode::Default, &[Effect::Fs]);
-        assert!(d.is_allow(), "cd is whitelisted, got {d:?}");
+        // "ls" is on the strict whitelist (read-only, zero side-effects).
+        let d = e.evaluate(&mut s, &ToolCall::bash("ls"), Mode::Default, &[Effect::Fs]);
+        assert!(d.is_allow(), "ls is on the strict whitelist, got {d:?}");
+    }
+
+    // =======================================================================
+    // NEW: Network policy wired into engine (Fix 3)
+    // =======================================================================
+
+    #[test]
+    fn network_policy_default_allows_github() {
+        let e = engine_with_protected(vec![], "/work");
+        let mut s = Session::with_id("test");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::network("https://github.com/user/repo", "GET"),
+            Mode::Default,
+            &[Effect::Network],
+        );
+        assert!(d.is_allow(), "github.com should be allowed by default policy, got {d:?}");
+    }
+
+    #[test]
+    fn network_policy_default_allows_npm() {
+        let e = engine_with_protected(vec![], "/work");
+        let mut s = Session::with_id("test");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::network("https://registry.npmjs.org/package", "GET"),
+            Mode::Default,
+            &[Effect::Network],
+        );
+        assert!(d.is_allow(), "registry.npmjs.org should be allowed, got {d:?}");
+    }
+
+    #[test]
+    fn network_policy_default_denies_private_ip() {
+        let e = engine_with_protected(vec![], "/work");
+        let mut s = Session::with_id("test");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::network("http://10.0.0.1/api", "GET"),
+            Mode::Default,
+            &[Effect::Network],
+        );
+        assert!(d.is_deny(), "private IP 10.0.0.1 should be denied, got {d:?}");
+    }
+
+    #[test]
+    fn network_policy_default_denies_exfiltration() {
+        let e = engine_with_protected(vec![], "/work");
+        let mut s = Session::with_id("test");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::network("telnet://evil.com", "GET"),
+            Mode::Default,
+            &[Effect::Network],
+        );
+        assert!(d.is_deny(), "telnet:// should be denied as exfiltration, got {d:?}");
+    }
+
+    #[test]
+    fn network_policy_custom_override() {
+        let mut custom = NetworkPolicy::new();
+        custom.add_allowed_host("my-internal.com");
+        let e = Engine::new(
+            EngineConfig::builder()
+                .working_dir("/work")
+                .network_policy(custom)
+                .build(),
+        );
+        let mut s = Session::with_id("test");
+        // Custom policy allows my-internal.com but not github.com (empty allowed).
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::network("https://my-internal.com/api", "GET"),
+            Mode::Default,
+            &[Effect::Network],
+        );
+        assert!(d.is_allow(), "custom allowed host should pass, got {d:?}");
+    }
+
+    // =======================================================================
+    // NEW: Default PromptAlways protected paths (Fix 4)
+    // =======================================================================
+
+    #[test]
+    fn prompt_always_overrides_bypass_for_ssh() {
+        let e = engine_with_protected(vec![], "/work");
+        let mut s = Session::with_id("test");
+        // ~/.ssh should be PromptAlways by default.
+        let home = dirs::home_dir().expect("home dir should exist");
+        let ssh_config = home.join(".ssh").join("config");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::write(ssh_config.to_str().unwrap()),
+            Mode::BypassPermissions,
+            &[Effect::Write, Effect::Fs],
+        );
+        assert!(d.is_prompt(), "~/.ssh should prompt even in BypassPermissions, got {d:?}");
+    }
+
+    #[test]
+    fn prompt_always_overrides_bypass_for_aws() {
+        let e = engine_with_protected(vec![], "/work");
+        let mut s = Session::with_id("test");
+        let home = dirs::home_dir().expect("home dir should exist");
+        let aws_creds = home.join(".aws").join("credentials");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::write(aws_creds.to_str().unwrap()),
+            Mode::BypassPermissions,
+            &[Effect::Write, Effect::Fs],
+        );
+        assert!(d.is_prompt(), "~/.aws should prompt even in BypassPermissions, got {d:?}");
+    }
+
+    // =======================================================================
+    // NEW: Strict mode restricted whitelist (Fix 5)
+    // =======================================================================
+
+    #[test]
+    fn strict_mode_uses_restricted_whitelist_docker_denied() {
+        let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
+        let mut s = Session::with_id("test");
+        // docker ps is on the full whitelist but NOT the strict whitelist.
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::bash("docker ps"),
+            Mode::Default,
+            &[Effect::Read],
+        );
+        assert!(d.is_deny(), "strict mode should deny docker ps, got {d:?}");
+    }
+
+    #[test]
+    fn strict_mode_uses_restricted_whitelist_npm_denied() {
+        let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
+        let mut s = Session::with_id("test");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::bash("npm run test"),
+            Mode::Default,
+            &[Effect::Read],
+        );
+        assert!(d.is_deny(), "strict mode should deny npm, got {d:?}");
+    }
+
+    #[test]
+    fn strict_mode_allows_git_status_on_restricted_list() {
+        let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
+        let mut s = Session::with_id("test");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::bash("git status"),
+            Mode::Default,
+            &[Effect::Read],
+        );
+        assert!(d.is_allow(), "strict mode should allow git status, got {d:?}");
+    }
+
+    #[test]
+    fn strict_mode_allows_ls_on_restricted_list() {
+        let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
+        let mut s = Session::with_id("test");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::bash("ls -la"),
+            Mode::Default,
+            &[Effect::Fs],
+        );
+        assert!(d.is_allow(), "strict mode should allow ls, got {d:?}");
+    }
+
+    // =======================================================================
+    // NEW: Compound command security through engine (Fix 1 verification)
+    // =======================================================================
+
+    #[test]
+    fn compound_command_through_engine_denied() {
+        let e = engine_with_protected(vec![], "/work");
+        let mut s = Session::with_id("test");
+        // "git status ; rm -rf /" should NOT be whitelisted.
+        // It will fall through to dangerous pattern check (rm -rf matches).
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::bash("git status ; rm -rf /"),
+            Mode::Default,
+            &[Effect::Read],
+        );
+        assert!(d.is_deny(), "compound command should be denied, got {d:?}");
     }
 }

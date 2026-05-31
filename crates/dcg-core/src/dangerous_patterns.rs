@@ -122,6 +122,7 @@ impl CompiledPattern {
 }
 
 /// Core dangerous patterns — git, filesystem, network, system, database.
+#[allow(clippy::too_many_lines)]
 fn build_core_patterns() -> Vec<CompiledPattern> {
     vec![
         // =============================================================================
