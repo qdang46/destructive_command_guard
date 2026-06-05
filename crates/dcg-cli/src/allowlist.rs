@@ -614,10 +614,26 @@ pub fn is_builtin_inspection_wrapper_call(command: &str) -> bool {
 }
 
 /// Returns true if `tail` contains any shell metacharacter sequence that could
-/// chain a second command after the allowlisted prefix. The set is intentionally
-/// conservative — false positives (refusing the allowlist match and falling
-/// through to normal evaluation, which usually still allows the command) are
-/// preferred over false negatives (silently allowing a command-chained tail).
+/// chain a second command or redirect I/O after the allowlisted prefix. The
+/// set is intentionally conservative — false positives (refusing the allowlist
+/// match and falling through to normal evaluation, which usually still allows
+/// the command) are preferred over false negatives (silently allowing a
+/// command-chained or redirected tail).
+///
+/// # Redirect operators (`>`, `<`, `>>`, `1>`, `2>`) are intentionally included
+///
+/// Bare `>` / `<` / `>>` without a following `(` are shell I/O redirections,
+/// not process substitutions. They cannot chain a second command but they can
+/// cause independent harm: `ee preflight check --cmd foo > /etc/passwd`
+/// redirects ee's stdout to `/etc/passwd`, truncating it — even though the
+/// `--cmd` argument is only inspected, not executed. Without catching bare `>`
+/// the inspection-wrapper exemption would skip pack evaluation and allow the
+/// redirect to a sensitive path through unchecked (dcg#132 bypass via redirect
+/// tail). The conservative policy — refuse the allowlist match and fall through
+/// to normal evaluation — is the right tradeoff: the pack's
+/// `redirect-truncate-root-home` rule discriminates safe targets (e.g.
+/// `>/dev/null`, `> /tmp/out`) from sensitive ones (e.g. `> /etc/passwd`), so
+/// false-positive pain is low.
 fn tail_has_shell_chain_metachars(tail: &str) -> bool {
     // NUL bytes are never legitimate in a shell command.
     if tail.contains('\0') {
@@ -642,7 +658,17 @@ fn tail_has_shell_chain_metachars(tail: &str) -> bool {
         match b {
             b';' | b'&' | b'|' | b'`' => return true,
             b'$' if bytes.get(i + 1) == Some(&b'(') => return true,
+            // Process substitutions <(…) and >(…) — both the command-chaining
+            // form and the bare redirect forms must be caught.
+            // `<(` / `>(` are process substitutions (caught here even without
+            // the bare-redirect rule below, kept for clarity).
             b'<' | b'>' if bytes.get(i + 1) == Some(&b'(') => return true,
+            // Bare I/O redirect operators: `>`, `<`, `>>`, `2>`, `1>`, etc.
+            // These cannot chain a second command but they can independently
+            // redirect (and thereby truncate/overwrite) files — an orthogonal
+            // harm vector that must not bypass pack evaluation via the
+            // inspection-wrapper exemption. See doc-comment above.
+            b'<' | b'>' => return true,
             _ => {}
         }
         i += 1;
@@ -2785,6 +2811,70 @@ mod tests {
         // No whitespace after the prefix → token-boundary check rejects.
         assert!(!is_builtin_inspection_wrapper_call(
             "ee preflight check --cmdX rm -rf /"
+        ));
+    }
+
+    #[test]
+    fn inspection_wrapper_rejects_redirect_tail_bypass() {
+        // Redirect operators (>, >>, 1>, 2>, <) after the inspection-wrapper
+        // prefix must NOT pass the metachar guard. Without this, an attacker
+        // can smuggle a destructive shell redirect through the inspection-wrapper
+        // exemption: `ee preflight check --cmd foo > /etc/passwd` would skip
+        // pack evaluation and silently truncate /etc/passwd even though the
+        // --cmd argument is only data. This is a real bypass that the
+        // original dcg#132 fix did not cover (see security audit follow-up).
+        //
+        // Verified-blocked: >, >>, <, 1>, 2>, glued >/ forms.
+        // NOT blocked by this guard (still caught by chain checks): &>, >|, >(
+        let redirect_bypass_attempts = [
+            // Bare stdout redirect to sensitive path
+            "ee preflight check --cmd foo > /etc/passwd",
+            // Redirect to /dev/sda (disk wipe)
+            "ee preflight check --cmd foo > /dev/sda",
+            // Append redirect (>> is non-destructive per pack rules, but we
+            // still conservatively reject it from the exemption; pack eval
+            // will allow benign >> targets)
+            "ee preflight check --cmd foo >> /etc/passwd",
+            // Numbered file-descriptor redirect
+            "ee preflight check --cmd foo 1>/etc/passwd",
+            "ee preflight check --cmd foo 2> /etc/shadow",
+            // Glued redirect with no space: >/etc/passwd
+            "ee preflight check --cmd foo >/etc/passwd",
+            // stdin redirect (< reads from a file; less harmful but still
+            // an uncontrolled I/O side-channel that must fall through to
+            // pack evaluation)
+            "ee preflight check --cmd foo < /etc/passwd",
+            // verify subcommand is equally covered
+            "ee preflight verify --cmd foo > /etc/hosts",
+            // cmd-base64 channel
+            "ee preflight check --cmd-base64 cm0gLXJmIC8= > /etc/hosts",
+        ];
+        for bypass in redirect_bypass_attempts {
+            assert!(
+                !is_builtin_inspection_wrapper_call(bypass),
+                "Inspection-wrapper exemption must NOT allow a redirect-tail bypass: {bypass:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inspection_wrapper_still_allows_cmd_without_redirect() {
+        // Confirm that the redirect metachar guard does NOT break the core
+        // use case: a destructive command as data with no redirect tail.
+        assert!(is_builtin_inspection_wrapper_call(
+            "ee preflight check --cmd \"git reset --hard HEAD~5\""
+        ));
+        assert!(is_builtin_inspection_wrapper_call(
+            "ee preflight check --cmd \"rm -rf /\""
+        ));
+        assert!(is_builtin_inspection_wrapper_call(
+            "ee preflight check --cmd-base64 cm0gLXJmIC8="
+        ));
+        assert!(is_builtin_inspection_wrapper_call(
+            "ee preflight verify --cmd \"git reset --hard\""
+        ));
+        assert!(is_builtin_inspection_wrapper_call(
+            "ee preflight check --stdin --json"
         ));
     }
 }
