@@ -1,0 +1,209 @@
+[info] --no-auth: Bearer token authentication disabled for this run
+2026-06-05T17:16:41.425397Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v15_add_recipients_json_to_messages
+2026-06-05T17:16:41.427885Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_effect_id
+2026-06-05T17:16:41.428089Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_trace_id
+2026-06-05T17:16:41.428290Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_claim_id
+2026-06-05T17:16:41.428489Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_evidence_id
+2026-06-05T17:16:41.428707Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_state
+2026-06-05T17:16:41.428921Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_subsystem
+2026-06-05T17:16:41.429121Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_decision_class
+2026-06-05T17:16:41.429322Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_subject
+2026-06-05T17:16:41.429527Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_project_key
+2026-06-05T17:16:41.429731Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_policy_id
+2026-06-05T17:16:41.429929Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_effect_kind
+2026-06-05T17:16:41.430121Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_action
+2026-06-05T17:16:41.430304Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_posterior_json
+2026-06-05T17:16:41.430508Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_expected_loss
+2026-06-05T17:16:41.430722Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_runner_up_action
+2026-06-05T17:16:41.430927Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_runner_up_loss
+2026-06-05T17:16:41.431130Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_evidence_summary
+2026-06-05T17:16:41.431327Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_calibration_healthy
+2026-06-05T17:16:41.431528Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_safe_mode_active
+2026-06-05T17:16:41.431783Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_non_execution_json
+2026-06-05T17:16:41.432034Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_outcome_json
+2026-06-05T17:16:41.432295Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_features_json
+2026-06-05T17:16:41.432520Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_feature_ext_json
+2026-06-05T17:16:41.432765Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_created_ts
+2026-06-05T17:16:41.432990Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_dispatched_ts
+2026-06-05T17:16:41.433200Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_executed_ts
+2026-06-05T17:16:41.433416Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_resolved_ts
+2026-06-05T17:16:41.433669Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16a_atc_experiences_add_context_json
+2026-06-05T17:16:41.437199Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_subsystem
+2026-06-05T17:16:41.437429Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_effect_kind
+2026-06-05T17:16:41.437632Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_risk_tier
+2026-06-05T17:16:41.437837Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_total_count
+2026-06-05T17:16:41.438046Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_resolved_count
+2026-06-05T17:16:41.438306Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_censored_count
+2026-06-05T17:16:41.438539Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_expired_count
+2026-06-05T17:16:41.438769Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_correct_count
+2026-06-05T17:16:41.438989Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_incorrect_count
+2026-06-05T17:16:41.439196Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_total_regret
+2026-06-05T17:16:41.439407Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_total_loss
+2026-06-05T17:16:41.439625Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v16b_atc_rollups_add_last_updated_ts
+2026-06-05T17:16:41.443766Z  INFO migration preflight found schema already satisfies migration; recording migration without executing DDL migration_id=v21_atc_experiences_add_feature_schema_version
+2026-06-05T17:16:41.457738Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:16:41.479644Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:16:41.479760Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:16:41.480184Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:16:41.480235Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:16:41.480251Z  INFO HTTP server supervisor started host=127.0.0.1 port=51862 workers=4
+2026-06-05T17:16:41.480271Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:16:41.480462Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:16:41.481811Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=51862
+2026-06-05T17:16:41.490008Z  INFO created proactive database backup primary=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 backup=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3.bak replaced_existing=false
+2026-06-05T17:16:41.490487Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 1s (attempt 1/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [83483]
+2026-06-05T17:16:43.368153Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:16:43.369407Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:16:43.369442Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:16:43.369615Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:16:43.369633Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:16:43.369642Z  INFO HTTP server supervisor started host=127.0.0.1 port=51884 workers=4
+2026-06-05T17:16:43.369650Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:16:43.369728Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:16:43.370633Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=51884
+2026-06-05T17:16:43.373405Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 2s (attempt 2/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [84153]
+2026-06-05T17:16:46.499291Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:16:46.500194Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:16:46.500242Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:16:46.500459Z  INFO HTTP server supervisor started host=127.0.0.1 port=51922 workers=4
+2026-06-05T17:16:46.500472Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:16:46.500494Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:16:46.500493Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:16:46.500719Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:16:46.501634Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=51922
+2026-06-05T17:16:46.505638Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 4s (attempt 3/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [84609]
+2026-06-05T17:16:50.872663Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:16:50.873535Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:16:50.873575Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:16:50.873752Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:16:50.873772Z  INFO HTTP server supervisor started host=127.0.0.1 port=51936 workers=4
+2026-06-05T17:16:50.873781Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:16:50.873802Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:16:50.874047Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:16:50.874917Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=51936
+2026-06-05T17:16:50.877566Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 8s (attempt 4/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [85245]
+2026-06-05T17:16:59.690603Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:16:59.691314Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:16:59.691349Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:16:59.691523Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:16:59.691543Z  INFO HTTP server supervisor started host=127.0.0.1 port=51951 workers=4
+2026-06-05T17:16:59.691551Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:16:59.691549Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:16:59.691646Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:16:59.692528Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=51951
+2026-06-05T17:16:59.695232Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 16s (attempt 5/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [89624]
+2026-06-05T17:17:17.083788Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:17:17.084516Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:17:17.084549Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:17:17.084712Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:17:17.084728Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:17:17.084734Z  INFO HTTP server supervisor started host=127.0.0.1 port=52101 workers=4
+2026-06-05T17:17:17.084742Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:17:17.084809Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:17:17.085732Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=52101
+2026-06-05T17:17:17.088193Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] max restarts (5) exceeded, not restarting
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [226]
+2026-06-05T17:24:16.855576Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:24:16.856796Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:24:16.856875Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:24:16.857112Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:24:16.857131Z  INFO HTTP server supervisor started host=127.0.0.1 port=52593 workers=4
+2026-06-05T17:24:16.857127Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:24:16.857151Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:24:16.857310Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:24:16.858787Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=52593
+2026-06-05T17:24:16.867631Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 1s (attempt 1/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [5211]
+2026-06-05T17:24:18.284163Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:24:18.285499Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:24:18.285571Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:24:18.285751Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:24:18.285781Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:24:18.285788Z  INFO HTTP server supervisor started host=127.0.0.1 port=52615 workers=4
+2026-06-05T17:24:18.285835Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:24:18.286027Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:24:18.287019Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=52615
+2026-06-05T17:24:18.290145Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 2s (attempt 2/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [5648]
+2026-06-05T17:24:21.458635Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:24:21.459639Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:24:21.459709Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:24:21.459916Z  INFO HTTP server supervisor started host=127.0.0.1 port=52650 workers=4
+2026-06-05T17:24:21.459917Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:24:21.459917Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:24:21.459928Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:24:21.460096Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:24:21.461118Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=52650
+2026-06-05T17:24:21.464456Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 4s (attempt 3/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [7859]
+2026-06-05T17:24:26.057840Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:24:26.059033Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:24:26.059073Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:24:26.059307Z  INFO HTTP server supervisor started host=127.0.0.1 port=52708 workers=4
+2026-06-05T17:24:26.059304Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:24:26.059303Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:24:26.059317Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:24:26.059527Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:24:26.061059Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=52708
+2026-06-05T17:24:26.063588Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 8s (attempt 4/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+2026-06-05T17:24:34.171506Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:24:34.172443Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:24:34.172494Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:24:34.172699Z  INFO HTTP server supervisor started host=127.0.0.1 port=52810 workers=4
+2026-06-05T17:24:34.172709Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:24:34.172725Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:24:34.172726Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:24:34.172936Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:24:34.173934Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=52810
+2026-06-05T17:24:34.176982Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] restarting in 16s (attempt 5/5)
+[info] --no-auth: Bearer token authentication disabled for this run
+[info] Stale Agent Mail process(es) holding /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 — killing PIDs [13005]
+2026-06-05T17:24:53.413885Z  INFO Active database database=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/storage.sqlite3 storage_root=/Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo
+2026-06-05T17:24:53.414880Z  INFO [startup-search] initialized search v3 bridge at /Users/tranquangdang21/.local/share/mcp-agent-mail/git_mailbox_repo/search_index
+2026-06-05T17:24:53.414924Z  INFO [startup-search] delaying backfill to prioritize startup responsiveness delay_secs=8
+2026-06-05T17:24:53.415098Z  INFO archive maintenance worker started interval_secs=1800 startup_delay_secs=15
+2026-06-05T17:24:53.415122Z  INFO HTTP server supervisor started host=127.0.0.1 port=52848 workers=4
+2026-06-05T17:24:53.415132Z  INFO HTTP runtime reactor selected reactor="default" workers=4
+2026-06-05T17:24:53.415146Z  INFO disk monitor worker started interval_secs=60
+2026-06-05T17:24:53.415339Z  INFO integrity guard worker started quick_interval_secs=300 full_interval_secs=3600
+2026-06-05T17:24:53.416184Z  INFO Startup readiness self-probe passed — server is accepting requests host=127.0.0.1 port=52848
+2026-06-05T17:24:53.419159Z  INFO integrity guard: periodic full integrity check passed
+[supervisor] daemon exited with error: signal: terminated
+[supervisor] max restarts (5) exceeded, not restarting

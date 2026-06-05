@@ -108,3 +108,20 @@ fn test_ee_preflight_check_with_chained_destructive_tail_is_still_blocked() {
         "Chained destructive tail must still be blocked even after an inspection wrapper, but got: {output}",
     );
 }
+
+// Regression test for the redirect-tail bypass (security audit of dcg#132):
+// `ee preflight check --cmd foo > /etc/passwd` must still be blocked because
+// the shell redirect in the tail is independent harm, even though the --cmd
+// argument is only data. The redirect-tail metachar guard in
+// `tail_has_shell_chain_metachars` ensures the inspection-wrapper exemption
+// does NOT apply when bare `>` / `<` operators are present in the tail.
+#[test]
+fn test_ee_preflight_check_with_redirect_tail_is_still_blocked() {
+    let cmd = "ee preflight check --cmd foo > /etc/passwd";
+    let output = run_hook_with_allowlist(cmd, "");
+
+    assert!(
+        output.contains("deny") || output.contains("permissionDecision"),
+        "Redirect tail after inspection wrapper must still be blocked, but got: {output}",
+    );
+}
