@@ -162,15 +162,16 @@ impl NetworkPolicy {
 
                 match severity {
                     NetworkSeverity::Allowed => Some(Decision::Allow),
-                    NetworkSeverity::Suspicious => {
-                        Some(Decision::prompt(format!("network: suspicious destination ({url})"), short_code))
-                    }
-                    NetworkSeverity::Dangerous => {
-                        Some(Decision::deny(format!("network: denied destination ({url})")))
-                    }
-                    NetworkSeverity::Exfiltration => {
-                        Some(Decision::deny(format!("network: exfiltration pattern detected ({url})")))
-                    }
+                    NetworkSeverity::Suspicious => Some(Decision::prompt(
+                        format!("network: suspicious destination ({url})"),
+                        short_code,
+                    )),
+                    NetworkSeverity::Dangerous => Some(Decision::deny(format!(
+                        "network: denied destination ({url})"
+                    ))),
+                    NetworkSeverity::Exfiltration => Some(Decision::deny(format!(
+                        "network: exfiltration pattern detected ({url})"
+                    ))),
                 }
             }
             _ => None,
@@ -212,19 +213,37 @@ pub fn default_policy() -> NetworkPolicy {
 
     // Allowed hosts — common developer endpoints.
     for host in [
-        "github.com", "api.github.com", "*.github.com",
-        "gitlab.com", "*.gitlab.com", "bitbucket.org", "*.bitbucket.org",
-        "registry.npmjs.org", "registry.npmmirror.com",
-        "pypi.org", "files.pythonhosted.org",
-        "cdn.jsdelivr.net", "cdn.bundler.io", "rubygems.org",
-        "repo.maven.apache.org", "dl.google.com",
-        "go.dev", "proxy.golang.org",
+        "github.com",
+        "api.github.com",
+        "*.github.com",
+        "gitlab.com",
+        "*.gitlab.com",
+        "bitbucket.org",
+        "*.bitbucket.org",
+        "registry.npmjs.org",
+        "registry.npmmirror.com",
+        "pypi.org",
+        "files.pythonhosted.org",
+        "cdn.jsdelivr.net",
+        "cdn.bundler.io",
+        "rubygems.org",
+        "repo.maven.apache.org",
+        "dl.google.com",
+        "go.dev",
+        "proxy.golang.org",
     ] {
         policy.add_allowed_host(host);
     }
 
     // Suspicious patterns.
-    for pat in [r"\.tk$", r"\.ml$", r"\.ga$", r"\.cf$", r"ipfs\.io", r"\.onion"] {
+    for pat in [
+        r"\.tk$",
+        r"\.ml$",
+        r"\.ga$",
+        r"\.cf$",
+        r"ipfs\.io",
+        r"\.onion",
+    ] {
         policy.add_suspicious_pattern(pat);
     }
 
@@ -248,7 +267,10 @@ mod tests {
 
     #[test]
     fn test_extract_host_https() {
-        assert_eq!(extract_host("https://api.github.com/users"), "api.github.com");
+        assert_eq!(
+            extract_host("https://api.github.com/users"),
+            "api.github.com"
+        );
     }
 
     #[test]
@@ -263,23 +285,35 @@ mod tests {
         // *.github.com matches subdomains like api.github.com and raw.githubusercontent.com
         // Note: raw.githubusercontent.com ends with .com, not .github.com, so it doesn't match
         // The correct pattern for matching github.com AND its subdomains would be to add both
-        assert!(matches!(policy.evaluate_url("https://api.github.com"), NetworkSeverity::Allowed));
+        assert!(matches!(
+            policy.evaluate_url("https://api.github.com"),
+            NetworkSeverity::Allowed
+        ));
         // raw.githubusercontent.com does NOT end with .github.com, so it goes to suspicious
-        assert!(matches!(policy.evaluate_url("https://raw.githubusercontent.com"), NetworkSeverity::Suspicious));
+        assert!(matches!(
+            policy.evaluate_url("https://raw.githubusercontent.com"),
+            NetworkSeverity::Suspicious
+        ));
     }
 
     #[test]
     fn test_exfiltration_denied() {
         let mut policy = NetworkPolicy::new();
         policy.add_exfiltration_pattern(r"telnet://");
-        assert!(matches!(policy.evaluate_url("telnet://evil.com"), NetworkSeverity::Exfiltration));
+        assert!(matches!(
+            policy.evaluate_url("telnet://evil.com"),
+            NetworkSeverity::Exfiltration
+        ));
     }
 
     #[test]
     fn test_denied_ip_ranges() {
         let mut policy = NetworkPolicy::new();
         policy.add_denied_ip_range("10.0.0.0/8");
-        assert!(matches!(policy.evaluate_url("http://10.0.0.1:8080"), NetworkSeverity::Dangerous));
+        assert!(matches!(
+            policy.evaluate_url("http://10.0.0.1:8080"),
+            NetworkSeverity::Dangerous
+        ));
     }
 
     #[test]

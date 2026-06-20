@@ -33,7 +33,7 @@ enabled = ["kubernetes", "database", "containers"]
 | [monitoring](monitoring.md) | 5 | Splunk, Datadog, PagerDuty, ... |
 | [package_managers](package_managers.md) | 1 | Package Managers |
 | [payment](payment.md) | 3 | Stripe, Braintree, Square |
-| [platform](platform.md) | 4 | GitHub Platform, GitLab Platform, Railway Platform, ... |
+| [platform](platform.md) | 5 | GitHub Platform, GitLab Platform, Railway Platform, ... |
 | [remote](remote.md) | 3 | rsync, ssh, scp |
 | [search](search.md) | 4 | Elasticsearch, OpenSearch, Algolia, ... |
 | [secrets](secrets.md) | 4 | HashiCorp Vault, AWS Secrets Manager, 1Password CLI, ... |
@@ -64,6 +64,7 @@ enabled = ["kubernetes", "database", "containers"]
 - [`platform.gitlab`](platform.md#platformgitlab)
 - [`platform.railway`](platform.md#platformrailway)
 - [`platform.modal`](platform.md#platformmodal)
+- [`platform.kamal`](platform.md#platformkamal)
 - [`dns.cloudflare`](dns.md#dnscloudflare)
 - [`dns.route53`](dns.md#dnsroute53)
 - [`dns.generic`](dns.md#dnsgeneric)

@@ -374,14 +374,39 @@ if (Get-Command cosign -ErrorAction SilentlyContinue) {
   Write-Info "Fetching sigstore bundle from $SigstoreBundleUrl"
   try {
     Invoke-WebRequest -Uri $SigstoreBundleUrl -OutFile $bundleFile -UseBasicParsing
-    & cosign verify-blob --bundle $bundleFile --certificate-identity-regexp $CosignIdentityRegex --certificate-oidc-issuer $CosignOidcIssuer $zipFile | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-      Write-Err "Signature verification failed"
-      exit 1
-    }
-    Write-Ok "Signature verified (cosign)"
   } catch {
     Write-Warn "Sigstore bundle not found; skipping signature verification"
+    $bundleFile = $null
+  }
+  if ($bundleFile) {
+    # --new-bundle-format: the release ships the modern Sigstore protobuf
+    # bundle (v0.3, cert under verificationMaterial.certificate) produced by
+    # cosign v3.x in dist.yml. cosign can only parse that --bundle shape when
+    # --new-bundle-format is passed; the flag was introduced in cosign v2.4.0
+    # (sigstore/cosign#3796). An older cosign on PATH dies with
+    # "unknown flag: --new-bundle-format" (exit 1) and cannot verify a v0.3
+    # bundle at all even without the flag (it would fall back to the legacy
+    # shape and fail with "bundle does not contain cert for verification,
+    # please provide public key" -- issue #140).
+    #
+    # Signature verification is best-effort (the SHA256 checksum is already
+    # verified and required above; the cosign-not-found and bundle-not-found
+    # branches warn-and-skip rather than abort). So probe whether this cosign
+    # supports the flag: if not, warn and skip instead of aborting the install
+    # on an honest old client. A cosign that supports the flag is the only one
+    # that can meaningfully verify the bundle, and for it a non-zero exit is a
+    # real verification failure we still abort on.
+    $cosignHelp = (& cosign verify-blob --help 2>&1 | Out-String)
+    if ($cosignHelp -notmatch '--new-bundle-format') {
+      Write-Warn "cosign is too old to verify the modern Sigstore bundle (needs >= 2.4.0 for --new-bundle-format); skipping signature verification (checksum already verified)"
+    } else {
+      & cosign verify-blob --new-bundle-format --bundle $bundleFile --certificate-identity-regexp $CosignIdentityRegex --certificate-oidc-issuer $CosignOidcIssuer $zipFile | Out-Null
+      if ($LASTEXITCODE -ne 0) {
+        Write-Err "Signature verification failed"
+        exit 1
+      }
+      Write-Ok "Signature verified (cosign)"
+    }
   }
 } else {
   Write-Warn "cosign not found; skipping signature verification (install cosign for stronger authenticity checks)"

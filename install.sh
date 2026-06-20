@@ -941,7 +941,43 @@ verify_sigstore_bundle() {
     return 0
   fi
 
+  # The release is signed by cosign v3.x (sigstore/cosign-installer in
+  # dist.yml), which emits the modern Sigstore protobuf bundle
+  # (mediaType "application/vnd.dev.sigstore.bundle.v0.3+json", with the
+  # signing cert under verificationMaterial.certificate). cosign only knows
+  # how to parse that bundle shape from --bundle when --new-bundle-format is
+  # passed; that flag was introduced in cosign v2.4.0 (PR sigstore/cosign#3796).
+  #
+  # Two failure modes have to be kept distinct (issue #140):
+  #   1. A cosign that DOES understand the modern bundle but the signature
+  #      genuinely does not verify -> a real tamper/corruption signal -> abort.
+  #   2. A cosign too old to know --new-bundle-format (< 2.4.0). Passing the
+  #      flag makes it die with "unknown flag: --new-bundle-format" (exit 1),
+  #      and even without the flag it cannot parse a v0.3 protobuf bundle at all
+  #      (it would fall back to the legacy shape and fail with "bundle does not
+  #      contain cert for verification, please provide public key"). Such a
+  #      client simply cannot verify this bundle no matter what we pass.
+  #
+  # The earlier form of this function unconditionally passed --new-bundle-format
+  # and treated ANY non-zero cosign exit as fatal, so an honest user whose only
+  # sin was an old cosign on PATH had their install / `dcg update` aborted on the
+  # "unknown flag" error. That is strictly worse than the pre-#140 behaviour.
+  #
+  # Signature verification is best-effort here (the SHA256 checksum is already
+  # verified and required just above the call site; the same "cosign not found"
+  # and "bundle not found" branches above warn-and-skip rather than abort). So:
+  # only pass --new-bundle-format when this cosign actually supports it, and if
+  # it does not, warn and skip rather than fail the whole install. A cosign that
+  # supports the flag is the only one that can meaningfully verify the bundle,
+  # and for that one a non-zero exit is a real failure we still abort on.
+  local nbf_flag="--new-bundle-format"
+  if ! cosign verify-blob --help 2>/dev/null | grep -q -- "$nbf_flag"; then
+    warn "cosign is too old to verify the modern Sigstore bundle (needs >= 2.4.0 for ${nbf_flag}); skipping signature verification (checksum already verified)"
+    return 0
+  fi
+
   if ! cosign verify-blob \
+    "$nbf_flag" \
     --bundle "$bundle_file" \
     --certificate-identity-regexp "$COSIGN_IDENTITY_RE" \
     --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \

@@ -60,9 +60,7 @@ pub use effect::{Effect, is_subset as is_effect_subset};
 pub use engine::{Engine, EngineConfig, EngineConfigBuilder};
 pub use escalation::DenialConfig;
 pub use mode::{Mode, ModePreCheck};
-pub use network_policy::{
-    default_policy, NetworkPolicy, NetworkSeverity,
-};
+pub use network_policy::{NetworkPolicy, NetworkSeverity, default_policy};
 pub use protected_paths::{ProtectedPathEntry, ProtectedPaths, ProtectedSeverity};
 pub use safe_whitelist::SafeCommandWhitelist;
 pub use session::{ALLOW_ONCE_CODE_LEN, ALLOW_ONCE_TTL, AllowOnceEntry, Session};

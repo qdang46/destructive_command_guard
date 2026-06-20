@@ -7,6 +7,8 @@ This document describes packs in the `platform` category.
 - [GitHub Platform](#platformgithub)
 - [GitLab Platform](#platformgitlab)
 - [Railway Platform](#platformrailway)
+- [Kamal](#platformkamal)
+
 - [Modal Platform](#platformmodal)
 
 ---
@@ -323,6 +325,82 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "platform.modal:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+## Kamal
+
+**Pack ID:** `platform.kamal`
+
+Protects against destructive Kamal 2.x operations that tear down the stack, delete accessory data directories, drop proxy routing, take the app offline, or prune the images that rollback depends on.
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `kamal`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `kamal-audit` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?:\s|$)` |
+| `kamal-details` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+details(?:\s|$)` |
+| `kamal-config` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?:\s|$)` |
+| `kamal-secrets` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets(?:\s|$)` |
+| `kamal-deploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+deploy(?:\s|$)` |
+| `kamal-redeploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+redeploy(?:\s|$)` |
+| `kamal-setup` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+setup(?:\s|$)` |
+| `kamal-build` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?:\s|$)` |
+| `kamal-rollback` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+rollback(?:\s|$)` |
+| `kamal-upgrade` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+upgrade(?:\s|$)` |
+| `kamal-registry` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+registry\s+(?:login|logout)(?:\s|$)` |
+| `kamal-lock` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+lock(?:\s|$)` |
+| `kamal-server-bootstrap` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+server\s+bootstrap(?:\s|$)` |
+| `kamal-init` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?:\s|$)` |
+| `kamal-docs` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+docs(?:\s|$)` |
+| `kamal-help` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+help(?:\s|$)` |
+| `kamal-version` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?:\s|$)` |
+| `kamal-app-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|containers|images|logs|version|stale_containers|maintenance|live)(?:\s|$)` |
+| `kamal-accessory-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|logs|upgrade)(?:\s|$)` |
+| `kamal-proxy-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|boot_config|start|restart|details|logs)(?:\s|$)` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `kamal-remove` | kamal remove tears down the entire deployment, including stateful accessories. | critical |
+| `kamal-accessory-remove` | kamal accessory remove deletes the accessory container, image, AND its host data directory. | critical |
+| `kamal-app-remove` | kamal app remove takes the app offline by removing its containers and images. | high |
+| `kamal-app-stop` | kamal app stop stops the app container, causing an outage until restarted. | high |
+| `kamal-proxy-remove` | kamal proxy remove drops routing for every app behind that proxy on the host. | high |
+| `kamal-proxy-reboot` | kamal proxy reboot stops, removes, and recreates the proxy, causing a short outage. | high |
+| `kamal-proxy-stop` | kamal proxy stop drops routing for every app behind that proxy until it is started. | high |
+| `kamal-accessory-reboot` | kamal accessory reboot stops, removes, and recreates the accessory container (downtime). | high |
+| `kamal-accessory-stop` | kamal accessory stop stops the accessory (e.g. the database), erroring the app. | high |
+| `kamal-prune` | kamal prune removes older images/containers that kamal rollback relies on. | medium |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "platform.kamal:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "platform.kamal:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

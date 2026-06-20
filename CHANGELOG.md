@@ -11,6 +11,63 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.6.0](https://github.com/quangdang46/destructive_command_guard/releases/tag/v0.6.0) -- 2026-06-21 [Release]
+
+Port of upstream changes from commits #125-#141.
+
+### Added
+
+- **Kamal deploy pack (`platform.kamal`).** Protects against destructive Kamal 2.x
+  operations: `kamal remove` (full teardown, critical), `kamal accessory remove`
+  (deletes data directory, critical), `kamal app remove|stop`,
+  `kamal proxy remove|reboot|stop`, `kamal accessory reboot|stop` (high), and
+  `kamal prune` (medium). Read-only inspection, deploy/redeploy, reversible
+  lifecycle, rollback, and meta commands are whitelisted (closes #141).
+- **Antigravity CLI (`agy`) guard support.** Full first-class support for Google's
+  Antigravity CLI successor to Gemini CLI. New `HookProtocol::Antigravity` +
+  `Agent::Antigravity` variant. `agy` nests its tool call under a `toolCall` object;
+  shell command read from `toolCall.args.CommandLine`. Detected via
+  `ANTIGRAVITY_CONVERSATION_ID` env var or `agy` parent process name.
+  `dcg install --agy` writes hooks to `~/.gemini/config/hooks.json`.
+  Blocks emit `{"decision":"block","reason":...}` with exit 0 (F5).
+
+### Fixed
+
+- **PowerShell tool names on Codex (Windows).** PowerShell tool names are now
+  unconditionally classified as Codex protocol, even without `turn_id`. On Windows,
+  Codex drives shell commands through PowerShell but does not always populate
+  `turn_id`. A PowerShell tool name is only ever emitted by Codex-style payloads —
+  Claude Code's shell tool is always "Bash" (closes #125).
+- **Built-in inspection-wrapper exemption.** Commands like
+  `ee preflight check --cmd "<destructive>"` are now allowed — they analyze
+  destructive commands as data, not instructions. Uses `command_prefix_safely_matches`
+  with anti-injection guards (closes #132).
+- **Close redirect-tail bypass in inspection-wrapper exemption.** Bare I/O redirect
+  operators (`>`, `<`, `>>`) in the tail are now treated as shell metacharacters,
+  preventing bypass via `ee preflight check --cmd foo > /etc/passwd` (followup to #132).
+- **Heredoc: language-aware string-literal scanning for interpreter-stdin heredocs.**
+  Interpreter-stdin (`python3 -`/`node -`) heredoc bodies are now language-aware:
+  string literals are scanned properly to distinguish data from executable code (#136).
+- **Heredoc: mask git stdin data sinks.** `git commit -F -`, `git hash-object --stdin`
+  heredoc bodies are masked (treated as data, not shell code), so commit messages
+  containing "restore" or "reset --hard" no longer false-positive (#136).
+- **Heredoc: stop masking interpreter-stdin bodies.** `python3 -`/`node -` bodies
+  remain deliberately unmasked because their body IS executed (#136, close false-negative gap).
+- **Heredoc: target resolution bounded to one line.** Prevents unbounded backward
+  scan from masking genuinely-executing heredoc bodies (#136, soundness fix).
+- **cosign signature verification.** `install.sh` and `install.ps1` now probe whether
+  cosign supports `--new-bundle-format` before passing it, so an old cosign on PATH
+  doesn't abort the install (closes #140).
+- **Pi agent integration recipe.** New `docs/pi-integration.md` with a ready-to-use
+  `dcg-guard.ts` extension for Pi coding agent (closes #133).
+- **Correct no-config default pack set documentation.** Fixes the default pack
+  count and adds `platform.kamal` to the pack reference (closes #138).
+
+### Dependencies
+
+- Bump rust-minor-patch group: 5 updates (#134), 12 updates (#139).
+- Bump codecov/codecov-action from 6 to 7 (#137).
+
 ## [v0.6.0-rc.1](https://github.com/Dicklesworthstone/destructive_command_guard) -- 2026-05-24 [Pre-release]
 
 ### New: `dcg-core` library crate + permission-modes API

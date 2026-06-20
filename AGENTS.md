@@ -242,8 +242,8 @@ JSON Input → Parse → Quick Reject (memchr) → Normalize → Safe Patterns �
 | File | Purpose |
 |------|---------|
 | `src/main.rs` | Entry point, hook I/O, CLI dispatch |
-| `src/evaluator.rs` | Pattern matching engine (safe + destructive evaluation) |
-| `src/hook.rs` | Claude Code PreToolUse hook protocol handling |
+| `crates/dcg-cli/src/evaluator.rs` | Pattern matching engine (safe + destructive evaluation) |
+| `crates/dcg-cli/src/hook.rs` | Claude Code PreToolUse hook protocol handling |
 | `src/normalize.rs` | Command normalization (path stripping, alias expansion) |
 | `src/heredoc.rs` | Heredoc and inline script extraction |
 | `src/ast_matcher.rs` | AST-based pattern matching for embedded code |
@@ -642,8 +642,8 @@ Runs `cargo llvm-cov` and enforces the thresholds configured in
 `.github/workflows/ci.yml` (`OVERALL_MIN`, `EVALUATOR_MIN`, `HOOK_MIN`).
 These are enforced gates, not aspirational targets:
 - **Overall:** >= 70%
-- **src/evaluator.rs:** >= 65%
-- **src/hook.rs:** >= 70%
+- **crates/dcg-cli/src/evaluator.rs:** >= 65%
+- **crates/dcg-cli/src/hook.rs:** >= 70%
 
 If CI thresholds change, update this section in the same change. The
 `coverage_threshold_docs` test checks that these documented values stay in sync

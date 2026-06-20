@@ -62,6 +62,15 @@ pub struct HookInput {
     /// would silently drop dcg's standard hookSpecificOutput payload.
     #[serde(alias = "turnId")]
     pub turn_id: Option<String>,
+
+    /// Antigravity CLI (`agy`) tool-call envelope. Unlike Claude/Gemini/Grok,
+    /// `agy` nests the tool name and arguments under a `toolCall` object:
+    /// `{"toolCall": {"name": "run_command", "args": {"CommandLine": "...",
+    /// "Cwd": "..."}}, "conversationId": "...", "stepIdx": 4, ...}`. The shell
+    /// command lives in `toolCall.args.CommandLine`. Verified empirically by
+    /// capturing the stdin `agy` passes to a `PreToolUse` hook.
+    #[serde(alias = "toolCall")]
+    pub tool_call: Option<ToolCall>,
 }
 
 /// Tool-specific input containing the command to execute.
@@ -69,6 +78,20 @@ pub struct HookInput {
 pub struct ToolInput {
     /// The command string (for Bash tools).
     pub command: Option<serde_json::Value>,
+}
+
+/// Antigravity CLI (`agy`) tool-call envelope.
+///
+/// `agy` emits `{"name": "run_command", "args": {"CommandLine": "...",
+/// "Cwd": "...", "WaitMsBeforeAsync": 500}}`. The shell command is in
+/// `args.CommandLine`.
+#[derive(Debug, Deserialize)]
+pub struct ToolCall {
+    /// The tool name (e.g. `"run_command"` for the shell tool).
+    pub name: Option<String>,
+
+    /// Tool arguments. For `run_command`, this carries `CommandLine`.
+    pub args: Option<serde_json::Value>,
 }
 
 /// Output structure for denying a command.
@@ -376,6 +399,22 @@ pub enum HookProtocol {
     /// `severity`, `remediation`, …) pass through unmolested for any tooling
     /// that wants them. See `~/.grok/docs/user-guide/10-hooks.md`.
     Grok,
+    /// Google Antigravity CLI (`agy`) protocol. Wire shape: stdin carries a
+    /// nested `toolCall` object — `{"toolCall": {"name": "run_command",
+    /// "args": {"CommandLine": "<cmd>", "Cwd": "<dir>"}}, "conversationId":
+    /// "...", "stepIdx": N, "transcriptPath": "...", "workspacePaths": [...]}`.
+    /// The shell command is in `toolCall.args.CommandLine` and the shell tool
+    /// name is `run_command`. Block decision is expressed via stdout JSON
+    /// `{"decision": "block", "reason": "..."}` with exit code 0 — verified
+    /// empirically: `agy` honors both `"block"` and `"deny"` decision keywords
+    /// and aborts the `run_command` tool, whereas a non-zero exit code is only
+    /// logged (`pre-tool hook ... failed: ... exit status 2`) and does NOT
+    /// reliably abort the tool. `agy`'s parser does not use
+    /// `deny_unknown_fields`, so dcg's ergonomics fields (`ruleId`, `packId`,
+    /// `severity`, `remediation`, …) pass through unmolested. `agy` reads its
+    /// hook config from `~/.gemini/config/hooks.json` (with
+    /// `~/.gemini/antigravity-cli/hooks.json` symlinked to it).
+    Antigravity,
 }
 
 /// Allow-once metadata for denial output.
@@ -484,6 +523,26 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     let hook_event_name = input.hook_event_name.as_deref().unwrap_or_default();
+
+    // --- Antigravity CLI (`agy`) indicators (checked first) ---
+    // `agy` is the only agent that nests the tool name and arguments under a
+    // `toolCall` object (`{"toolCall": {"name": "run_command", "args":
+    // {"CommandLine": "..."}}}`). None of the other supported agents emit a
+    // `toolCall` field, so its mere presence unambiguously identifies `agy`.
+    // We check this before every other protocol so the `agy`-specific deny
+    // shape (stdout `{"decision":"block",...}` + exit 0) is always used.
+    if let Some(tool_call) = input.tool_call.as_ref() {
+        let tool_call_name = tool_call
+            .name
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        // An empty/absent name still indicates the `agy` envelope shape; a
+        // populated name should be the shell tool `run_command`.
+        if tool_call_name.is_empty() || tool_call_name == "run_command" {
+            return HookProtocol::Antigravity;
+        }
+    }
 
     // --- Hermes Agent indicators (checked first) ---
     // Hermes uses two distinctive markers:
@@ -659,13 +718,29 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // Grok (xAI) shell tool. Grok aliases Claude-style "Bash" to its
             // internal name `run_terminal_cmd` before invoking hooks, so the
             // toolName field on the wire is always this canonical form.
+            // Antigravity CLI (`agy`) shell tool name.
+            // `agy` uses `name: "run_command"` under the `toolCall` envelope.
             | "run_terminal_cmd"
+            | "run_command"
     )
 }
 
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
     if is_supported_shell_tool(input.tool_name.as_deref()) {
         return true;
+    }
+
+    // Antigravity CLI (`agy`): the shell tool is `run_command`, named under
+    // `toolCall.name`, with the command in `toolCall.args.CommandLine`.
+    if let Some(tool_call) = input.tool_call.as_ref() {
+        let name = tool_call
+            .name
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if name == "run_command" || (name.is_empty() && tool_call.args.is_some()) {
+            return true;
+        }
     }
 
     input.tool_name.is_none()
@@ -720,6 +795,17 @@ pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookP
     if let Some(tool_args) = input.tool_args.as_ref() {
         if let Some(command) = extract_command_from_tool_args(tool_args) {
             return Some((command, protocol));
+        }
+    }
+
+    // Antigravity CLI (`agy`): command is in `toolCall.args.CommandLine`.
+    if let Some(tool_call) = input.tool_call.as_ref() {
+        if let Some(args) = tool_call.args.as_ref() {
+            if let Some(command) = args.get("CommandLine").and_then(|v| v.as_str()) {
+                if !command.is_empty() {
+                    return Some((command.to_string(), protocol));
+                }
+            }
         }
     }
 
@@ -1085,7 +1171,8 @@ pub fn write_denial_to(
         | HookProtocol::Copilot
         | HookProtocol::Gemini
         | HookProtocol::Hermes
-        | HookProtocol::Grok => WarningAudience::HumanOperator,
+        | HookProtocol::Grok
+        | HookProtocol::Antigravity => WarningAudience::HumanOperator,
     };
 
     print_colorful_warning_to(
@@ -1216,6 +1303,24 @@ pub fn write_denial_to(
                 confidence,
                 remediation,
             };
+
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Antigravity => {
+            // `agy` honors `{"decision":"block","reason":...}` with exit code 0.
+            // Verified empirically: both "block" and "deny" keywords abort the
+            // `run_command` tool, whereas a non-zero exit code is only logged and
+            // does NOT reliably abort the tool. We always emit exit 0 + JSON.
+            let output = serde_json::json!({
+                "decision": "block",
+                "reason": message.clone(),
+                "ruleId": rule_id,
+                "packId": pack,
+                "severity": severity.map(|s| format!("{:?}", s)),
+                "confidence": confidence,
+                "remediation": remediation,
+            });
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
@@ -1438,6 +1543,19 @@ pub(crate) fn write_warning_to(
                 confidence: None,
                 remediation: None,
             };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Antigravity => {
+            // `agy` supports `{"decision":"allow","reason":...}` and does not
+            // surface a "warn" concept via its hook API. Emit an explicit
+            // "allow" with the warning text in the `reason` field, which `agy`
+            // logs in the hooks scrollback. Verified empirically that `agy`
+            // preserves `reason` on allow decisions.
+            let output = serde_json::json!({
+                "decision": "allow",
+                "reason": warn_reason,
+            });
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }

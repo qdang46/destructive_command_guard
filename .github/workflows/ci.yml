@@ -316,13 +316,13 @@ jobs:
 
           echo "Coverage thresholds:"
           echo "  overall >= ${OVERALL_MIN}%"
-          echo "  src/evaluator.rs >= ${EVALUATOR_MIN}%"
-          echo "  src/hook.rs >= ${HOOK_MIN}%"
+          echo "  crates/dcg-cli/src/evaluator.rs >= ${EVALUATOR_MIN}%"
+          echo "  crates/dcg-cli/src/hook.rs >= ${HOOK_MIN}%"
           echo ""
           echo "Observed coverage:"
           printf "  overall=%.2f%%\n" "$overall"
-          printf "  src/evaluator.rs=%.2f%%\n" "$evaluator"
-          printf "  src/hook.rs=%.2f%%\n" "$hook"
+          printf "  crates/dcg-cli/src/evaluator.rs=%.2f%%\n" "$evaluator"
+          printf "  crates/dcg-cli/src/hook.rs=%.2f%%\n" "$hook"
 
           echo "coverage_overall=${overall}" >> "$GITHUB_OUTPUT"
           echo "coverage_evaluator=${evaluator}" >> "$GITHUB_OUTPUT"
@@ -338,18 +338,18 @@ jobs:
           fi
 
           if [ -z "$evaluator" ] || [ "$evaluator" = "null" ]; then
-            echo "::error::Failed to parse src/evaluator.rs coverage from coverage.json"
+            echo "::error::Failed to parse crates/dcg-cli/crates/dcg-cli/src/evaluator.rs coverage from coverage.json"
             failures=$((failures + 1))
           elif awk -v v="$evaluator" -v min="$EVALUATOR_MIN" 'BEGIN{exit !(v+0 < min+0)}'; then
-            printf "::error::src/evaluator.rs coverage %.2f%% is below ${EVALUATOR_MIN}%%\n" "$evaluator"
+            printf "::error::crates/dcg-cli/src/evaluator.rs coverage %.2f%% is below ${EVALUATOR_MIN}%%\n" "$evaluator"
             failures=$((failures + 1))
           fi
 
           if [ -z "$hook" ] || [ "$hook" = "null" ]; then
-            echo "::error::Failed to parse src/hook.rs coverage from coverage.json"
+            echo "::error::Failed to parse crates/dcg-cli/crates/dcg-cli/src/hook.rs coverage from coverage.json"
             failures=$((failures + 1))
           elif awk -v v="$hook" -v min="$HOOK_MIN" 'BEGIN{exit !(v+0 < min+0)}'; then
-            printf "::error::src/hook.rs coverage %.2f%% is below ${HOOK_MIN}%%\n" "$hook"
+            printf "::error::crates/dcg-cli/src/hook.rs coverage %.2f%% is below ${HOOK_MIN}%%\n" "$hook"
             failures=$((failures + 1))
           fi
 

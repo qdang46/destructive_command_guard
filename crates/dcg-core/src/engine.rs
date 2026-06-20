@@ -136,10 +136,7 @@ impl Engine {
     #[allow(clippy::needless_pass_by_value)]
     #[must_use]
     pub fn new(config: EngineConfig) -> Self {
-        let protected = build_protected_paths(
-            &config.protected_paths_raw,
-            &config.working_dir,
-        );
+        let protected = build_protected_paths(&config.protected_paths_raw, &config.working_dir);
         let network_policy = config.network_policy.clone().unwrap_or_else(default_policy);
         Self {
             config: config.clone(),
@@ -321,9 +318,9 @@ impl Engine {
                     );
                 }
                 if strict_mode_active {
-                    return Decision::deny(
-                        format!("network: suspicious destination ({url}) [strict mode]"),
-                    );
+                    return Decision::deny(format!(
+                        "network: suspicious destination ({url}) [strict mode]"
+                    ));
                 }
                 Decision::prompt(
                     format!("network: suspicious destination ({url})"),
@@ -365,7 +362,8 @@ impl Engine {
             );
         }
 
-        let should_escalate = session.consecutive_denials() >= self.config.strictness.max_consecutive
+        let should_escalate = session.consecutive_denials()
+            >= self.config.strictness.max_consecutive
             || session.total_denials() >= self.config.strictness.max_total;
 
         if should_escalate {
@@ -396,7 +394,9 @@ impl Engine {
         let cmd_repr = tool_repr(tool);
         session.bump_deny_counter(&cmd_repr);
 
-        if self.denial_config.should_escalate(session.consecutive_denials(), session.total_denials())
+        if self
+            .denial_config
+            .should_escalate(session.consecutive_denials(), session.total_denials())
         {
             let code = session.generate_allow_once_code(&cmd_repr);
             Decision::prompt(
@@ -429,7 +429,10 @@ fn build_protected_paths(user_entries: &[String], working_dir: &Path) -> Protect
     // User-supplied entries — all get PromptInNonBypass by default.
     for raw in user_entries {
         let prefix = expand_path(raw, working_dir, home.as_deref());
-        entries.push(ProtectedPathEntry::new(prefix, ProtectedSeverity::PromptInNonBypass));
+        entries.push(ProtectedPathEntry::new(
+            prefix,
+            ProtectedSeverity::PromptInNonBypass,
+        ));
     }
 
     // Built-in PromptAlways entries — override even BypassPermissions.
@@ -443,9 +446,16 @@ fn build_protected_paths(user_entries: &[String], working_dir: &Path) -> Protect
     }
 
     // Built-in PromptInNonBypass — always present for project config.
-    for raw in &[".env", ".env.local", ".env.production",
-        ".git", ".mcp.json", ".claude.json",
-        ".claude", ".vscode"] {
+    for raw in &[
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".git",
+        ".mcp.json",
+        ".claude.json",
+        ".claude",
+        ".vscode",
+    ] {
         entries.push(ProtectedPathEntry::new(
             working_dir.join(raw),
             ProtectedSeverity::PromptInNonBypass,
@@ -622,7 +632,9 @@ mod tests {
         );
         assert!(d.is_prompt(), "got {d:?}");
         match d {
-            Decision::Prompt { allow_once_code, .. } => {
+            Decision::Prompt {
+                allow_once_code, ..
+            } => {
                 assert!(s.has_unused_allow_once(&allow_once_code));
             }
             _ => unreachable!(),
@@ -714,8 +726,16 @@ mod tests {
     fn strict_mode_denies_unknown_command() {
         let e = engine_with_strictness(vec![], "/work", Strictness::new(true));
         let mut s = Session::with_id("test");
-        let d = e.evaluate(&mut s, &ToolCall::bash("rm -rf /"), Mode::Default, &[Effect::Fs]);
-        assert!(d.is_deny(), "strict mode should deny unknown commands, got {d:?}");
+        let d = e.evaluate(
+            &mut s,
+            &ToolCall::bash("rm -rf /"),
+            Mode::Default,
+            &[Effect::Fs],
+        );
+        assert!(
+            d.is_deny(),
+            "strict mode should deny unknown commands, got {d:?}"
+        );
     }
 
     #[test]
@@ -728,7 +748,10 @@ mod tests {
             Mode::Default,
             &[Effect::Read],
         );
-        assert!(d.is_allow(), "strict mode should allow whitelisted commands, got {d:?}");
+        assert!(
+            d.is_allow(),
+            "strict mode should allow whitelisted commands, got {d:?}"
+        );
     }
 
     #[test]
@@ -741,7 +764,10 @@ mod tests {
             Mode::Default,
             &[Effect::MutateVcs],
         );
-        assert!(d.is_deny(), "strict mode should deny dangerous patterns, got {d:?}");
+        assert!(
+            d.is_deny(),
+            "strict mode should deny dangerous patterns, got {d:?}"
+        );
     }
 
     #[test]
@@ -770,7 +796,10 @@ mod tests {
             Mode::Default,
             &[Effect::Read],
         );
-        assert!(d.is_prompt(), "after escalation, subsequent should stay prompt, got {d:?}");
+        assert!(
+            d.is_prompt(),
+            "after escalation, subsequent should stay prompt, got {d:?}"
+        );
     }
 
     #[test]
@@ -805,7 +834,10 @@ mod tests {
             Mode::Default,
             &[Effect::Network],
         );
-        assert!(d.is_deny(), "strict mode should deny network calls not on safe list, got {d:?}");
+        assert!(
+            d.is_deny(),
+            "strict mode should deny network calls not on safe list, got {d:?}"
+        );
     }
 
     #[test]
@@ -820,7 +852,10 @@ mod tests {
             Mode::Default,
             &[Effect::Network],
         );
-        assert!(d.is_prompt(), "strict mode should prompt for network when configured, got {d:?}");
+        assert!(
+            d.is_prompt(),
+            "strict mode should prompt for network when configured, got {d:?}"
+        );
     }
 
     #[test]
@@ -833,7 +868,10 @@ mod tests {
             Mode::BypassPermissions,
             &[Effect::Write, Effect::Fs, Effect::Irreversible],
         );
-        assert!(d.is_allow(), "BypassPermissions should bypass even in strict mode, got {d:?}");
+        assert!(
+            d.is_allow(),
+            "BypassPermissions should bypass even in strict mode, got {d:?}"
+        );
     }
 
     #[test]
@@ -846,7 +884,10 @@ mod tests {
             Mode::AcceptEdits,
             &[Effect::Write, Effect::Fs, Effect::Irreversible],
         );
-        assert!(d.is_prompt(), "strict AcceptEdits should prompt on irreversible, got {d:?}");
+        assert!(
+            d.is_prompt(),
+            "strict AcceptEdits should prompt on irreversible, got {d:?}"
+        );
     }
 
     #[test]
@@ -872,7 +913,10 @@ mod tests {
             Mode::Default,
             &[Effect::Read],
         );
-        assert!(d.is_allow(), "non-strict mode should allow unknown commands, got {d:?}");
+        assert!(
+            d.is_allow(),
+            "non-strict mode should allow unknown commands, got {d:?}"
+        );
     }
 
     #[test]
@@ -898,7 +942,10 @@ mod tests {
             Mode::Default,
             &[Effect::Network],
         );
-        assert!(d.is_allow(), "github.com should be allowed by default policy, got {d:?}");
+        assert!(
+            d.is_allow(),
+            "github.com should be allowed by default policy, got {d:?}"
+        );
     }
 
     #[test]
@@ -911,7 +958,10 @@ mod tests {
             Mode::Default,
             &[Effect::Network],
         );
-        assert!(d.is_allow(), "registry.npmjs.org should be allowed, got {d:?}");
+        assert!(
+            d.is_allow(),
+            "registry.npmjs.org should be allowed, got {d:?}"
+        );
     }
 
     #[test]
@@ -924,7 +974,10 @@ mod tests {
             Mode::Default,
             &[Effect::Network],
         );
-        assert!(d.is_deny(), "private IP 10.0.0.1 should be denied, got {d:?}");
+        assert!(
+            d.is_deny(),
+            "private IP 10.0.0.1 should be denied, got {d:?}"
+        );
     }
 
     #[test]
@@ -937,7 +990,10 @@ mod tests {
             Mode::Default,
             &[Effect::Network],
         );
-        assert!(d.is_deny(), "telnet:// should be denied as exfiltration, got {d:?}");
+        assert!(
+            d.is_deny(),
+            "telnet:// should be denied as exfiltration, got {d:?}"
+        );
     }
 
     #[test]
@@ -978,7 +1034,10 @@ mod tests {
             Mode::BypassPermissions,
             &[Effect::Write, Effect::Fs],
         );
-        assert!(d.is_prompt(), "~/.ssh should prompt even in BypassPermissions, got {d:?}");
+        assert!(
+            d.is_prompt(),
+            "~/.ssh should prompt even in BypassPermissions, got {d:?}"
+        );
     }
 
     #[test]
@@ -993,7 +1052,10 @@ mod tests {
             Mode::BypassPermissions,
             &[Effect::Write, Effect::Fs],
         );
-        assert!(d.is_prompt(), "~/.aws should prompt even in BypassPermissions, got {d:?}");
+        assert!(
+            d.is_prompt(),
+            "~/.aws should prompt even in BypassPermissions, got {d:?}"
+        );
     }
 
     // =======================================================================
@@ -1037,7 +1099,10 @@ mod tests {
             Mode::Default,
             &[Effect::Read],
         );
-        assert!(d.is_allow(), "strict mode should allow git status, got {d:?}");
+        assert!(
+            d.is_allow(),
+            "strict mode should allow git status, got {d:?}"
+        );
     }
 
     #[test]

@@ -72,6 +72,11 @@ pub enum Agent {
     /// `~/.claude/settings.json` compatibility layer; emits `pre_tool_use`
     /// events with `run_terminal_cmd` as the shell tool).
     Grok,
+    /// Google Antigravity CLI (`agy`). Reads Claude-Code-compatible
+    /// `PreToolUse` hooks from `~/.gemini/config/hooks.json`; emits a tool-call
+    /// envelope with `toolCall.name = "run_command"` and the shell command in
+    /// `toolCall.args.CommandLine`.
+    Antigravity,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -96,6 +101,7 @@ impl Agent {
             Self::CursorIde => "cursor-ide",
             Self::Hermes => "hermes",
             Self::Grok => "grok",
+            Self::Antigravity => "antigravity",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -116,6 +122,7 @@ impl Agent {
                 | Self::CursorIde
                 | Self::Hermes
                 | Self::Grok
+                | Self::Antigravity
         )
     }
 
@@ -173,6 +180,7 @@ impl fmt::Display for Agent {
             Self::CursorIde => write!(f, "Cursor IDE"),
             Self::Hermes => write!(f, "Hermes Agent"),
             Self::Grok => write!(f, "Grok (xAI)"),
+            Self::Antigravity => write!(f, "Antigravity CLI"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -504,6 +512,19 @@ fn detect_from_environment() -> Option<DetectionResult> {
             Some("GROK_HOOK_EVENT".to_string()),
         ));
     }
+
+    // Antigravity CLI (`agy`) detection. `agy` exports
+    // `ANTIGRAVITY_CONVERSATION_ID=<uuid>` into the environment of the
+    // subprocesses it spawns (confirmed in the `agy` binary: the format
+    // string `ANTIGRAVITY_CONVERSATION_ID=%s`). This is the canonical session
+    // marker, mirroring CLAUDE_SESSION_ID / GROK_SESSION_ID.
+    if std::env::var("ANTIGRAVITY_CONVERSATION_ID").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Antigravity,
+            DetectionMethod::Environment,
+            Some("ANTIGRAVITY_CONVERSATION_ID".to_string()),
+        ));
+    }
     if std::env::var("GROK_WORKSPACE_ROOT").is_ok() {
         return Some(DetectionResult::new(
             Agent::Grok,
@@ -721,6 +742,7 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "cursor" | "cursor-ide" => Some(Agent::CursorIde),
         "hermes" | "hermes-agent" | "hermes-cli" => Some(Agent::Hermes),
         "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
+        "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         _ => None,
     }
 }

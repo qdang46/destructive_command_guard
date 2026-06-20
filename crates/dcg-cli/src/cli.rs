@@ -306,6 +306,14 @@ pub enum Command {
         /// but the native path gives the cleanest doctor output.
         #[arg(long)]
         grok: bool,
+
+        /// Install the dcg PreToolUse hook for the Antigravity CLI (`agy`) at
+        /// `~/.gemini/config/hooks.json` (user-level) or
+        /// `<repo>/.gemini/config/hooks.json` (with `--project`). `agy` reads
+        /// Claude-Code-compatible `PreToolUse` hooks from this file and aborts
+        /// its `run_command` shell tool when dcg returns a block decision.
+        #[arg(long)]
+        agy: bool,
     },
 
     /// Full setup: install hook + add shell startup check
@@ -1967,9 +1975,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             force,
             project,
             grok,
+            agy,
         }) => {
             if grok {
                 install_grok_hook(force, project)?;
+            } else if agy {
+                install_antigravity_hook(force, project)?;
             } else {
                 install_hook(force, project)?;
             }
@@ -10232,6 +10243,99 @@ fn install_grok_hook(force: bool, project: bool) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Install the dcg hook into the Antigravity CLI (`agy`) hooks config.
+///
+/// `agy` reads Claude-Code-compatible `PreToolUse` hooks from
+/// `~/.gemini/config/hooks.json` (canonical post-migration path; the legacy
+/// `~/.gemini/antigravity-cli/hooks.json` is symlinked to it). The file uses
+/// the exact same `{"hooks":{"PreToolUse":[{"matcher":...,"hooks":[{"type":
+/// "command","command":"dcg"}]}]}}` shape as Claude's `settings.json`, so we
+/// reuse `install_dcg_hook_into_settings`. When dcg returns a block decision
+/// (stdout `{"decision":"block",...}`), `agy` aborts its `run_command` tool.
+///
+/// With `--project`, writes to `<repo>/.gemini/config/hooks.json` instead.
+///
+/// Returns `Err` if the file cannot be read/written or, for project installs,
+/// if the current directory is not inside a git repository.
+fn install_antigravity_hook(force: bool, project: bool) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let hooks_path = if project {
+        project_antigravity_hooks_path()?
+    } else {
+        antigravity_hooks_path()
+    };
+
+    // `agy` migrates ~/.gemini/antigravity-cli/hooks.json to
+    // ~/.gemini/config/hooks.json and leaves a symlink at the old path. If the
+    // canonical file is itself a symlink (or the old path exists as a real
+    // file), prefer editing the real target so we don't clobber the symlink.
+    let mut settings: serde_json::Value = if hooks_path.exists() {
+        let file_content = std::fs::read_to_string(&hooks_path)?;
+        if file_content.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&file_content)?
+        }
+    } else {
+        if let Some(parent) = hooks_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        serde_json::json!({})
+    };
+
+    let changed = install_dcg_hook_into_settings(&mut settings, force)?;
+    if !changed {
+        println!("{}", "Hook already installed!".yellow());
+        println!("Use --force to reinstall");
+        return Ok(());
+    }
+
+    let content_body = serde_json::to_string_pretty(&settings)?;
+    std::fs::write(&hooks_path, content_body)?;
+
+    let level = if project { "project" } else { "user" };
+    println!(
+        "{}",
+        "Antigravity (agy) hook installed successfully!"
+            .green()
+            .bold()
+    );
+    println!("Hooks file updated ({level}): {}", hooks_path.display());
+    println!();
+    println!(
+        "{}",
+        "Restart agy (start a new session) for the change to take effect.".yellow()
+    );
+
+    Ok(())
+}
+
+/// Path to the user-level Antigravity (`agy`) hooks file
+/// (`~/.gemini/config/hooks.json`).
+///
+/// This is the canonical post-migration path: `agy` migrates
+/// `~/.gemini/antigravity-cli/hooks.json` here on first run and symlinks the
+/// old path to it. Both paths resolve to this file, so editing it is correct
+/// regardless of which one `agy` was last run with.
+fn antigravity_hooks_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".gemini")
+        .join("config")
+        .join("hooks.json")
+}
+
+/// Path to a project-level Antigravity (`agy`) hooks file
+/// (`<repo>/.gemini/config/hooks.json`).
+///
+/// Returns `Err` if the current directory is not inside a git repository.
+fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let repo_root = find_repo_root_from_cwd()
+        .ok_or("Not inside a git repository -- cannot determine project root")?;
+    Ok(repo_root.join(".gemini").join("config").join("hooks.json"))
+}
+
 /// The shell snippet that checks whether the DCG hook is still present in
 /// Claude Code settings on every new shell session. Runs in milliseconds,
 /// silent when the hook is present, yellow warning when missing.
@@ -14597,11 +14701,13 @@ mod tests {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(!force);
             assert!(project);
             assert!(!grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }
@@ -14614,11 +14720,13 @@ mod tests {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(force);
             assert!(project);
             assert!(!grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }
@@ -14631,11 +14739,13 @@ mod tests {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(!force);
             assert!(!project);
             assert!(grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }
@@ -14648,11 +14758,13 @@ mod tests {
             force,
             project,
             grok,
+            agy,
         }) = cli.command
         {
             assert!(!force);
             assert!(project);
             assert!(grok);
+            assert!(!agy);
         } else {
             unreachable!("Expected Install command");
         }

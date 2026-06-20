@@ -114,6 +114,7 @@ fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent:
         hook::HookProtocol::Copilot => Agent::CopilotCli.config_key(),
         hook::HookProtocol::Hermes => Agent::Hermes.config_key(),
         hook::HookProtocol::Grok => Agent::Grok.config_key(),
+        hook::HookProtocol::Antigravity => Agent::Antigravity.config_key(),
         hook::HookProtocol::ClaudeCompatible => detected_agent.config_key(),
     }
 }
@@ -128,6 +129,7 @@ fn effective_agent_for_hook_protocol(
         hook::HookProtocol::Copilot => Agent::CopilotCli,
         hook::HookProtocol::Hermes => Agent::Hermes,
         hook::HookProtocol::Grok => Agent::Grok,
+        hook::HookProtocol::Antigravity => Agent::Antigravity,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
     }
 }
