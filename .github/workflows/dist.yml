@@ -2,6 +2,11 @@ name: dist
 
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.6.0). If empty, reads version from Cargo.toml'
+        required: false
+        type: string
   push:
     tags:
       - 'v*'
@@ -245,10 +250,23 @@ jobs:
             cosign sign-blob --yes --bundle "$script.sigstore.json" "$script"
           done
 
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/dcg-cli/Cargo.toml | head -1)
+            echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
-          name: ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
           draft: false
           prerelease: false
           generate_release_notes: true

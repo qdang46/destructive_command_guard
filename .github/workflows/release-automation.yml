@@ -58,7 +58,9 @@ jobs:
               repo: context.repo.repo,
               workflow_id: 'dist.yml',
               ref: 'main',
-              inputs: {}
+              inputs: {
+                tag: tag
+              }
             });
             console.log('dist workflow triggered');
 
