@@ -1,6 +1,7 @@
 [workspace]
 members = ["crates/dcg-core", "crates/dcg-cli", "fuzz"]
 resolver = "2"
+default-members = ["crates/dcg-core", "crates/dcg-cli"]
 
 # Workspace-level shared profiles. Cargo applies these to every member
 # crate; per-crate profile overrides are silently ignored, so they live
