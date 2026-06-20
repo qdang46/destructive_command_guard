@@ -11,7 +11,7 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [v0.6.0](https://github.com/quangdang46/destructive_command_guard/releases/tag/v0.6.0) -- 2026-06-21 [Release]
+## [v0.1.0](https://github.com/quangdang46/destructive_command_guard/releases/tag/v0.1.0) -- 2026-06-21 [Release]
 
 Port of upstream changes from commits #125-#141.
 
