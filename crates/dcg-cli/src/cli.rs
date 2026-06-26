@@ -474,7 +474,11 @@ pub enum Command {
 
     /// Show current configuration
     #[command(name = "config")]
-    ShowConfig,
+    ShowConfig {
+        /// Output format (`pretty` for humans, `json` for agents/scripts)
+        #[arg(long, value_enum, default_value_t = ConfigFormat::Pretty, env = "DCG_FORMAT")]
+        format: ConfigFormat,
+    },
 
     /// Scan files for destructive commands (CI/pre-commit integration)
     ///
@@ -803,6 +807,18 @@ pub enum ClassifyFormat {
     /// Human-readable text output
     #[value(alias = "human")]
     Text,
+}
+
+/// Output format for the `config` command (issue #159).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ConfigFormat {
+    /// Human-readable text output
+    #[default]
+    #[value(alias = "text")]
+    Pretty,
+    /// Structured JSON output for programmatic consumption
+    #[value(alias = "sarif")]
+    Json,
 }
 
 /// Output format for packs list command.
@@ -1463,6 +1479,14 @@ pub struct ScanCommand {
     #[arg(long, value_name = "N", default_value = "10")]
     top: usize,
 
+    /// Files or directories to scan, given positionally.
+    ///
+    /// `dcg scan a.sh b.sh` is equivalent to `dcg scan --paths a.sh b.sh`
+    /// (issue #158). Mutually exclusive with `--staged`, `--git-diff`, and
+    /// `--paths`.
+    #[arg(value_name = "PATH", conflicts_with_all = ["staged", "git_diff", "paths"])]
+    positional_paths: Vec<std::path::PathBuf>,
+
     /// Optional action subcommand (pre-commit integration helpers)
     #[command(subcommand)]
     action: Option<ScanAction>,
@@ -1969,7 +1993,13 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             doctor(fix, format);
         }
         Some(Command::Hook(cmd)) => {
-            run_hook_command(&config, &cmd)?;
+            // `dcg hook` returns the process exit code (deny -> 1, parse halt
+            // -> 4, otherwise 0) so batch/JSONL consumers can gate on it
+            // (issues #148, #165).
+            let code = run_hook_command(&config, &cmd)?;
+            if code != crate::exit_codes::EXIT_SUCCESS {
+                std::process::exit(code);
+            }
         }
         Some(Command::Install {
             force,
@@ -2113,9 +2143,12 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 init_config(output, force)?;
             }
         }
-        Some(Command::ShowConfig) => {
+        Some(Command::ShowConfig { format }) => {
             if !verbosity.quiet {
-                show_config(&config);
+                match format {
+                    ConfigFormat::Json => show_config_json(&config),
+                    ConfigFormat::Pretty => show_config(&config),
+                }
             }
         }
         Some(Command::Allowlist { action }) => {
@@ -2259,15 +2292,14 @@ fn write_completions(shell: CompletionShell) -> Result<(), Box<dyn std::error::E
 
 /// Run the hook command with optional batch processing.
 #[allow(clippy::too_many_lines)]
-fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn std::error::Error>> {
+fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::{self, BufRead, Write};
 
-    // If not batch mode and not parallel, fall through to normal hook mode
-    if !cmd.batch && !cmd.parallel {
-        // Delegate to main.rs hook mode by returning an error
-        // that main.rs will catch and handle
-        return Err("Hook mode without --batch; delegating to main.rs".into());
-    }
+    // `dcg hook` reads JSONL hook payloads from stdin and writes one result
+    // line per (non-empty) input line. `--batch` is accepted for explicitness
+    // but is no longer required — a single JSON object on stdin is processed as
+    // a one-line batch instead of erroring with an internal message (issue
+    // #157). `--parallel` selects parallel evaluation.
 
     // Parallel implies batch
     let workers = if cmd.workers == 0 {
@@ -2313,25 +2345,60 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
     let stdout = io::stdout();
     let mut stdout_lock = stdout.lock();
 
+    // Running tallies across all emitted results:
+    // - `emit_index`: indices are assigned ONLY to emitted results, so blank
+    //   input lines (which are skipped entirely) do not create phantom indexed
+    //   entries (issue #154).
+    // - `any_deny`: if any command is denied, the process exits non-zero so a
+    //   caller can gate on the exit code, like `dcg test` does (issue #148).
+    // - `parse_halt`: without `--continue-on-error`, the first malformed line
+    //   emits an `error` result and then halts processing (issue #165).
+    let mut emit_index = 0usize;
+    let mut any_deny = false;
+    let mut parse_halt = false;
+
     if cmd.parallel && workers > 1 {
-        // Parallel processing: collect all lines, process in parallel, output in order
+        // Parallel processing: collect all non-blank lines, evaluate in
+        // parallel, then emit in input order. Blank lines are dropped here so
+        // they neither create indexed entries nor consume an index (#154).
         let lines: Vec<(usize, String)> = stdin
             .lock()
             .lines()
+            .map_while(std::result::Result::ok)
+            .filter(|l| !l.trim().is_empty())
             .enumerate()
-            .filter_map(|(idx, line)| line.ok().map(|l| (idx, l)))
             .collect();
 
-        // Process in parallel using rayon
         #[cfg(feature = "rayon")]
-        {
+        let mut results: Vec<(usize, BatchHookOutput)> = {
             use rayon::prelude::*;
 
-            let results: Vec<BatchHookOutput> = lines
+            lines
                 .into_par_iter()
-                .map(|(index, line)| {
+                .map(|(order, line)| {
+                    (
+                        order,
+                        evaluate_batch_line(
+                            &line,
+                            &enabled_keywords,
+                            &ordered_packs,
+                            keyword_index.as_ref(),
+                            &compiled_overrides,
+                            &allowlists,
+                            &heredoc_settings,
+                        ),
+                    )
+                })
+                .collect()
+        };
+
+        #[cfg(not(feature = "rayon"))]
+        let mut results: Vec<(usize, BatchHookOutput)> = lines
+            .into_iter()
+            .map(|(order, line)| {
+                (
+                    order,
                     evaluate_batch_line(
-                        index,
                         &line,
                         &enabled_keywords,
                         &ordered_packs,
@@ -2339,64 +2406,54 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
                         &compiled_overrides,
                         &allowlists,
                         &heredoc_settings,
-                        cmd.continue_on_error,
-                    )
-                })
-                .collect();
+                    ),
+                )
+            })
+            .collect();
 
-            // Sort by index and output
-            let mut sorted = results;
-            sorted.sort_by_key(|r| r.index);
+        results.sort_by_key(|(order, _)| *order);
 
-            for result in sorted {
-                let json = serde_json::to_string(&result)?;
-                writeln!(stdout_lock, "{json}")?;
+        for (_, mut result) in results {
+            result.index = emit_index;
+            emit_index += 1;
+            if result.decision == "deny" {
+                any_deny = true;
             }
-        }
-
-        // Fallback to sequential if rayon is not available
-        #[cfg(not(feature = "rayon"))]
-        {
-            for (index, line) in lines {
-                let result = evaluate_batch_line(
-                    index,
-                    &line,
-                    &enabled_keywords,
-                    &ordered_packs,
-                    keyword_index.as_ref(),
-                    &compiled_overrides,
-                    &allowlists,
-                    &heredoc_settings,
-                    cmd.continue_on_error,
-                );
-                let json = serde_json::to_string(&result)?;
-                writeln!(stdout_lock, "{json}")?;
+            let halt = result.decision == "error" && !cmd.continue_on_error;
+            writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
+            if halt {
+                parse_halt = true;
+                break;
             }
         }
     } else {
-        // Sequential processing: stream input to output
-        for (index, line) in stdin.lock().lines().enumerate() {
+        // Sequential processing: stream input to output.
+        for line in stdin.lock().lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
                     if cmd.continue_on_error {
                         let result = BatchHookOutput {
-                            index,
+                            index: emit_index,
                             decision: "error",
                             rule_id: None,
                             pack_id: None,
                             error: Some(format!("IO error: {e}")),
                         };
-                        let json = serde_json::to_string(&result)?;
-                        writeln!(stdout_lock, "{json}")?;
+                        emit_index += 1;
+                        writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
                         continue;
                     }
                     return Err(e.into());
                 }
             };
 
-            let result = evaluate_batch_line(
-                index,
+            // Blank lines are skipped entirely: no output, no index (#154).
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let mut result = evaluate_batch_line(
                 &line,
                 &enabled_keywords,
                 &ordered_packs,
@@ -2404,20 +2461,41 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<(), Box<dyn st
                 &compiled_overrides,
                 &allowlists,
                 &heredoc_settings,
-                cmd.continue_on_error,
             );
-            let json = serde_json::to_string(&result)?;
-            writeln!(stdout_lock, "{json}")?;
+            result.index = emit_index;
+            emit_index += 1;
+            if result.decision == "deny" {
+                any_deny = true;
+            }
+            let halt = result.decision == "error" && !cmd.continue_on_error;
+            writeln!(stdout_lock, "{}", serde_json::to_string(&result)?)?;
+            if halt {
+                parse_halt = true;
+                break;
+            }
         }
     }
 
-    Ok(())
+    // Exit code contract for `dcg hook` (issues #148, #165):
+    // - any deny   -> EXIT_DENIED (1): callers can gate on the exit code.
+    // - parse halt -> EXIT_PARSE_ERROR (4): a malformed line stopped processing.
+    // - otherwise  -> EXIT_SUCCESS (0).
+    let exit_code = if any_deny {
+        crate::exit_codes::EXIT_DENIED
+    } else if parse_halt {
+        crate::exit_codes::EXIT_PARSE_ERROR
+    } else {
+        crate::exit_codes::EXIT_SUCCESS
+    };
+    Ok(exit_code)
 }
 
 /// Evaluate a single batch line and return the result.
+///
+/// The returned `index` is a placeholder (`0`); the caller assigns the real
+/// emit index so that skipped blank lines do not consume an index (issue #154).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn evaluate_batch_line(
-    index: usize,
     line: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
@@ -2425,12 +2503,11 @@ fn evaluate_batch_line(
     compiled_overrides: &crate::config::CompiledOverrides,
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
-    continue_on_error: bool,
 ) -> BatchHookOutput {
     // Skip empty lines
     if line.trim().is_empty() {
         return BatchHookOutput {
-            index,
+            index: 0,
             decision: "skip",
             rule_id: None,
             pack_id: None,
@@ -2438,21 +2515,14 @@ fn evaluate_batch_line(
         };
     }
 
-    // Parse JSON input
+    // Parse JSON input. A malformed line yields an `error` result; whether
+    // processing continues or halts after it is decided by the caller based on
+    // `--continue-on-error` (see `run_hook_command`, issue #165).
     let hook_input: crate::hook::HookInput = match serde_json::from_str(line) {
         Ok(input) => input,
         Err(e) => {
-            if continue_on_error {
-                return BatchHookOutput {
-                    index,
-                    decision: "error",
-                    rule_id: None,
-                    pack_id: None,
-                    error: Some(format!("JSON parse error: {e}")),
-                };
-            }
             return BatchHookOutput {
-                index,
+                index: 0,
                 decision: "error",
                 rule_id: None,
                 pack_id: None,
@@ -2463,7 +2533,7 @@ fn evaluate_batch_line(
 
     let Some((command, _protocol)) = crate::hook::extract_command_with_protocol(&hook_input) else {
         return BatchHookOutput {
-            index,
+            index: 0,
             decision: "skip",
             rule_id: None,
             pack_id: None,
@@ -2487,7 +2557,7 @@ fn evaluate_batch_line(
 
     match eval_result.decision {
         EvaluationDecision::Allow => BatchHookOutput {
-            index,
+            index: 0,
             decision: "allow",
             rule_id: None,
             pack_id: None,
@@ -2509,7 +2579,7 @@ fn evaluate_batch_line(
                     });
 
             BatchHookOutput {
-                index,
+                index: 0,
                 decision: "deny",
                 rule_id,
                 pack_id,
@@ -3844,9 +3914,11 @@ fn test_command(
 ) -> bool {
     use std::time::Instant;
 
-    if verbosity.quiet {
-        return false; // Not blocked in quiet mode
-    }
+    // NOTE: quiet mode is handled AFTER evaluation (see below) so the returned
+    // decision — and therefore the process exit code — still reflects whether
+    // the command is blocked. Returning early here would make
+    // `DCG_QUIET=1 dcg test <blocked>` exit 0 and silently bypass the block
+    // (issue #149).
 
     if verbosity.is_trace() && format == TestFormat::Pretty {
         handle_explain(config, command, ExplainFormat::Pretty, extra_packs);
@@ -3959,6 +4031,13 @@ fn test_command(
     }
 
     let elapsed = start.elapsed();
+
+    // Quiet mode: the command was fully evaluated above, so suppress all
+    // human/structured output but still return the real decision so the exit
+    // code is correct (blocked -> exit 1, allowed -> exit 0). See issue #149.
+    if verbosity.quiet {
+        return result.decision == EvaluationDecision::Deny;
+    }
 
     // Handle structured output (JSON/TOON)
     if format.is_structured() {
@@ -5258,6 +5337,107 @@ fn show_config(config: &Config) {
     }
 }
 
+/// Emit the current configuration as JSON for agents/scripts (issue #159).
+///
+/// Mirrors the fields shown by [`show_config`] in a stable, machine-readable
+/// shape so consumers can parse the active configuration without scraping the
+/// human-readable output.
+fn show_config_json(config: &Config) {
+    let lang_label = |lang: crate::heredoc::ScriptLanguage| -> &'static str {
+        match lang {
+            crate::heredoc::ScriptLanguage::Bash => "bash",
+            crate::heredoc::ScriptLanguage::Go => "go",
+            crate::heredoc::ScriptLanguage::Php => "php",
+            crate::heredoc::ScriptLanguage::Python => "python",
+            crate::heredoc::ScriptLanguage::Ruby => "ruby",
+            crate::heredoc::ScriptLanguage::Perl => "perl",
+            crate::heredoc::ScriptLanguage::JavaScript => "javascript",
+            crate::heredoc::ScriptLanguage::TypeScript => "typescript",
+            crate::heredoc::ScriptLanguage::Unknown => "unknown",
+        }
+    };
+
+    // Config sources, in lowest -> highest priority order, that actually exist.
+    let mut sources: Vec<serde_json::Value> = Vec::new();
+    let system_cfg = crate::config::system_config_dir().join("config.toml");
+    if system_cfg.exists() {
+        sources
+            .push(serde_json::json!({"level": "system", "path": system_cfg.display().to_string()}));
+    }
+    let user_cfg = config_path();
+    if user_cfg.exists() {
+        sources.push(serde_json::json!({"level": "user", "path": user_cfg.display().to_string()}));
+    }
+    if let Some(repo_root) = find_repo_root_from_cwd() {
+        let project_cfg = repo_root.join(".dcg.toml");
+        if project_cfg.exists() {
+            sources.push(
+                serde_json::json!({"level": "project", "path": project_cfg.display().to_string()}),
+            );
+        }
+    }
+    if let Ok(value) = std::env::var(crate::config::ENV_CONFIG_PATH) {
+        if let Some(path) = crate::config::resolve_config_path_value(
+            &value,
+            std::env::current_dir().ok().as_deref(),
+        ) {
+            sources.push(serde_json::json!({
+                "level": "explicit",
+                "path": path.display().to_string(),
+                "exists": path.exists(),
+            }));
+        }
+    }
+
+    let heredoc = config.heredoc_settings();
+    let languages = heredoc.allowed_languages.as_ref().map_or_else(
+        || serde_json::Value::String("all".to_string()),
+        |langs| {
+            serde_json::Value::Array(
+                langs
+                    .iter()
+                    .copied()
+                    .map(|l| serde_json::Value::String(lang_label(l).to_string()))
+                    .collect(),
+            )
+        },
+    );
+
+    // Sort enabled packs for deterministic JSON output (the set is unordered).
+    let mut enabled_packs: Vec<String> = config.enabled_pack_ids().into_iter().collect();
+    enabled_packs.sort();
+
+    let output = serde_json::json!({
+        "dcg_version": env!("CARGO_PKG_VERSION"),
+        "config_sources": sources,
+        "general": {
+            "color": config.general.color,
+            "verbose": config.general.verbose,
+            "log_file": config.general.log_file,
+        },
+        "packs": {
+            "enabled": enabled_packs,
+            "disabled": config.packs.disabled,
+        },
+        "heredoc": {
+            "enabled": heredoc.enabled,
+            "timeout_ms": heredoc.limits.timeout_ms,
+            "max_body_bytes": heredoc.limits.max_body_bytes,
+            "max_body_lines": heredoc.limits.max_body_lines,
+            "max_heredocs": heredoc.limits.max_heredocs,
+            "fail_open_on_parse_error": heredoc.fallback_on_parse_error,
+            "fail_open_on_timeout": heredoc.fallback_on_timeout,
+            "languages": languages,
+        },
+    });
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .unwrap_or_else(|_| "{\"error\":\"failed to serialize config\"}".to_string())
+    );
+}
+
 const DCG_SCAN_PRE_COMMIT_SENTINEL: &str = "# dcg:scan-pre-commit";
 
 fn build_scan_pre_commit_hook_script() -> String {
@@ -5659,8 +5839,20 @@ fn handle_scan_command(
         redact,
         truncate,
         top,
+        positional_paths,
         action,
     } = scan;
+
+    // Merge positionally-supplied paths into the `--paths` selection so
+    // `dcg scan a.sh b.sh` behaves like `dcg scan --paths a.sh b.sh` (issue
+    // #158). The two forms are mutually exclusive at the clap layer, so at most
+    // one is non-empty; prefer the explicit `--paths` if somehow both are set.
+    let paths = match (paths, positional_paths) {
+        (Some(p), _) => Some(p),
+        (None, pos) if !pos.is_empty() => Some(pos),
+        (None, _) => None,
+    };
+
     let effective_verbose = verbosity.is_verbose();
     let quiet = verbosity.quiet;
     let debug = verbosity.is_debug();
@@ -12413,6 +12605,30 @@ fn allowlist_add_rule(
     allowlist_add_rule_with_paths(rule_id, reason, layer, expires, conditions, &[])
 }
 
+/// Return true if `pack_id` refers to a pack dcg knows about — a built-in pack
+/// in the registry (matched exactly or as a group prefix, e.g. `kubernetes`
+/// for `kubernetes.kubectl`) or an external pack declared via the config's
+/// `custom_paths`. Used to reject allowlist rules that reference nonexistent
+/// packs (issue #162).
+fn pack_id_is_known(pack_id: &str) -> bool {
+    let prefix = format!("{pack_id}.");
+    if REGISTRY.get(pack_id).is_some()
+        || REGISTRY
+            .all_pack_ids()
+            .iter()
+            .any(|id| *id == pack_id || id.starts_with(&prefix))
+    {
+        return true;
+    }
+
+    // Fall back to external packs declared in config `custom_paths`.
+    let config = Config::load();
+    let external = load_external_packs(&config.packs.expand_custom_paths());
+    external
+        .pack_ids()
+        .any(|id| id == pack_id || id.starts_with(&prefix))
+}
+
 /// Add a rule to the allowlist with optional path scoping.
 fn allowlist_add_rule_with_paths(
     rule_id: &str,
@@ -12427,6 +12643,18 @@ fn allowlist_add_rule_with_paths(
     // Validate rule ID format
     let parsed_rule = RuleId::parse(rule_id)
         .ok_or_else(|| format!("Invalid rule ID: {rule_id} (expected pack_id:pattern_name)"))?;
+
+    // Reject rules that reference a pack dcg doesn't know about. Such entries
+    // can never match anything and silently do nothing, which misleads users
+    // into thinking they have allowlisted a command (issue #162).
+    if !pack_id_is_known(&parsed_rule.pack_id) {
+        return Err(format!(
+            "Unknown pack ID '{}' in rule '{rule_id}'. The entry would never match anything. \
+             Run `dcg packs --verbose` to see available pack IDs.",
+            parsed_rule.pack_id
+        )
+        .into());
+    }
 
     // Validate expiration date format if provided
     if let Some(exp) = expires {
@@ -12670,31 +12898,32 @@ fn allowlist_remove(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let parsed_rule = RuleId::parse(rule_id)
-        .ok_or_else(|| format!("Invalid rule ID: {rule_id} (expected pack_id:pattern_name)"))?;
-
     let path = allowlist_path_for_layer(layer);
     if !path.exists() {
-        println!(
-            "{} No {} allowlist file found at {}",
-            "Warning:".yellow(),
+        // Nothing to remove: report a failed removal (exit non-zero) so scripts
+        // and CI can detect it, instead of silently succeeding (issue #163).
+        return Err(format!(
+            "No {} allowlist file found at {}",
             layer.label(),
             path.display()
-        );
-        return Ok(());
+        )
+        .into());
     }
 
     let mut doc = load_or_create_allowlist_doc(&path)?;
 
-    let removed = remove_rule_entry(&mut doc, &parsed_rule);
+    // Accept either a `pack_id:pattern_name` rule id OR an exact command string
+    // (as written by `dcg allowlist add-command`). Try the rule form first when
+    // the argument parses as one, then fall back to an exact-command match so
+    // `add-command` entries are removable via the CLI (issue #161).
+    let removed_rule =
+        RuleId::parse(rule_id).is_some_and(|parsed| remove_rule_entry(&mut doc, &parsed));
+    let removed = removed_rule || remove_command_entry(&mut doc, rule_id);
+
     if !removed {
-        println!(
-            "{} Rule {} not found in {} allowlist",
-            "Warning:".yellow(),
-            rule_id,
-            layer.label()
-        );
-        return Ok(());
+        // The rule/command was not present: exit non-zero so a failed removal
+        // is observable (issue #163).
+        return Err(format!("{rule_id} not found in {} allowlist", layer.label()).into());
     }
 
     write_allowlist(&path, &doc)?;
@@ -13611,6 +13840,40 @@ fn remove_rule_entry(doc: &mut toml_edit::DocumentMut, rule_id: &RuleId) -> bool
     arr.len() < initial_len
 }
 
+/// Remove an exact-command entry from the document. Returns true if removed.
+///
+/// Mirrors [`remove_rule_entry`] but matches the `exact_command` field, so
+/// entries created by `dcg allowlist add-command` can be removed via the CLI
+/// (issue #161).
+fn remove_command_entry(doc: &mut toml_edit::DocumentMut, command: &str) -> bool {
+    let Some(allow) = doc.get_mut("allow") else {
+        return false;
+    };
+    let Some(arr) = allow.as_array_of_tables_mut() else {
+        return false;
+    };
+
+    let initial_len = arr.len();
+
+    let mut remove_idx = None;
+    for (idx, tbl) in arr.iter().enumerate() {
+        if tbl
+            .get("exact_command")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == command)
+        {
+            remove_idx = Some(idx);
+            break;
+        }
+    }
+
+    if let Some(idx) = remove_idx {
+        arr.remove(idx);
+    }
+
+    arr.len() < initial_len
+}
+
 /// Get the current user (from environment or whoami).
 fn get_current_user() -> Option<String> {
     std::env::var("USER")
@@ -14219,8 +14482,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, line)| {
-                evaluate_batch_line(
-                    index,
+                let mut result = evaluate_batch_line(
                     line,
                     &ctx.enabled_keywords,
                     &ctx.ordered_packs,
@@ -14228,8 +14490,9 @@ mod tests {
                     &ctx.compiled_overrides,
                     &ctx.allowlists,
                     &ctx.heredoc_settings,
-                    true,
-                )
+                );
+                result.index = index;
+                result
             })
             .collect()
     }

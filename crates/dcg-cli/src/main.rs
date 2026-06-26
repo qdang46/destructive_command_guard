@@ -1086,9 +1086,11 @@ fn print_help() {
     );
     eprintln!();
 
-    // Additional packs note
+    // Additional packs note. These IDs must be real pack IDs that resolve via
+    // `dcg pack info <id>` — listing non-existent IDs here misleads users into
+    // trying to enable packs that don't exist (see issue #152).
     eprintln!("    📦 Additional packs: containers.docker, kubernetes.kubectl,");
-    eprintln!("       databases.sql, cloud.terraform, and more.");
+    eprintln!("       database.postgresql, infrastructure.terraform, and more.");
     eprintln!();
 
     // Links section

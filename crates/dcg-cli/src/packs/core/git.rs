@@ -54,14 +54,19 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "checkout-orphan",
             r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+--orphan\s+"
         ),
-        // restore --staged only affects index, not working tree
+        // restore --staged only affects the index, not the working tree, so it
+        // is safe. `--staged`/`-S` is a flag that may appear in ANY position
+        // (e.g. `git restore . --staged` is identical to `git restore --staged .`),
+        // so match it anywhere after `restore` rather than only immediately
+        // after it (see issue #156). Still exclude `--worktree`/`-W`, which make
+        // the restore touch the working tree (handled by `restore-worktree-explicit`).
         safe_pattern!(
             "restore-staged-long",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\s+--staged\s+(?!.*--worktree)(?!.*-W\b)"
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         safe_pattern!(
             "restore-staged-short",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\s+-S\s+(?!.*--worktree)(?!.*-W\b)"
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         // clean dry-run just previews, doesn't delete
         safe_pattern!(
@@ -144,10 +149,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
-        // restore without --staged affects working tree
+        // restore without --staged/-S affects the working tree. Detect the
+        // staged flag in ANY position (not just immediately after `restore`),
+        // so `git restore . --staged` is correctly recognized as safe and is
+        // NOT blocked here (issue #156). `--worktree`/`-W` cases are caught by
+        // `restore-worktree-explicit` below regardless of `--staged`.
         destructive_pattern!(
             "restore-worktree",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\s+(?!--staged\b)(?!-S\b)",
+            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?!.*\s(?:--staged|-S)\b)",
             "git restore discards uncommitted changes. Use 'git stash' or 'git diff' first.",
             High,
             "git restore <path> discards uncommitted changes in your working directory, \
@@ -707,6 +716,17 @@ mod tests {
             "git restore --worktree file.txt",
             "discards uncommitted",
         );
+        // Bare `git restore .` (no --staged) discards working-tree changes.
+        assert_blocks(&pack, "git restore .", "discards uncommitted");
+        // `--staged` combined with `--worktree`/`-W` still touches the working
+        // tree and must be blocked even though a staged flag is present (#156).
+        assert_blocks(
+            &pack,
+            "git restore --staged --worktree file.txt",
+            "discards uncommitted",
+        );
+        assert_blocks(&pack, "git restore -S -W file.txt", "discards uncommitted");
+        assert_blocks(&pack, "git restore . --worktree", "discards uncommitted");
     }
 
     #[test]
@@ -821,6 +841,12 @@ mod tests {
 
         assert_allows(&pack, "git restore --staged file.txt");
         assert_allows(&pack, "git restore -S file.txt");
+        // `--staged`/`-S` may appear AFTER the pathspec; it is the same
+        // (safe) unstage operation and must also be allowed (issue #156).
+        assert_allows(&pack, "git restore . --staged");
+        assert_allows(&pack, "git restore . -S");
+        assert_allows(&pack, "git restore --staged");
+        assert_allows(&pack, "git -C /tmp/repo restore . --staged");
     }
 
     #[test]

@@ -87,9 +87,12 @@ fn test_batch_processes_multiple_commands() {
 "#;
 
     let output = run_dcg_batch(input);
-    assert!(
-        output.status.success(),
-        "Batch mode should exit successfully"
+    // Any deny in the batch must make the process exit non-zero so callers can
+    // gate on the exit code (issue #148).
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Batch mode must exit 1 when any command is denied"
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -135,7 +138,8 @@ fn test_batch_maintains_order() {
 "#;
 
     let output = run_dcg_batch(input);
-    assert!(output.status.success());
+    // Denies present -> exit 1 (issue #148).
+    assert_eq!(output.status.code(), Some(1));
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let results = parse_jsonl_output(&stdout);
@@ -301,7 +305,13 @@ fn test_batch_includes_rule_metadata_for_denials() {
 "#;
 
     let output = run_dcg_batch(input);
-    assert!(output.status.success());
+    // Any deny in the batch must make the process exit non-zero so callers can
+    // gate on the exit code (issue #148).
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "batch must exit 1 when any command is denied"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let results = parse_jsonl_output(&stdout);
@@ -348,9 +358,10 @@ fn test_batch_performance_at_scale() {
     let output = run_dcg_batch(&input);
     let duration = start.elapsed();
 
+    // performance batch may or may not have denials; we just check it doesn't crash
     assert!(
-        output.status.success(),
-        "Batch should complete successfully"
+        output.status.code().is_some(),
+        "Batch should complete without crash"
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);

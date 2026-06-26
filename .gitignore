@@ -85,3 +85,7 @@ e2e_*.log
 # NTM agent coordination runtime state (human inbox spool, per-pane rate
 # limits, robot snapshot summaries) — regenerated every orchestrator tick.
 .ntm/
+
+# DCG temporary/backup files
+.dcg/
+alex
