@@ -5179,7 +5179,7 @@ fn show_config(config: &Config) {
     println!();
     println!("Config sources (lowest → highest priority):");
     let user_cfg = config_path();
-    let system_cfg = std::path::PathBuf::from("/etc/dcg").join("config.toml");
+    let system_cfg = crate::config::system_config_dir().join("config.toml");
     if system_cfg.exists() {
         println!("  - system: {}", system_cfg.display());
     }
@@ -9918,7 +9918,45 @@ fn collect_doctor_report(fix: bool) -> DoctorReport {
 }
 
 fn is_dcg_command(cmd: &str) -> bool {
-    cmd == "dcg" || cmd.ends_with("/dcg")
+    // Recognize whether a hook entry's `command` belongs to dcg. This must be
+    // path-separator- and extension-agnostic so it works on Windows, where the
+    // Grok/agy installers write the full `current_exe()` path — e.g.
+    // `C:\Users\me\.local\bin\dcg.exe` (backslashes + `.exe`), optionally quoted
+    // and followed by arguments. Mirrors install.ps1's `Get-DcgCommandName`
+    // (quote-stripping + last path segment + case-insensitive compare) so the
+    // install-side and runtime-side agree.
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Extract the program token: a leading quoted path (`"…dcg.exe" --flag`) or
+    // the first whitespace-delimited token of an unquoted command.
+    let program = if let Some(stripped) = trimmed.strip_prefix('"') {
+        stripped.split('"').next().unwrap_or(stripped)
+    } else if let Some(stripped) = trimmed.strip_prefix('\'') {
+        stripped.split('\'').next().unwrap_or(stripped)
+    } else {
+        trimmed.split_whitespace().next().unwrap_or(trimmed)
+    };
+
+    // Final path component, splitting on BOTH Unix (`/`) and Windows (`\`)
+    // separators, then strip a trailing `.exe` case-insensitively and compare
+    // the stem. Stem-exact match avoids false positives like `dcg-wrapper`.
+    let basename = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    // Strip a trailing `.exe` case-insensitively (`.EXE`, `.Exe`, …) in a
+    // char-boundary-safe way; a non-boundary index simply leaves `basename` as-is.
+    let stem = match basename.len().checked_sub(4) {
+        Some(idx)
+            if basename
+                .get(idx..)
+                .is_some_and(|s| s.eq_ignore_ascii_case(".exe")) =>
+        {
+            &basename[..idx]
+        }
+        _ => basename,
+    };
+    stem.eq_ignore_ascii_case("dcg")
 }
 
 fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
@@ -10339,6 +10377,10 @@ fn project_antigravity_hooks_path() -> Result<std::path::PathBuf, Box<dyn std::e
 /// The shell snippet that checks whether the DCG hook is still present in
 /// Claude Code settings on every new shell session. Runs in milliseconds,
 /// silent when the hook is present, yellow warning when missing.
+///
+/// Unix-only: this is a POSIX-shell (bash/zsh) snippet sourced from RC files,
+/// which native Windows shells do not use.
+#[cfg(unix)]
 const DCG_SHELL_CHECK_SNIPPET: &str = r#"
 # dcg: warn if hook was silently removed from Claude Code settings
 if command -v dcg &>/dev/null && command -v jq &>/dev/null; then
@@ -10351,9 +10393,11 @@ fi
 "#;
 
 /// Marker used to identify the DCG shell check block for idempotent injection.
+#[cfg(unix)]
 const DCG_SHELL_CHECK_MARKER: &str = "# dcg: warn if hook was silently removed";
 
 /// Check whether a shell RC file already contains the DCG startup check.
+#[cfg(unix)]
 fn rc_has_dcg_check(path: &std::path::Path) -> bool {
     if let Ok(content) = std::fs::read_to_string(path) {
         content.contains(DCG_SHELL_CHECK_MARKER)
@@ -10366,6 +10410,7 @@ fn rc_has_dcg_check(path: &std::path::Path) -> bool {
 ///
 /// Returns `Ok(true)` if the snippet was added, `Ok(false)` if it was already
 /// present.
+#[cfg(unix)]
 fn inject_shell_check(path: &std::path::Path) -> Result<bool, Box<dyn std::error::Error>> {
     if rc_has_dcg_check(path) {
         return Ok(false);
@@ -10392,12 +10437,48 @@ fn run_setup(
     auto_shell_check: bool,
     no_shell_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use colored::Colorize;
-
     // --- Step 1: Install the hook (same as `dcg install`) ---
     install_hook(force, false)?;
 
     // --- Step 2: Offer the shell startup check ---
+    // The check appends a snippet to ~/.bashrc / ~/.zshrc, which native Windows
+    // (PowerShell / cmd) does not source. It is therefore a Unix-shell-only
+    // feature; on Windows this is a clean, informative no-op (the PowerShell
+    // `$PROFILE` equivalent is offered by install.ps1 — win-installer-profile-check).
+    #[cfg(unix)]
+    {
+        run_shell_check_setup(auto_shell_check, no_shell_check)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        use colored::Colorize;
+        let _ = (auto_shell_check, no_shell_check);
+        println!();
+        println!(
+            "{}",
+            "Shell startup check is a Unix-shell feature; skipped on this platform.".cyan()
+        );
+        println!(
+            "{}",
+            "PowerShell users: install.ps1 can add an equivalent $PROFILE check.".dimmed()
+        );
+    }
+
+    Ok(())
+}
+
+/// Unix-only shell-startup-check setup: appends the dcg hook-removal warning
+/// snippet to the user's shell RC file(s) (`~/.bashrc` / `~/.zshrc`). Gated to
+/// Unix because native Windows shells do not source these files (see `run_setup`);
+/// the PowerShell `$PROFILE` equivalent is handled by the installer instead.
+#[cfg(unix)]
+fn run_shell_check_setup(
+    auto_shell_check: bool,
+    no_shell_check: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
     if no_shell_check {
         return Ok(());
     }
@@ -11055,9 +11136,13 @@ fn config_path() -> std::path::PathBuf {
 
 /// Check if dcg is in PATH
 fn which_dcg() -> Option<std::path::PathBuf> {
+    // The installed binary is `dcg.exe` on Windows and `dcg` elsewhere. Probe for
+    // the platform-correct filename (`EXE_SUFFIX` is ".exe" on Windows, "" on
+    // Unix), otherwise `dcg doctor` reports a false "NOT FOUND in PATH" on Windows.
+    let exe_name = format!("dcg{}", std::env::consts::EXE_SUFFIX);
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
-            let path = dir.join("dcg");
+            let path = dir.join(&exe_name);
             if path.is_file() { Some(path) } else { None }
         })
     })
@@ -11615,7 +11700,7 @@ fn allowlist_path_for_layer(layer: AllowlistLayer) -> std::path::PathBuf {
             repo_root.join(".dcg").join("allowlist.toml")
         }
         AllowlistLayer::User => config_dir().join("allowlist.toml"),
-        AllowlistLayer::System => std::path::PathBuf::from("/etc/dcg/allowlist.toml"),
+        AllowlistLayer::System => crate::config::system_config_dir().join("allowlist.toml"),
     }
 }
 
@@ -17009,14 +17094,28 @@ exclude = ["target/**"]
 
     #[test]
     fn is_dcg_command_recognizes_various_forms() {
+        // Unix forms
         assert!(is_dcg_command("dcg"));
         assert!(is_dcg_command("/usr/local/bin/dcg"));
         assert!(is_dcg_command("/home/user/.cargo/bin/dcg"));
         assert!(is_dcg_command("~/.local/bin/dcg"));
 
+        // Windows forms: backslash paths, `.exe`, drive letters, and quoting —
+        // exactly what `dcg install --grok|--agy` write via current_exe().
+        assert!(is_dcg_command(r"C:\Users\me\.local\bin\dcg.exe"));
+        assert!(is_dcg_command(r"C:\Users\me\.local\bin\dcg.EXE"));
+        assert!(is_dcg_command("dcg.exe"));
+        assert!(is_dcg_command(r#""C:\Program Files\dcg\dcg.exe" --flag"#));
+        assert!(is_dcg_command("'C:\\tools\\dcg.exe'"));
+        // Unix path with trailing args / surrounding whitespace
+        assert!(is_dcg_command("  /usr/local/bin/dcg  "));
+
+        // Negatives — stem-exact, so look-alikes must not match
         assert!(!is_dcg_command("other-hook"));
         assert!(!is_dcg_command(""));
         assert!(!is_dcg_command("dcg-wrapper"));
+        assert!(!is_dcg_command(r"C:\tools\mydcg.exe"));
+        assert!(!is_dcg_command(r"C:\tools\dcgwrapper.exe"));
     }
 
     #[test]

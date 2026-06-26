@@ -21,6 +21,8 @@ fn expected_detector_docs() -> BTreeMap<&'static str, &'static str> {
         ("is_package_json", "package.json"),
         ("is_terraform", "Terraform"),
         ("is_compose", "Docker Compose"),
+        ("is_powershell", "PowerShell Scripts"),
+        ("is_batch", "Batch Scripts"),
     ])
 }
 

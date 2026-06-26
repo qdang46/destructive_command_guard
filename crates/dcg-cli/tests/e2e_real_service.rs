@@ -237,7 +237,7 @@ fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("current test executable path");
     path.pop();
     path.pop();
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -280,7 +280,10 @@ fn run_dcg(
         .env_clear()
         .env("PATH", system_path)
         .env("HOME", env.home_path())
+        .env("USERPROFILE", env.home_path())
         .env("TMPDIR", &env.tmp_dir)
+        .env("TEMP", &env.tmp_dir)
+        .env("TMP", &env.tmp_dir)
         .env("XDG_CONFIG_HOME", env.home_path().join(".config"))
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env("NO_COLOR", "1")

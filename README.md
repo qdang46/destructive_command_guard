@@ -226,6 +226,11 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - `system.permissions` - Protects against dangerous permission changes like chmod 777, recursive chmod/chown on system directories.
 - `system.services` - Protects against dangerous service operations like stopping critical services and modifying init configuration.
 
+- `windows.filesystem` - Protects against destructive Windows filesystem operations: `del`, `rd`, `format`, `Remove-Item -Recurse`, `Clear-Content`, `Clear-RecycleBin`.
+- `windows.system` - Protects against destructive Windows system operations: `vssadmin delete shadows`, `wmic`, `diskpart`, `Format-Volume`, `Clear-Disk`, `cipher`, `bcdedit`.
+- `windows.misc` - Protects against destructive Windows misc operations: `reg delete`, `net user/localgroup /delete`, `sc delete`, `schtasks /delete`, `wsl --unregister`, `robocopy /MIR`.
+- `windows.powershell` - Protects against destructive PowerShell cmdlets: `Remove-Item`, `Remove-ItemProperty`, `Clear-Item`, `Remove-PSDrive`, `Remove-LocalUser`, `Unregister-ScheduledTask`, `Remove-VM`.
+
 ### CI/CD Packs
 - `cicd.circleci` - Protects against destructive CircleCI operations like deleting contexts, removing secrets, deleting orbs/namespaces, or removing pipelines.
 - `cicd.github_actions` - Protects against destructive GitHub Actions operations like deleting secrets/variables or using gh api DELETE against /actions endpoints.
@@ -242,6 +247,7 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - `platform.github` - Protects against destructive GitHub CLI operations like deleting repositories, gists, releases, or SSH keys.
 - `platform.gitlab` - Protects against destructive GitLab platform operations like deleting projects, releases, protected branches, and webhooks.
 - `platform.modal` - Protects against destructive Modal serverless platform operations like recursive volume removal, app stops with `--force`, and secret deletion.
+- `platform.kamal` - Protects against destructive Kamal deployer operations like `kamal remove`, `kamal rollback`, and `kamal access`.
 - `platform.railway` - Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, functions, volumes, variables, or deployments.
 
 ### DNS Packs
@@ -1140,6 +1146,8 @@ dcg scan includes specialized extractors for each file format, understanding whi
 | **package.json** | `package.json` | `scripts` object values |
 | **Terraform** | `*.tf` | `provisioner` blocks (`local-exec`, `remote-exec`) |
 | **Docker Compose** | `docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `compose.yaml` | `command:`, `entrypoint:`, `healthcheck.test:` fields |
+| **PowerShell Scripts** | `*.ps1`, `*.psm1`, `*.psd1` | Non-comment executable command lines |
+| **Batch Scripts** | `*.bat`, `*.cmd` | Non-comment executable command lines |
 
 **Context-Aware Extraction**:
 

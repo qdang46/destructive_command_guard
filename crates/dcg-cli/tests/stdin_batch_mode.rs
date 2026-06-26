@@ -18,7 +18,7 @@ fn dcg_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name
     path.pop(); // Remove deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -43,6 +43,7 @@ fn run_dcg_batch_with_args(input: &str, extra_args: &[&str]) -> std::process::Ou
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .env("DCG_PACKS", "core.git,core.filesystem")

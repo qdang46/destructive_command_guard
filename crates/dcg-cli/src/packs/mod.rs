@@ -43,6 +43,8 @@ pub mod storage;
 pub mod strict_git;
 pub mod system;
 
+pub mod windows;
+
 // Testing infrastructure
 pub mod test_helpers;
 #[cfg(test)]
@@ -999,7 +1001,7 @@ impl EnabledKeywordIndex {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 86] = [
+static PACK_ENTRIES: [PackEntry; 90] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1577,6 +1579,112 @@ static PACK_ENTRIES: [PackEntry; 86] = [
             "npm", "yarn", "pnpm", "pip", "cargo", "gem", "composer", "go",
         ],
         package_managers::create_pack,
+    ),
+    // Windows-native packs. Keywords enumerate realistic casings because the
+    // keyword quick-reject is case-sensitive (see packs::windows module docs).
+    PackEntry::new(
+        "windows.filesystem",
+        &[
+            "del",
+            "DEL",
+            "erase",
+            "ERASE",
+            "rd",
+            "RD",
+            "rmdir",
+            "RMDIR",
+            "format",
+            "FORMAT",
+            "Remove-Item",
+            "remove-item",
+            "REMOVE-ITEM",
+            "rm",
+            "RM",
+            "ri",
+            "RI",
+            "Clear-Content",
+            "clear-content",
+            "clc",
+            "CLC",
+            "Clear-RecycleBin",
+            "clear-recyclebin",
+        ],
+        windows::filesystem::create_pack,
+    ),
+    PackEntry::new(
+        "windows.system",
+        &[
+            "vssadmin",
+            "VSSADMIN",
+            "wmic",
+            "WMIC",
+            "shadowcopy",
+            "ShadowCopy",
+            "diskpart",
+            "DISKPART",
+            "Format-Volume",
+            "format-volume",
+            "FORMAT-VOLUME",
+            "Clear-Disk",
+            "clear-disk",
+            "CLEAR-DISK",
+            "Remove-Partition",
+            "remove-partition",
+            "Initialize-Disk",
+            "initialize-disk",
+            "Reset-PhysicalDisk",
+            "reset-physicaldisk",
+            "cipher",
+            "CIPHER",
+            "bcdedit",
+            "BCDEDIT",
+        ],
+        windows::system::create_pack,
+    ),
+    // Opt-in (not default-on, even on Windows): broader registry/account/service/
+    // wsl/robocopy destruction. Enable via `enabled = ["windows.misc"]` or the
+    // whole `windows` category.
+    PackEntry::new(
+        "windows.misc",
+        &[
+            "reg", "REG", "net", "NET", "sc", "SC", "schtasks", "SCHTASKS", "wsl", "WSL",
+            "robocopy", "ROBOCOPY",
+        ],
+        windows::misc::create_pack,
+    ),
+    // Opt-in: broader PowerShell-cmdlet destruction (registry/provider deletes,
+    // account/task/system-restore, VM/app removal).
+    PackEntry::new(
+        "windows.powershell",
+        &[
+            "Remove-Item",
+            "remove-item",
+            "ri",
+            "RI",
+            "Remove-ItemProperty",
+            "remove-itemproperty",
+            "Clear-Item",
+            "clear-item",
+            "Remove-PSDrive",
+            "remove-psdrive",
+            "Remove-LocalUser",
+            "remove-localuser",
+            "Remove-LocalGroup",
+            "remove-localgroup",
+            "Unregister-ScheduledTask",
+            "unregister-scheduledtask",
+            "Disable-ComputerRestore",
+            "disable-computerrestore",
+            "Stop-Computer",
+            "stop-computer",
+            "Restart-Computer",
+            "restart-computer",
+            "Remove-VM",
+            "remove-vm",
+            "Remove-VMSnapshot",
+            "remove-vmsnapshot",
+        ],
+        windows::powershell::create_pack,
     ),
 ];
 
@@ -4465,7 +4573,9 @@ mod tests {
             default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
         };
 
-        let deadline = Deadline::new(Duration::ZERO);
+        // Create a deadline that's already expired by sleeping briefly
+        let deadline = Deadline::new(Duration::from_nanos(1));
+        std::thread::sleep(Duration::from_nanos(100));
         assert!(
             !pack.matches_safe_with_deadline("rm --dry-run safe_target", Some(&deadline)),
             "Expired deadline should cause safe match to return false"

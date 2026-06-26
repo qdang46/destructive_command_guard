@@ -9,7 +9,7 @@ fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("current_exe");
     path.pop(); // test binary name
     path.pop(); // deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -30,6 +30,7 @@ fn run_dcg_isolated(args: &[&str], cwd: Option<&Path>) -> Output {
     let mut cmd = Command::new(dcg_binary());
     cmd.args(args)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", &xdg)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "");
 

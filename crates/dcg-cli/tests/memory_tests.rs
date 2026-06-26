@@ -745,6 +745,7 @@ fn run_codex_deny_subprocess(
     let mut child = std::process::Command::new(dcg_bin)
         .env_clear()
         .env("HOME", home_dir)
+        .env("USERPROFILE", home_dir)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())

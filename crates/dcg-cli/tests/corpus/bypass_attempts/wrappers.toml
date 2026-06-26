@@ -142,3 +142,38 @@ rule_id = "core.git:reset-hard"
 description = "nice -n 19 rm -rf is blocked"
 command = "nice -n 19 rm -rf /home/user"
 expected = "deny"
+
+[[case]]
+description = "env -C <dir>/$(rm -rf) flag value is not stripped away"
+command = "env -C /tmp/$(rm -rf /home/user) git status"
+expected = "deny"
+
+[[case]]
+description = "env --chdir=$(rm -rf) attached flag value is not stripped away"
+command = "env --chdir=$(rm -rf /home/user) git status"
+expected = "deny"
+
+[[case]]
+description = "env -C`rm -rf` backtick flag value is not stripped away"
+command = "env -C `rm -rf /home/user` git status"
+expected = "deny"
+
+[[case]]
+description = "sudo -u $(rm -rf) flag value is not stripped away"
+command = "sudo -u $(rm -rf /home/user) git status"
+expected = "deny"
+
+[[case]]
+description = "sudo -D<dir>/$(rm -rf) attached flag value is not stripped away"
+command = "sudo -D/tmp/$(rm -rf /home/user) git status"
+expected = "deny"
+
+[[case]]
+description = "quoted Windows git path (forward slashes) reset --hard is blocked"
+command = '"C:/Program Files/Git/bin/git.exe" reset --hard'
+expected = "deny"
+
+[[case]]
+description = "quoted Windows git path (backslashes) reset --hard is blocked"
+command = '"C:\Program Files\Git\bin\git.exe" reset --hard'
+expected = "deny"

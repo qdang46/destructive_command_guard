@@ -392,6 +392,58 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
     None
 }
 
+/// High-signal filesystem sink fallback for cases where the full AST pass is
+/// unavailable or too close to the hook deadline.
+///
+/// This intentionally stays narrower than the AST pattern set: it only matches
+/// Ruby `FileUtils.*` calls that start a source line and use a literal target.
+/// That avoids firing on common inert cases such as comments or strings while
+/// still catching catastrophic calls like `FileUtils.rm_rf("/")` before a
+/// fail-open timeout can turn them into false negatives.
+#[must_use]
+pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
+    if language != ScriptLanguage::Ruby {
+        return None;
+    }
+
+    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+
+    for caps in RUBY_FILEUTILS_LITERAL.captures_iter(code) {
+        let Some(m) = caps.get(0) else { continue };
+        let Some(path) = string_literal_from_caps(&caps) else {
+            continue;
+        };
+        let catastrophic = is_catastrophic_path(path);
+        let severity = if catastrophic {
+            Severity::Critical
+        } else {
+            Severity::Medium
+        };
+        let suffix = if catastrophic { ".catastrophic" } else { "" };
+        let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
+        let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
+
+        return Some(PatternMatch {
+            rule_id: format!("heredoc.ruby.fileutils_{fn_name}{suffix}"),
+            reason: if catastrophic {
+                format!(
+                    "FileUtils.{fn_name}() deletes files/directories (catastrophic target path)"
+                )
+            } else {
+                format!("FileUtils.{fn_name}() deletes files/directories")
+            },
+            matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
+            start: m.start(),
+            end: m.end(),
+            line_number,
+            severity,
+            suggestion: Some("Verify target path carefully before running".to_string()),
+        });
+    }
+
+    None
+}
+
 /// Ruby-specific exec-sink backstop covering forms whose destructive payload is
 /// not a quoted string literal (`%x(...)`/`%x{...}`/`%x[...]`, backticks) as well
 /// as quoted-arg sinks (`system`/`exec`/`spawn`, `IO.popen`, `Open3.*`). Any
@@ -485,6 +537,13 @@ static RUBY_QUOTED_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?m)\b(?:(?:Kernel|Process|IO|Open3)\.)?(?P<sink>system|exec|spawn|popen|capture2e|capture2|capture3|popen2e|popen2|popen3|pipeline_r|pipeline_rw|pipeline)\b(?:\s*\(\s*|\s+)(?:"[^"\n]*"|'[^'\n]*')"#,
     )
     .expect("ruby quoted exec sink regex compiles")
+});
+
+static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)^[ \t]*FileUtils\.(?P<fn>rm_rf|remove_dir|rm|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
+    )
+    .expect("ruby FileUtils literal regex compiles")
 });
 
 static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
@@ -2890,8 +2949,13 @@ mod tests {
             matches!(result, Err(MatchError::Timeout { .. })),
             "zero timeout should fail open before AST parsing starts"
         );
+        // The matches!(Err(Timeout)) check above is the real regression guard. This
+        // timing bound only documents "returned promptly without parsing"; it is
+        // deliberately generous so scheduler preemption under heavy parallel load
+        // can't flake it (parsing the 256K-token malformed input would take far
+        // longer than this ceiling).
         assert!(
-            start.elapsed() < Duration::from_millis(50),
+            start.elapsed() < Duration::from_secs(2),
             "zero-timeout malformed input should return immediately"
         );
     }
@@ -2909,8 +2973,11 @@ mod tests {
             matches!(result, Err(MatchError::Timeout { .. })),
             "oversized direct matcher input should fail open on the budget guard"
         );
+        // As above, the matches!(Err(Timeout)) check is the real guard; this
+        // generous timing bound only documents the early return and avoids
+        // load-induced flakes.
         assert!(
-            start.elapsed() < Duration::from_millis(50),
+            start.elapsed() < Duration::from_secs(2),
             "oversized input should not enter ast-grep parsing"
         );
     }
@@ -3969,6 +4036,35 @@ def cleanup():
             assert!(
                 scan_executing_sink_fallback(&code, ScriptLanguage::Bash).is_none(),
                 "bash bodies are never masked, so the backstop is a no-op for them"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_catches_ruby_fileutils_catastrophic() {
+            let code = "require \"fileutils\"\nFileUtils.rm_rf(\"/\")";
+            let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby);
+            assert!(
+                hit.is_some_and(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf.catastrophic"
+                    && m.severity.blocks_by_default()),
+                "catastrophic FileUtils.rm_rf must be caught by fallback"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_ruby_fileutils_in_comment() {
+            let code = "# FileUtils.rm_rf(\"/\")";
+            assert!(
+                scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
+                "commented FileUtils call must not fire fallback"
+            );
+        }
+
+        #[test]
+        fn filesystem_fallback_ignores_ruby_fileutils_in_string() {
+            let code = "puts 'FileUtils.rm_rf(\"/\")'";
+            assert!(
+                scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
+                "inert string containing FileUtils call must not fire fallback"
             );
         }
 

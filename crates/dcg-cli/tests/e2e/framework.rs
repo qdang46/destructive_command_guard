@@ -262,15 +262,26 @@ impl E2ETestContextBuilder {
             init_git_repo(&temp_path, branch);
         }
 
-        // Create hermetic home and config directories
+        // Create hermetic home, config, and temp directories
         let test_home = temp_path.join("home");
         let test_xdg_config = temp_path.join("xdg_config");
+        let test_temp = temp_path.join("tmp");
         std::fs::create_dir_all(&test_home).expect("Failed to create test home");
         std::fs::create_dir_all(&test_xdg_config).expect("Failed to create test xdg config");
+        std::fs::create_dir_all(&test_temp).expect("Failed to create test temp");
 
         // Set up environment variables
+        let test_home_str = test_home.to_string_lossy().to_string();
+        let test_temp_str = test_temp.to_string_lossy().to_string();
         let mut env_vars = self.env_vars;
-        env_vars.insert("HOME".to_string(), test_home.to_string_lossy().to_string());
+        env_vars.insert("HOME".to_string(), test_home_str.clone());
+        // Native Windows resolves the home dir from USERPROFILE (HOME is usually
+        // unset) and temp from TEMP/TMP, so mirror them to keep the e2e sandbox
+        // hermetic on Windows too — otherwise tests would touch the real profile.
+        env_vars.insert("USERPROFILE".to_string(), test_home_str);
+        env_vars.insert("TEMP".to_string(), test_temp_str.clone());
+        env_vars.insert("TMP".to_string(), test_temp_str.clone());
+        env_vars.insert("TMPDIR".to_string(), test_temp_str);
         env_vars.insert(
             "XDG_CONFIG_HOME".to_string(),
             test_xdg_config.to_string_lossy().to_string(),
@@ -485,19 +496,21 @@ fn find_dcg_binary() -> PathBuf {
         }
     }
 
-    // Check for local build artifacts first
-    let release_path = PathBuf::from("./target/release/dcg");
+    // Check for local build artifacts first. Append the platform executable
+    // suffix so the fallback resolves `dcg.exe` on Windows (empty on Unix).
+    let exe = format!("dcg{}", std::env::consts::EXE_SUFFIX);
+    let release_path = PathBuf::from(format!("./target/release/{exe}"));
     if release_path.exists() {
         return std::fs::canonicalize(&release_path).unwrap_or(release_path);
     }
 
-    let debug_path = PathBuf::from("./target/debug/dcg");
+    let debug_path = PathBuf::from(format!("./target/debug/{exe}"));
     if debug_path.exists() {
         return std::fs::canonicalize(&debug_path).unwrap_or(debug_path);
     }
 
-    // Fall back to PATH
-    which::which("dcg").unwrap_or_else(|_| PathBuf::from("dcg"))
+    // Fall back to PATH (the `which` crate honors PATHEXT, so it finds dcg.exe).
+    which::which("dcg").unwrap_or_else(|_| PathBuf::from(exe))
 }
 
 /// Initialize a git repository in the given directory.

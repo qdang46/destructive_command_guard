@@ -62,7 +62,7 @@ use tracing::{debug, instrument, trace, warn};
 /// quote-aware scanner so we can suppress obvious false positives inside quoted
 /// literals (commit messages, search patterns, etc.) without introducing false
 /// negatives for real shell syntax (including `$()`/backtick substitutions).
-const HEREDOC_TRIGGER_PATTERNS: [&str; 14] = [
+const HEREDOC_TRIGGER_PATTERNS: [&str; 17] = [
     // Inline interpreter execution. These patterns intentionally allow:
     // - interleaved flags (python -I -c, bash --norc -c)
     // - combined short-flag clusters (bash -lc, node -pe, perl -pi -e)
@@ -77,20 +77,20 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 14] = [
     // superset invariant.  False positives are acceptable for Tier 1.
     r"<<<",
     // Python inline execution (matches python, python3, python3.11, python.exe, python3.11.exe, etc.)
-    r#"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bpython[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ce][A-Za-z]*(?:\s|['"]|$)"#,
     // Ruby inline execution (matches ruby, ruby3, ruby3.0, ruby.exe, etc.)
-    r#"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
-    r#"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bruby[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\birb[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Perl inline execution (matches perl, perl5, perl5.36, perl.exe, etc.)
-    r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bperl[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[eE][A-Za-z]*(?:\s|['"]|$)"#,
     // Node.js inline execution (matches node, node18, nodejs, node.exe, etc.)
-    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bnode(?:js)?[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*[ep][A-Za-z]*(?:\s|['"]|$)"#,
     // PHP inline execution
-    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\bphp[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*r[A-Za-z]*(?:\s|['"]|$)"#,
     // Lua inline execution
-    r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\blua[0-9.]*(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*e[A-Za-z]*(?:\s|['"]|$)"#,
     // Shell inline execution (sh -c, bash -c, zsh -c, fish -c, bash -lc, etc.)
-    r#"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+))*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
+    r#"\b(?:sh|bash|zsh|fish)(?:\.exe)?\b(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-[A-Za-z]*c[A-Za-z]*(?:\s|['"]|$)"#,
     // PowerShell inline execution (powershell -Command '...', pwsh -c "...",
     // and Windows full-path forms like
     //   "C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '...'
@@ -101,7 +101,19 @@ const HEREDOC_TRIGGER_PATTERNS: [&str; 14] = [
     // case-insensitive (Windows paths are case-insensitive). A possible closing
     // `"` of a quoted interpreter path is allowed before the flag. Tier 1 may
     // over-trigger; Tier 2 validates the actual flag.
-    r#"(?i)\b(?:powershell|pwsh)(?:\.exe)?["']?(?:\s+(?:-\S+))*\s+-c[a-z]*\s*['"]"#,
+    r#"(?i)\b(?:powershell|pwsh)(?:\.exe)?["']?(?:\s+-\S+(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-c[a-z]*\s*['"]"#,
+    // PowerShell -EncodedCommand <base64> (abbreviates to -e/-en/-enc/-encodedcommand,
+    // case-insensitively). The inner script is base64'd UTF-16LE; Tier 2 decodes and
+    // re-evaluates it, so a destructive payload hidden in base64 is still caught. Tier 1
+    // over-triggers (any base64-looking token after the flag); Tier 2 validates + decodes.
+    r#"(?i)\b(?:powershell|pwsh)(?:\.exe)?["']?(?:\s+-\S+(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-e(?:n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+[A-Za-z0-9+/=]"#,
+    // cmd.exe inline execution (`cmd /c "..."`, `cmd /k ...`, `cmd /s /c ...`,
+    // `cmd.exe /c ...`). The /c (run-then-exit) and /k (run-then-stay) switches run an
+    // arbitrary inner command line that Tier 2 extracts and re-evaluates.
+    r"(?i)\bcmd(?:\.exe)?\b(?:\s+/[A-Za-z]+)*\s+/[ck]\b",
+    // PowerShell Invoke-Expression / its `iex` alias: executes a string as code. Tier 2
+    // extracts the quoted argument and re-evaluates it.
+    r"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b",
     // Piped execution to interpreters (versioned, with optional .exe)
     r"\|\s*(?:python[0-9.]*|ruby[0-9.]*|perl[0-9.]*|node(?:js)?[0-9.]*|php[0-9.]*|lua[0-9.]*|sh|bash)(?:\.exe)?\b",
     // Piped to xargs (can execute arbitrary commands)
@@ -997,7 +1009,7 @@ static INLINE_SCRIPT_SINGLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // `(?i:powershell|pwsh)` matches the Windows PowerShell host case-insensitively;
     // `["']?` after the interpreter swallows the closing quote of a quoted full
     // path (e.g. `"...\powershell.exe" -Command '...'`) before flags (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b["']?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*'([^']*)'"#)
         .expect("inline script single-quote regex compiles")
 });
 
@@ -1009,9 +1021,59 @@ static INLINE_SCRIPT_DOUBLE_QUOTE: LazyLock<Regex> = LazyLock::new(|| {
     // Supports Windows .exe extensions: python.exe, python3.11.exe, etc.
     // PowerShell host + quoted-path closing quote handled as in the single-quote
     // variant above (#125).
-    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+))*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
+    Regex::new(r#"\b(python[0-9.]*(?:\.exe)?|ruby[0-9.]*(?:\.exe)?|irb[0-9.]*(?:\.exe)?|perl[0-9.]*(?:\.exe)?|node(js)?[0-9.]*(?:\.exe)?|php[0-9.]*(?:\.exe)?|lua[0-9.]*(?:\.exe)?|sh(?:\.exe)?|bash(?:\.exe)?|zsh(?:\.exe)?|fish(?:\.exe)?|(?i:powershell|pwsh)(?:\.exe)?)\b['"]?(?:\s+(?:--\S+|-[A-Za-z]+(?:[:.=]\S*)?)(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+(-[A-Za-z]*[ceECpr][A-Za-z]*)\s*"([^"]*)""#)
         .expect("inline script double-quote regex compiles")
 });
+
+/// Regex for `cmd /c "..."` / `cmd /k ...` inline execution (the Windows analog of
+/// `bash -c`). Group 1 = double-quoted inner, group 2 = single-quoted inner,
+/// group 3 = unquoted rest-of-line. The inner command line is re-evaluated by the
+/// full pipeline, so `cmd /c "del /s /q C:\src"` is blocked like the bare `del`.
+static CMD_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\bcmd(?:\.exe)?\b(?:\s+/[A-Za-z]+)*\s+/[ck]\s+(?:"([^"]*)"|'([^']*)'|([^\n]+))"#,
+    )
+    .expect("cmd inline script regex compiles")
+});
+
+/// Regex for PowerShell `Invoke-Expression`/`iex` of a quoted string. Group 1 =
+/// double-quoted, group 2 = single-quoted. The argument is executed as code, so we
+/// re-evaluate it.
+static IEX_INLINE_SCRIPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(?:^|[\s;|&({])(?:iex|invoke-expression)\b\s*(?:"([^"]*)"|'([^']*)')"#)
+        .expect("iex inline script regex compiles")
+});
+
+/// Regex for `powershell -EncodedCommand <base64>` (flag abbreviates to any prefix
+/// of `-encodedcommand`, min `-e`). Group 1 = the base64 token, which Tier 2 decodes
+/// (base64 -> UTF-16LE -> text) and re-evaluates.
+static POWERSHELL_ENCODED_COMMAND: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\b(?:powershell|pwsh)(?:\.exe)?["']?(?:\s+-\S+(?:\s+(?:[0-9]\S*|\S*[:/\\]\S*|[A-Za-z][A-Za-z0-9_]*))?)*\s+-e(?:n(?:c(?:o(?:d(?:e(?:d(?:c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+([A-Za-z0-9+/=]+)"#,
+    )
+    .expect("powershell encoded-command regex compiles")
+});
+
+/// Decode a PowerShell `-EncodedCommand` payload: standard base64 of a UTF-16LE
+/// string. Returns `None` (fail-open) on invalid base64 or empty output.
+#[must_use]
+fn decode_powershell_encoded_command(b64: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    if bytes.len() < 2 {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let decoded = String::from_utf16_lossy(&units);
+    if decoded.trim().is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
 
 // ============================================================================
 // Robustness: Binary Content Detection
@@ -1155,6 +1217,23 @@ pub fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionRe
 
     // Extract inline scripts (-c/-e flags)
     extract_inline_scripts(
+        command,
+        limits,
+        start_time,
+        timeout,
+        &mut extracted,
+        &mut skip_reasons,
+    );
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, &mut skip_reasons) {
+        return if extracted.is_empty() {
+            ExtractionResult::Skipped(skip_reasons)
+        } else {
+            ExtractionResult::Extracted(extracted)
+        };
+    }
+
+    // Extract Windows inline wrappers (cmd /c|/k, iex/Invoke-Expression, -EncodedCommand)
+    extract_windows_inline_scripts(
         command,
         limits,
         start_time,
@@ -1332,6 +1411,132 @@ fn extract_inline_scripts(
         skip_reasons.push(SkipReason::ExceededHeredocLimit {
             limit: limits.max_heredocs,
         });
+    }
+}
+
+/// Push one extracted Windows inner command (re-evaluated as a shell command).
+///
+/// Returns `false` if the per-command heredoc/inline limit was hit (caller should
+/// stop), `true` to continue. Oversized bodies are skipped quietly (return `true`).
+/// Kept as a free function (not a closure) so the per-loop `record_timeout_if_needed`
+/// borrows of `skip_reasons` don't conflict with the `extracted`/`skip_reasons`
+/// mutable borrows this needs.
+fn push_windows_inner(
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+    limits: &ExtractionLimits,
+    content: &str,
+    full: std::ops::Range<usize>,
+    content_range: Option<std::ops::Range<usize>>,
+    target: &str,
+) -> bool {
+    if extracted.len() >= limits.max_heredocs {
+        skip_reasons.push(SkipReason::ExceededHeredocLimit {
+            limit: limits.max_heredocs,
+        });
+        return false;
+    }
+    if content.len() > limits.max_body_bytes {
+        return true; // skip oversize body quietly, keep scanning
+    }
+    extracted.push(ExtractedContent {
+        content: content.to_string(),
+        // Re-evaluate the inner command line as a shell command, exactly like the
+        // PowerShell `-Command` body is, so windows.* (and core) packs apply to it.
+        language: ScriptLanguage::Bash,
+        delimiter: None,
+        byte_range: full,
+        content_range,
+        quoted: true,
+        heredoc_type: None,
+        target_command: Some(target.to_string()),
+    });
+    true
+}
+
+/// Extract Windows-specific inline scripts that wrap an inner command line:
+/// `cmd /c "..."` / `cmd /k ...`, `iex` / `Invoke-Expression "..."`, and
+/// `powershell -EncodedCommand <base64>` (decoded from base64 UTF-16LE). The inner
+/// content is re-evaluated by the full pipeline so a destructive command hidden by
+/// any of these wrappers is blocked exactly as the bare form is. Fail-open: a bad
+/// base64 payload or a timeout simply yields no extraction.
+fn extract_windows_inline_scripts(
+    command: &str,
+    limits: &ExtractionLimits,
+    start_time: Instant,
+    timeout: Duration,
+    extracted: &mut Vec<ExtractedContent>,
+    skip_reasons: &mut Vec<SkipReason>,
+) {
+    if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+        return;
+    }
+
+    // cmd /c | /k  (double-quoted, single-quoted, or unquoted rest-of-line)
+    for cap in CMD_INLINE_SCRIPT.captures_iter(command) {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        if let Some(m) = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)) {
+            let full = cap.get(0).expect("group 0 always present");
+            if !push_windows_inner(
+                extracted,
+                skip_reasons,
+                limits,
+                m.as_str(),
+                full.start()..full.end(),
+                Some(m.start()..m.end()),
+                "cmd",
+            ) {
+                return;
+            }
+        }
+    }
+
+    // iex / Invoke-Expression "<code>"
+    for cap in IEX_INLINE_SCRIPT.captures_iter(command) {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        if let Some(m) = cap.get(1).or_else(|| cap.get(2)) {
+            let full = cap.get(0).expect("group 0 always present");
+            if !push_windows_inner(
+                extracted,
+                skip_reasons,
+                limits,
+                m.as_str(),
+                full.start()..full.end(),
+                Some(m.start()..m.end()),
+                "iex",
+            ) {
+                return;
+            }
+        }
+    }
+
+    // powershell -EncodedCommand <base64>  (decode base64 UTF-16LE, then re-evaluate)
+    for cap in POWERSHELL_ENCODED_COMMAND.captures_iter(command) {
+        if record_timeout_if_needed(start_time, timeout, limits.timeout_ms, skip_reasons) {
+            return;
+        }
+        let Some(b64) = cap.get(1) else { continue };
+        let Some(decoded) = decode_powershell_encoded_command(b64.as_str()) else {
+            continue; // fail-open on invalid base64
+        };
+        let full = cap.get(0).expect("group 0 always present");
+        // The decoded text isn't a substring of the original command, so there is
+        // no content_range to report.
+        if !push_windows_inner(
+            extracted,
+            skip_reasons,
+            limits,
+            &decoded,
+            full.start()..full.end(),
+            None,
+            "powershell",
+        ) {
+            return;
+        }
     }
 }
 
@@ -2809,6 +3014,257 @@ mod tests {
             } else {
                 panic!("Expected Extracted result");
             }
+        }
+
+        // --- Windows inline wrappers (.9.7): cmd /c|/k, iex/Invoke-Expression, -EncodedCommand ---
+
+        #[test]
+        fn extracts_cmd_slash_c_double_quoted() {
+            let result =
+                extract_content(r#"cmd /c "del /s /q C:\src""#, &ExtractionLimits::default());
+            let ExtractionResult::Extracted(contents) = result else {
+                panic!("expected Extracted");
+            };
+            assert!(
+                contents
+                    .iter()
+                    .any(|c| c.content == r"del /s /q C:\src"
+                        && c.language == ScriptLanguage::Bash),
+                "cmd /c body not extracted: {contents:?}"
+            );
+        }
+
+        #[test]
+        fn extracts_cmd_slash_k_and_slash_s_c() {
+            let r1 = extract_content(r#"cmd /k "format C: /q""#, &ExtractionLimits::default());
+            let ExtractionResult::Extracted(c1) = r1 else {
+                panic!("expected Extracted for /k");
+            };
+            assert!(c1.iter().any(|c| c.content == "format C: /q"));
+
+            let r2 = extract_content(
+                r#"cmd /s /c "rd /s /q C:\Windows""#,
+                &ExtractionLimits::default(),
+            );
+            let ExtractionResult::Extracted(c2) = r2 else {
+                panic!("expected Extracted for /s /c");
+            };
+            assert!(c2.iter().any(|c| c.content == r"rd /s /q C:\Windows"));
+        }
+
+        #[test]
+        fn extracts_cmd_slash_c_unquoted_rest_of_line() {
+            let result = extract_content(r"cmd /c del /s /q C:\src", &ExtractionLimits::default());
+            let ExtractionResult::Extracted(contents) = result else {
+                panic!("expected Extracted");
+            };
+            assert!(contents.iter().any(|c| c.content == r"del /s /q C:\src"));
+        }
+
+        #[test]
+        fn extracts_iex_and_invoke_expression() {
+            let r1 = extract_content(
+                r#"iex "Remove-Item -Recurse -Force C:\src""#,
+                &ExtractionLimits::default(),
+            );
+            let ExtractionResult::Extracted(c1) = r1 else {
+                panic!("expected Extracted for iex");
+            };
+            assert!(
+                c1.iter()
+                    .any(|c| c.content == r"Remove-Item -Recurse -Force C:\src")
+            );
+
+            let r2 = extract_content(
+                r"Invoke-Expression 'rd /s /q C:\src'",
+                &ExtractionLimits::default(),
+            );
+            let ExtractionResult::Extracted(c2) = r2 else {
+                panic!("expected Extracted for Invoke-Expression");
+            };
+            assert!(c2.iter().any(|c| c.content == r"rd /s /q C:\src"));
+        }
+
+        #[test]
+        fn extracts_powershell_encoded_command_base64_utf16le() {
+            // base64(UTF-16LE("Remove-Item -Recurse -Force C:\src"))
+            let enc = "UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=";
+            for cmd in [
+                format!("powershell -EncodedCommand {enc}"),
+                format!("powershell -enc {enc}"),
+                format!("pwsh -e {enc}"),
+                // Flags that take a VALUE before the encoded flag (the canonical
+                // obfuscation form) must not defeat extraction.
+                format!("powershell -ExecutionPolicy Bypass -EncodedCommand {enc}"),
+                format!("powershell -WindowStyle Hidden -nop -enc {enc}"),
+                format!("pwsh -ExecutionPolicy Bypass -NoProfile -e {enc}"),
+            ] {
+                let result = extract_content(&cmd, &ExtractionLimits::default());
+                let ExtractionResult::Extracted(contents) = result else {
+                    panic!("expected Extracted for {cmd}");
+                };
+                assert!(
+                    contents
+                        .iter()
+                        .any(|c| c.content == r"Remove-Item -Recurse -Force C:\src"),
+                    "decoded mismatch for {cmd}: {contents:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn extracts_powershell_command_after_value_flag() {
+            // `powershell -ExecutionPolicy Bypass -Command "..."` is the canonical
+            // way to invoke an inline payload; a value-taking flag before -Command
+            // must not break the inline-script extraction.
+            for cmd in [
+                r#"powershell -ExecutionPolicy Bypass -Command "Remove-Item -Recurse -Force C:\src""#,
+                r"powershell -ExecutionPolicy Bypass -NoProfile -Command 'rd /s /q C:\src'",
+                r#"pwsh -WindowStyle Hidden -Command "del /s /q C:\src""#,
+            ] {
+                let result = extract_content(cmd, &ExtractionLimits::default());
+                let ExtractionResult::Extracted(contents) = result else {
+                    panic!("expected Extracted for {cmd}");
+                };
+                assert!(
+                    contents.iter().any(|c| !c.content.is_empty()
+                        && (c.content.contains("Remove-Item")
+                            || c.content.contains("rd ")
+                            || c.content.contains("del "))),
+                    "no inline body extracted for {cmd}: {contents:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn value_flag_skip_does_not_falsely_extract_script_arg() {
+            // A SCRIPT positional (it has an extension) must NOT be mistaken for a
+            // boolean flag's value, or we'd falsely extract an inline flag that is
+            // really a positional arg to the script — the interpreter runs the
+            // SCRIPT, not the `-c`/`-e`. (Scripts whose extension is itself a shell
+            // name — *.sh/.bash/.zsh/.fish — match the interpreter alternation via a
+            // separate, pre-existing suffix boundary, so they are avoided here to
+            // isolate the value-flag-skip behavior under test.)
+            for cmd in [
+                r#"node script.js -e "evil()""#,
+                r#"bash -x deploy.bin -c "rm -rf /etc""#,
+                r#"python -v mymodule.py -c "import os""#,
+            ] {
+                let result = extract_content(cmd, &ExtractionLimits::default());
+                if let ExtractionResult::Extracted(contents) = result {
+                    assert!(
+                        !contents.iter().any(|c| c.content.contains("evil")
+                            || c.content.contains("rm -rf")
+                            || c.content.contains("import os")),
+                        "must not extract an inline flag that is a positional arg to a script: {cmd} -> {contents:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn non_bareword_flag_value_does_not_defeat_extraction() {
+            // A value-taking interpreter flag whose value is NOT a clean bareword —
+            // it starts with a digit (`4096`, `5.1`) or contains `:`/`/`/`\`
+            // (`ignore::DeprecationWarning`, `ts-node/register`, `/etc/profile`) —
+            // must still be skipped so the inline `-c`/`-e`/`-Command`/`-EncodedCommand`
+            // after it is extracted. These are canonical real-world obfuscations
+            // (Python `-W` filters, Node `-r` loaders / `--max-old-space-size`, bash
+            // `--rcfile`, PowerShell `-ExecutionPolicy`/`-Version`); a bareword-only
+            // value token silently let them slip past Tier-1/Tier-2 (an UNDER-block).
+            // The companion guard `value_flag_skip_does_not_falsely_extract_script_arg`
+            // proves a bare `name.ext` script positional is still NOT skipped.
+            //
+            // The last two cases cover ATTACHED (no-space) short-flag values
+            // (`-MFile::Spec`, `-i.bak`) — the short-flag token consumes a trailing
+            // `:`/`.`/`=` value so they don't defeat the inline `-e` either.
+            let enc = "UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=";
+            let cases: [(String, &str); 9] = [
+                (
+                    r#"python -W ignore::DeprecationWarning -c "import shutil; shutil.rmtree('/home/user')""#.to_string(),
+                    "shutil.rmtree",
+                ),
+                (
+                    r#"node --max-old-space-size 4096 -e "require('child_process').execSync('rm -rf /')""#.to_string(),
+                    "execSync",
+                ),
+                (
+                    r#"node -r ts-node/register -e "doEvil()""#.to_string(),
+                    "doEvil",
+                ),
+                (
+                    r#"bash --rcfile /etc/profile -c "rm -rf /etc""#.to_string(),
+                    "rm -rf",
+                ),
+                (
+                    r#"ruby -r ./lib/foo -e "FileUtils.rm_rf('/home/user')""#.to_string(),
+                    "rm_rf",
+                ),
+                (
+                    r#"powershell -Version 5.1 -Command "Remove-Item -Recurse -Force C:\src""#.to_string(),
+                    "Remove-Item",
+                ),
+                (
+                    format!("powershell -ExecutionPolicy Unrestricted -EncodedCommand {enc}"),
+                    "Remove-Item",
+                ),
+                (
+                    r#"perl -MFile::Spec -e "system('rm -rf /home/user')""#.to_string(),
+                    "system",
+                ),
+                (
+                    r#"perl -i.bak -e "unlink glob('*')""#.to_string(),
+                    "unlink",
+                ),
+            ];
+            for (cmd, needle) in &cases {
+                let result = extract_content(cmd, &ExtractionLimits::default());
+                let ExtractionResult::Extracted(contents) = result else {
+                    panic!("expected Extracted for {cmd}");
+                };
+                assert!(
+                    contents.iter().any(|c| c.content.contains(*needle)),
+                    "non-bareword flag value defeated extraction for {cmd}: {contents:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn decode_powershell_encoded_command_roundtrip_and_failopen() {
+            let enc = "UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=";
+            assert_eq!(
+                decode_powershell_encoded_command(enc).as_deref(),
+                Some(r"Remove-Item -Recurse -Force C:\src")
+            );
+            // Fail-open on garbage / empty input.
+            assert_eq!(decode_powershell_encoded_command("!!!not-base64!!!"), None);
+            assert_eq!(decode_powershell_encoded_command(""), None);
+        }
+
+        #[test]
+        fn windows_wrappers_trigger_tier1() {
+            for cmd in [
+                r#"cmd /c "del x""#,
+                "cmd /k whatever",
+                r#"iex "x""#,
+                r#"Invoke-Expression "x""#,
+                "powershell -EncodedCommand QQBhAA==",
+            ] {
+                assert_eq!(
+                    check_triggers(cmd),
+                    TriggerResult::Triggered,
+                    "should trigger Tier 1: {cmd}"
+                );
+            }
+        }
+
+        #[test]
+        fn iexplore_does_not_falsely_trigger_iex() {
+            // The `iex` alias must be a standalone token, not a prefix of `iexplore`.
+            assert_eq!(
+                check_triggers("start iexplore.exe https://example.com"),
+                TriggerResult::NoTrigger
+            );
         }
 
         #[test]

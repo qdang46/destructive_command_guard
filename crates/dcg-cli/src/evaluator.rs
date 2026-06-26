@@ -2772,9 +2772,7 @@ fn evaluate_heredoc(
         };
 
     for content in contents {
-        if deadline_exceeded(context.deadline)
-            || remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
-        {
+        if deadline_exceeded(context.deadline) {
             return Some(EvaluationResult::allowed_due_to_budget());
         }
 
@@ -2817,6 +2815,69 @@ fn evaluate_heredoc(
                 "Skipping heredoc content analysis for non-executing target"
             );
             continue; // Skip to next extracted content - this heredoc is just data
+        }
+
+        // Cheap, high-signal fallback before the expensive AST pass. If the
+        // hook is already close to its fail-open deadline, this keeps obvious
+        // catastrophic language-library deletes from being silently allowed.
+        if let Some(m) =
+            crate::ast_matcher::scan_filesystem_sink_fallback(&content.content, content.language)
+        {
+            if m.severity.blocks_by_default() {
+                let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
+
+                if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+                    if first_allowlist_hit.is_none() {
+                        let reason =
+                            format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+                        let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
+                        *first_allowlist_hit = Some((
+                            PatternMatch {
+                                pack_id: Some(pack_id),
+                                pattern_name: Some(pattern_name),
+                                severity: Some(ast_severity_to_pack_severity(m.severity)),
+                                reason,
+                                source: MatchSource::HeredocAst,
+                                matched_span: mapped_span,
+                                matched_text_preview: Some(m.matched_text_preview),
+                                explanation: None,
+                                suggestions: &[],
+                            },
+                            hit.layer,
+                            hit.entry.reason.clone(),
+                        ));
+                    }
+                } else {
+                    let reason =
+                        format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+                    let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
+                    return Some(EvaluationResult {
+                        decision: EvaluationDecision::Deny,
+                        pattern_info: Some(PatternMatch {
+                            pack_id: Some(pack_id),
+                            pattern_name: Some(pattern_name),
+                            severity: Some(ast_severity_to_pack_severity(m.severity)),
+                            reason,
+                            source: MatchSource::HeredocAst,
+                            matched_span: mapped_span,
+                            matched_text_preview: Some(m.matched_text_preview),
+                            explanation: None,
+                            suggestions: &[],
+                        }),
+                        allowlist_override: None,
+                        effective_mode: Some(crate::packs::DecisionMode::Deny),
+                        skipped_due_to_budget: false,
+                        branch_context: None,
+                        session_occurrence: None,
+                        graduated_response: None,
+                        bypass_method: None,
+                    });
+                }
+            }
+        }
+
+        if remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE) {
+            return Some(EvaluationResult::allowed_due_to_budget());
         }
 
         // Tier 2.5: Recursive Shell Analysis

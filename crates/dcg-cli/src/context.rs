@@ -204,9 +204,10 @@ enum TokenizerState {
     Normal,
     SingleQuote,
     DoubleQuote,
-    CommandSubst, // Inside $(...), scanning for matching )
-    Backtick,     // Inside `...`, scanning for matching `
-    Comment,      // Inside #... (newline terminates)
+    CommandSubst,           // Inside $(...), scanning for matching )
+    Backtick,               // Inside `...`, scanning for matching `
+    Comment,                // Inside #... (newline terminates)
+    PowerShellBlockComment, // Inside <# ... #> (PowerShell block comment; #> terminates)
 }
 
 /// Shell command tokenizer and context classifier.
@@ -283,7 +284,10 @@ impl ContextClassifier {
 
             // Handle escapes first (except in SingleQuote where \ is literal)
             if byte == b'\\' && current_state != TokenizerState::SingleQuote {
-                let effective = !matches!(current_state, TokenizerState::Comment);
+                let effective = !matches!(
+                    current_state,
+                    TokenizerState::Comment | TokenizerState::PowerShellBlockComment
+                );
                 if effective {
                     // Consume the backslash and the next character
                     i += 1; // Skip \
@@ -407,6 +411,21 @@ impl ContextClassifier {
                             pending_inline_code = false;
                             // After a command separator, the next word is a new command
                             in_command_position = true;
+                            continue;
+                        }
+                        b'<' if i + 1 < len && bytes[i + 1] == b'#' => {
+                            // PowerShell block comment `<# ... #>`. Its body is not
+                            // executed, so classify the whole region as a Comment (a
+                            // destructive string printed inside it must NOT block).
+                            if i > span_start {
+                                spans.push(Span::new(current_kind, span_start, i));
+                            }
+                            span_start = i;
+                            stack.push(TokenizerState::PowerShellBlockComment);
+                            // Consume both `<#` bytes so the opener's `#` cannot be
+                            // mistaken for a `#>` terminator (e.g. `<#>` is an
+                            // UNTERMINATED comment, not a complete one).
+                            i += 2;
                             continue;
                         }
                         b'#' if i == 0
@@ -580,6 +599,19 @@ impl ContextClassifier {
                         }
                     }
                 }
+                TokenizerState::PowerShellBlockComment => {
+                    // Terminates on `#>` (consume both bytes). Newlines do NOT end it.
+                    if byte == b'#' && i + 1 < len && bytes[i + 1] == b'>' {
+                        stack.pop();
+                        if matches!(stack.last(), Some(TokenizerState::Normal)) {
+                            spans.push(Span::new(SpanKind::Comment, span_start, i + 2));
+                            span_start = i + 2;
+                            current_kind = SpanKind::Executed;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                }
             }
             i += 1;
         }
@@ -597,7 +629,9 @@ impl ContextClassifier {
                     }
                 }
                 Some(TokenizerState::SingleQuote) | None => SpanKind::Unknown,
-                Some(TokenizerState::Comment) => SpanKind::Comment,
+                Some(TokenizerState::Comment | TokenizerState::PowerShellBlockComment) => {
+                    SpanKind::Comment
+                }
                 Some(TokenizerState::CommandSubst | TokenizerState::Backtick) => {
                     SpanKind::InlineCode
                 }
@@ -1871,6 +1905,28 @@ fn tokenize_command(command: &str) -> SanitizeTokens {
             continue;
         }
 
+        // PowerShell block comment `<# ... #>` (checked before separators so `<#`
+        // wins over the `<` redirect operator). Masked so a destructive string
+        // printed inside the comment does not match any pattern (.9.7).
+        if i + 1 < len && bytes[i] == b'<' && bytes[i + 1] == b'#' {
+            let start = i;
+            i += 2; // skip `<#`
+            while i + 1 < len && !(bytes[i] == b'#' && bytes[i + 1] == b'>') {
+                i += 1;
+            }
+            if i + 1 < len && bytes[i] == b'#' && bytes[i + 1] == b'>' {
+                i += 2; // consume closing `#>`
+            } else {
+                i = len; // unterminated block comment runs to EOF
+            }
+            tokens.push(SanitizeToken {
+                kind: SanitizeTokenKind::Comment,
+                byte_range: start..i,
+                has_inline_code: false,
+            });
+            continue;
+        }
+
         if let Some(end) = consume_separator_token(bytes, i, len, &mut tokens) {
             i = end;
             continue;
@@ -2351,6 +2407,75 @@ mod tests {
         let comment_span = spans.spans().iter().find(|s| s.kind == SpanKind::Comment);
         assert!(comment_span.is_some());
         assert_eq!(comment_span.unwrap().text(cmd), "# rm -rf /");
+    }
+
+    #[test]
+    fn test_powershell_block_comment_is_comment_span() {
+        // PowerShell `<# ... #>` block comment: body must be classified Comment so a
+        // destructive string printed inside it does not block (.9.7).
+        let cmd = r"echo safe <# rm -rf / #> done";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("block comment should produce a Comment span");
+        assert_eq!(comment.text(cmd), "<# rm -rf / #>");
+        // The destructive text must NOT appear in any Executed span.
+        assert!(
+            !spans
+                .spans()
+                .iter()
+                .any(|s| s.kind == SpanKind::Executed && s.text(cmd).contains("rm -rf")),
+            "destructive text leaked into an Executed span"
+        );
+    }
+
+    #[test]
+    fn test_powershell_block_comment_unterminated_runs_to_eof() {
+        let cmd = r"echo safe <# rm -rf / never closed";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("unterminated block comment should still be a Comment span");
+        assert!(comment.text(cmd).starts_with("<# rm -rf /"));
+    }
+
+    #[test]
+    fn test_powershell_block_comment_lt_hash_gt_is_unterminated() {
+        // `<#>` opens a block comment whose terminator (`#>`) never appears — the
+        // opener's own `#` must NOT be reused as the terminator. So everything from
+        // `<#` to EOF is a Comment, and the destructive tail is never Executed.
+        let cmd = r"echo a <#> rm -rf /";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("`<#>` should open an unterminated Comment span");
+        assert!(comment.text(cmd).starts_with("<#>"));
+        assert!(
+            !spans
+                .spans()
+                .iter()
+                .any(|s| s.kind == SpanKind::Executed && s.text(cmd).contains("rm -rf")),
+            "the tail after `<#>` must not be Executed"
+        );
+    }
+
+    #[test]
+    fn test_powershell_empty_block_comment_lt_hash_hash_gt() {
+        // `<##>` is a complete, empty block comment (terminator is the 2nd `#` + `>`).
+        let cmd = r"echo a <##> echo b";
+        let spans = classify_command(cmd);
+        let comment = spans
+            .spans()
+            .iter()
+            .find(|s| s.kind == SpanKind::Comment)
+            .expect("`<##>` should be a complete Comment span");
+        assert_eq!(comment.text(cmd), "<##>");
     }
 
     #[test]
@@ -3010,6 +3135,27 @@ mod tests {
             .iter()
             .find(|s| s.kind == SpanKind::InlineCode);
         assert!(code_span.is_some(), "python -c content must be InlineCode");
+    }
+
+    #[test]
+    fn sanitize_masks_powershell_block_comment() {
+        // A destructive string inside `<# ... #>` must be masked so it can't match
+        // any pattern (printed-not-executed; .9.7).
+        let cmd = r"Write-Output <# Remove-Item -Recurse -Force C:\src #> done";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(
+            !sanitized.as_ref().contains("Remove-Item -Recurse -Force"),
+            "block-comment body leaked: {sanitized}"
+        );
+        assert!(sanitized.as_ref().contains("Write-Output"));
+    }
+
+    #[test]
+    fn sanitize_masks_unterminated_powershell_block_comment() {
+        let cmd = r"echo ok <# rd /s /q C:\Windows never closed";
+        let sanitized = sanitize_for_pattern_matching(cmd);
+        assert!(!sanitized.as_ref().contains("rd /s /q"));
     }
 
     #[test]

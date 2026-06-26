@@ -345,6 +345,28 @@ struct GitAwarenessConfigLayer {
     warn_if_not_git: Option<bool>,
 }
 
+/// The system-wide (machine-level) dcg configuration directory.
+///
+/// On Unix this is `/etc/dcg`. Native Windows has no `/etc`, so the system
+/// layer lives under `%ProgramData%\dcg` (resolved from the `ProgramData`
+/// environment variable, falling back to `C:\ProgramData`) — the conventional
+/// location for machine-wide application configuration. The `dirs` crate does
+/// not expose `ProgramData`, hence the manual resolution. This is the single
+/// source of truth for the "system" config + allowlist base on every platform.
+pub(crate) fn system_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("ProgramData")
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
+            .join("dcg")
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("/etc/dcg")
+    }
+}
+
 fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
     if value == "~" {
         if let Some(home) = dirs::home_dir() {
@@ -1309,6 +1331,25 @@ impl PacksConfig {
             .any(|d| d == "system.disk" || d == "system");
         if !system_disk_explicitly_disabled {
             enabled.insert("system.disk".to_string());
+        }
+
+        // Windows-native packs are default-ON only on Windows: a fresh Windows
+        // install must block `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
+        // etc. with no config, while Unix pays no quick-reject cost for Windows
+        // verbs by default. The packs stay *registered* on every platform, so
+        // Unix users can still opt in (e.g. to scan committed `.ps1`/`.cmd`
+        // scripts) via `enabled = ["windows.filesystem"]`. Opt out on Windows
+        // with `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`).
+        #[cfg(windows)]
+        {
+            // Catastrophic Windows packs default-ON; each opt-out-able by its own
+            // id or by the `windows` category.
+            for pack_id in ["windows.filesystem", "windows.system"] {
+                let disabled = self.disabled.iter().any(|d| d == pack_id || d == "windows");
+                if !disabled {
+                    enabled.insert(pack_id.to_string());
+                }
+            }
         }
 
         enabled
@@ -3056,13 +3097,13 @@ impl Config {
 
     /// Load system-wide configuration.
     ///
-    /// The `/etc/dcg/config.toml` path is treated as a privileged config
-    /// source: it sits in `ConfigSource::System`, which means
-    /// `read_config_file_bounded` refuses to follow symlinks pointing at
-    /// user-writable targets (a non-root user could otherwise influence
-    /// system-layer config by symlinking it into their home directory).
+    /// The system config path is treated as a privileged config source: it sits
+    /// in `ConfigSource::System`, which means `read_config_file_bounded` refuses
+    /// to follow symlinks pointing at user-writable targets (a non-root user
+    /// could otherwise influence system-layer config by symlinking it into their
+    /// home directory).
     fn load_system_config_layer() -> Option<ConfigLayer> {
-        let path = PathBuf::from("/etc/dcg").join(CONFIG_FILE_NAME);
+        let path = system_config_dir().join(CONFIG_FILE_NAME);
         let content = read_config_file_bounded(&path, ConfigSource::System)?;
         match toml::from_str(&content) {
             Ok(layer) => Some(layer),
@@ -4395,6 +4436,26 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
+    #[test]
+    fn system_config_dir_is_platform_correct() {
+        let dir = system_config_dir();
+        #[cfg(not(windows))]
+        {
+            assert_eq!(dir, PathBuf::from("/etc/dcg"));
+        }
+        #[cfg(windows)]
+        {
+            // `%ProgramData%\dcg` — last component is `dcg`, parent resolves to
+            // ProgramData (env or the C:\ProgramData fallback).
+            assert!(
+                dir.ends_with("dcg"),
+                "expected .../dcg, got {}",
+                dir.display()
+            );
+            assert!(dir.parent().is_some());
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Branch glob regression tests for `GitAwarenessConfig::matches_any_pattern`
     // ---------------------------------------------------------------------
@@ -4504,6 +4565,78 @@ auto_prune_expired = true
             "system.disk must be enabled by default — catastrophic disk \
              ops are not safe to leave one config-edit away from \
              unprotected. Got enabled set: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn windows_packs_are_default_on_only_on_windows() {
+        // win-pack-default-enablement (.9.10): the catastrophic Windows packs
+        // (windows.filesystem, windows.system) are default-ON on Windows so a
+        // fresh install blocks `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
+        // `vssadmin delete shadows`, etc. with no config; on Unix they are
+        // registered but OFF (opt-in) so the Unix quick-reject pays no cost for
+        // Windows verbs. The broader windows.misc / windows.powershell packs are
+        // opt-in on every platform.
+        let enabled = Config::default().enabled_pack_ids();
+
+        #[cfg(windows)]
+        {
+            assert!(
+                enabled.contains("windows.filesystem"),
+                "windows.filesystem must be default-on on Windows: {enabled:?}"
+            );
+            assert!(
+                enabled.contains("windows.system"),
+                "windows.system must be default-on on Windows: {enabled:?}"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                !enabled.contains("windows.filesystem"),
+                "windows.filesystem must be opt-in (off) on Unix: {enabled:?}"
+            );
+            assert!(
+                !enabled.contains("windows.system"),
+                "windows.system must be opt-in (off) on Unix: {enabled:?}"
+            );
+        }
+
+        // Broader Windows packs are opt-in on every platform.
+        assert!(!enabled.contains("windows.misc"));
+        assert!(!enabled.contains("windows.powershell"));
+    }
+
+    #[test]
+    fn windows_packs_respect_opt_out_and_explicit_enable() {
+        // Opt-out: disabling the `windows` category removes the default-on packs
+        // (a no-op on Unix where they were never on).
+        let opt_out = Config {
+            packs: PacksConfig {
+                enabled: vec![],
+                disabled: vec!["windows".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = opt_out.enabled_pack_ids();
+        assert!(!enabled.contains("windows.filesystem"));
+        assert!(!enabled.contains("windows.system"));
+
+        // Explicit enable works on any platform (e.g. to scan committed .ps1/.cmd
+        // scripts on Unix CI).
+        let opt_in = Config {
+            packs: PacksConfig {
+                enabled: vec!["windows.misc".to_string()],
+                disabled: vec![],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = opt_in.enabled_pack_ids();
+        assert!(
+            enabled.contains("windows.misc"),
+            "explicit enable must include windows.misc: {enabled:?}"
         );
     }
 

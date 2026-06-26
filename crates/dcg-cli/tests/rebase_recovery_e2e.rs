@@ -18,7 +18,7 @@ fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // deps
     path.pop(); // debug
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -43,6 +43,7 @@ fn run_hook_in_with_env(
     cmd.current_dir(cwd)
         // Keep tests hermetic: don't share the test user's real dcg state.
         .env("HOME", cwd)
+        .env("USERPROFILE", cwd)
         .env("XDG_CONFIG_HOME", cwd.join("xdg"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -77,6 +78,7 @@ fn run_rebase_recover(cwd: &Path, ttl_secs: Option<u64>) -> std::process::Output
     let mut cmd = Command::new(dcg_binary());
     cmd.current_dir(cwd)
         .env("HOME", cwd)
+        .env("USERPROFILE", cwd)
         .env("XDG_CONFIG_HOME", cwd.join("xdg"))
         .arg("rebase-recover");
     if let Some(t) = ttl_secs {

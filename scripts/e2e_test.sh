@@ -229,7 +229,7 @@ log_pass() {
 
     if ! $JSON_OUTPUT; then
         if $VERBOSE && ! $JSON_OUTPUT; then
-            local duration_ms="${TEST_TIMES[-1]}"
+            local duration_ms="${TEST_TIMES[${#TEST_TIMES[@]}-1]}"
             echo -e "${GREEN}✓${NC} $desc ${CYAN}(${duration_ms}ms)${NC}"
         else
             echo -e "${GREEN}✓${NC} $desc"
@@ -261,7 +261,7 @@ log_fail() {
     fi
 
     if ! $JSON_OUTPUT; then
-        local duration_ms="${TEST_TIMES[-1]}"
+        local duration_ms="${TEST_TIMES[${#TEST_TIMES[@]}-1]}"
         if $VERBOSE && ! $JSON_OUTPUT; then
             echo -e "${RED}✗${NC} $desc ${CYAN}(${duration_ms}ms)${NC}"
             echo -e "  ${YELLOW}Expected:${NC} $expected"
@@ -1610,8 +1610,10 @@ test_command_with_layered_allowlists() {
     fi
 
     if [[ -n "$user_allowlist" ]]; then
-        mkdir -p "$user_config_dir/dcg"
-        echo "$user_allowlist" > "$user_config_dir/dcg/allowlist.toml"
+        # Write to $HOME/.config/dcg/allowlist.toml as that's what the code checks first
+        local home_config_dir="$home_dir/.config/dcg"
+        mkdir -p "$home_config_dir"
+        echo "$user_allowlist" > "$home_config_dir/allowlist.toml"
     fi
 
     if [[ -n "$system_allowlist" ]]; then

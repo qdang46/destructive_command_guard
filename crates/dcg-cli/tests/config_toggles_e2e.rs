@@ -26,7 +26,7 @@ fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name
     path.pop(); // Remove deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -93,6 +93,7 @@ impl TestEnv {
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &self.home_dir)
+            .env("USERPROFILE", &self.home_dir)
             .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
             .env("DCG_CONFIG", &self.config_path)
             .env("DCG_PACKS", "core.git,core.filesystem")
@@ -123,6 +124,7 @@ impl TestEnv {
         let mut cmd = Command::new(dcg_binary());
         cmd.env_clear()
             .env("HOME", &self.home_dir)
+            .env("USERPROFILE", &self.home_dir)
             .env("XDG_CONFIG_HOME", &self.xdg_config_dir)
             .env("DCG_CONFIG", &self.config_path)
             .env("DCG_PACKS", "core.git,core.filesystem")
@@ -481,6 +483,7 @@ fn test_config_toggle_defaults_without_config() {
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_PACKS", "core.git")
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")

@@ -324,12 +324,33 @@ impl DecisionLogger {
 // ============================================================================
 
 fn expand_tilde(path: &str) -> String {
-    if path.starts_with("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}{}", home.to_string_lossy(), &path[1..]);
+    // Expand a leading `~/` or `~\` using $HOME first (honored for test
+    // isolation), then the platform home dir (USERPROFILE on Windows). On native
+    // Windows `HOME` is normally unset, so the `dirs::home_dir()` fallback is what
+    // keeps `~`-prefixed log paths from collapsing into a junk relative path.
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home_dir_string() {
+            return format!("{}/{}", home.trim_end_matches(['/', '\\']), rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = home_dir_string() {
+            return home;
         }
     }
     path.to_string()
+}
+
+/// Resolve the user's home directory as a `String`, preferring `$HOME` (so tests
+/// can override it for isolation) and falling back to the platform home
+/// (`USERPROFILE` on Windows) via the `dirs` crate.
+fn home_dir_string() -> Option<String> {
+    if let Some(home) = std::env::var_os("HOME") {
+        let s = home.to_string_lossy();
+        if !s.is_empty() {
+            return Some(s.into_owned());
+        }
+    }
+    dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
 fn open_log_file(path: &str) -> std::io::Result<File> {
@@ -1091,6 +1112,23 @@ mod tests {
     fn expand_tilde_without_tilde() {
         let result = expand_tilde("/absolute/path");
         assert_eq!(result, "/absolute/path");
+    }
+
+    #[test]
+    fn expand_tilde_backslash_form_and_bare_tilde() {
+        // `~\` (Windows-style) must expand just like `~/`, and bare `~` resolves
+        // to the home dir. Uses home_dir_string(), which falls back to
+        // dirs::home_dir() (USERPROFILE on Windows) when $HOME is unset, so this
+        // runs on any host.
+        if home_dir_string().is_some() {
+            let result = expand_tilde(r"~\test\path");
+            assert!(!result.starts_with('~'));
+            assert!(result.ends_with("/test\\path") || result.ends_with("/test/path"));
+
+            let bare = expand_tilde("~");
+            assert!(!bare.starts_with('~'));
+            assert!(!bare.is_empty());
+        }
     }
 
     #[test]

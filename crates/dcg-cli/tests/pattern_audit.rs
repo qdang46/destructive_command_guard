@@ -937,6 +937,16 @@ fn test_audit_backtracking_requirements() {
                 "systemctl-status",
             ]),
         ),
+        (
+            "windows.filesystem",
+            HashSet::from(["whatif-preview", "remove-item-recurse-force"]),
+        ),
+        ("windows.misc", HashSet::from(["robocopy-mirror"])),
+        (
+            "windows.powershell",
+            HashSet::from(["force-stop-or-restart-computer"]),
+        ),
+        ("windows.system", HashSet::from(["diskpart"])),
     ]);
 
     let registry = PackRegistry::new();

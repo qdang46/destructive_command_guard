@@ -254,6 +254,14 @@ Upstream tracking:
 - https://github.com/openai/codex/pull/18888 — work to emit Bash hook events when
   `exec_command` completes via the `write_stdin` polling mechanism.
 
+dcg behavior under this gap is **fail-open by construction**: when Codex routes a
+command through `unified_exec`/`command_execution`, *no* `PreToolUse` hook fires, so
+dcg is simply never invoked — it cannot block what it never sees, and it neither
+crashes nor interferes. The simple per-tool shell path (Codex's `Bash` /
+PowerShell-named payload) **is** intercepted (it dispatches as `HookProtocol::Codex`,
+the exit-2 deny path). See also the Windows limitations summary in
+[docs/windows.md](windows.md#limitations-honest).
+
 ### dcg-side state (already correct)
 
 The dcg engine and its installed hook config are correct for every path Codex

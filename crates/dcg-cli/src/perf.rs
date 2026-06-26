@@ -391,8 +391,10 @@ mod tests {
 
     #[test]
     fn deadline_exceeded_with_zero_duration() {
+        // Create a zero-duration deadline and ensure it's exceeded by sleeping
+        // briefly to let the Instant pass the zero point.
         let deadline = Deadline::new(Duration::ZERO);
-        // A zero-duration deadline should be immediately exceeded
+        std::thread::sleep(Duration::from_nanos(100));
         assert!(deadline.is_exceeded());
         assert!(deadline.remaining().is_none());
     }

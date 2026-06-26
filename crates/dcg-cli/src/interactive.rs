@@ -1296,9 +1296,13 @@ mod tests {
 
     #[test]
     fn test_read_line_with_timeout_returns_input_before_deadline() {
+        // The reader returns immediately, so this normally completes in
+        // microseconds. The timeout is generous (seconds, not milliseconds) purely
+        // so a scheduler stall under heavy parallel load can't spuriously trip the
+        // deadline before the already-ready input is delivered.
         let input = read_line_with_timeout(
             || Ok("verification-code\n".to_string()),
-            Duration::from_millis(100),
+            Duration::from_secs(10),
         )
         .expect("input should arrive before timeout");
 
@@ -1307,10 +1311,17 @@ mod tests {
 
     #[test]
     fn test_read_line_with_timeout_enforces_deadline() {
+        // The blocking reader sleeps far longer than the timeout, so a correct
+        // implementation MUST return Err(Timeout) without waiting for it. The
+        // elapsed bound is deliberately generous — orders of magnitude above the
+        // timeout, yet still well under the reader's sleep — so the test cannot
+        // flake when the scheduler is starved under heavy parallel load. It only
+        // has to prove we short-circuited the multi-second reader, not hit a tight
+        // millisecond target.
         let start = Instant::now();
         let result = read_line_with_timeout(
             || {
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(Duration::from_secs(10));
                 Ok("late input\n".to_string())
             },
             Duration::from_millis(20),
@@ -1318,7 +1329,7 @@ mod tests {
 
         assert!(matches!(result, Err(InputError::Timeout)));
         assert!(
-            start.elapsed() < Duration::from_millis(150),
+            start.elapsed() < Duration::from_secs(5),
             "timeout should return before the blocking reader finishes"
         );
     }

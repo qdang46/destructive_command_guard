@@ -118,8 +118,22 @@ impl AllowOnceEntry {
     pub fn matches_scope(&self, cwd: &Path) -> bool {
         let scope_path = Path::new(&self.scope_path);
         match self.scope_kind {
-            AllowOnceScopeKind::Cwd => cwd == scope_path,
-            AllowOnceScopeKind::Project => cwd.starts_with(scope_path),
+            AllowOnceScopeKind::Cwd => {
+                // On macOS, /var is a symlink to /private/var, so direct
+                // comparison can fail. Canonicalize both paths to normalize.
+                let cwd_canonical =
+                    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                let scope_canonical =
+                    std::fs::canonicalize(scope_path).unwrap_or_else(|_| scope_path.to_path_buf());
+                cwd == scope_path || cwd_canonical == scope_canonical
+            }
+            AllowOnceScopeKind::Project => {
+                let cwd_canonical =
+                    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+                let scope_canonical =
+                    std::fs::canonicalize(scope_path).unwrap_or_else(|_| scope_path.to_path_buf());
+                cwd.starts_with(scope_path) || cwd_canonical.starts_with(&scope_canonical)
+            }
         }
     }
 }

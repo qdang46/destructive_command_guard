@@ -455,11 +455,16 @@ mod tests {
 
         let scan_future = DcgMcpServer::run_blocking_scan(move || {
             scan_started_in_worker.store(true, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(Duration::from_secs(2));
             Ok(empty_scan_report())
         });
         let quick_future = async {
-            let quick_check = tokio::time::timeout(Duration::from_millis(50), async {
+            // If the blocking scan were starving the async runtime, this quick
+            // check could not complete until the scan's multi-second sleep
+            // finished. The timeout is generous (well under the scan's sleep, but
+            // far above any realistic scheduling jitter) so it detects genuine
+            // starvation without flaking when workers are merely busy under load.
+            let quick_check = tokio::time::timeout(Duration::from_secs(1), async {
                 while !scan_started.load(Ordering::SeqCst) {
                     tokio::task::yield_now().await;
                 }

@@ -4,7 +4,7 @@ fn dcg_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // deps
     path.pop(); // debug
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -16,9 +16,12 @@ fn run_hook_with_allowlist(command: &str, allowlist_content: &str) -> String {
     std::fs::write(&allowlist_path, allowlist_content).unwrap();
 
     // Create a fake home dir for user config loading
+    // The fork's allowlist loading first checks `$HOME/.config/dcg/allowlist.toml`
+    // (via dirs::home_dir()), then falls back to dirs::config_dir() which on
+    // macOS returns `$HOME/Library/Application Support/dcg/allowlist.toml`.
+    // We write to the first path that will be checked.
     let home_dir = temp_dir.path().join("home");
-    let xdg_config_dir = temp_dir.path().join("xdg_config");
-    let user_config_dir = xdg_config_dir.join("dcg");
+    let user_config_dir = home_dir.join(".config").join("dcg");
     std::fs::create_dir_all(&user_config_dir).unwrap();
     std::fs::write(user_config_dir.join("allowlist.toml"), allowlist_content).unwrap();
 
@@ -31,7 +34,7 @@ fn run_hook_with_allowlist(command: &str, allowlist_content: &str) -> String {
 
     let mut child = Command::new(dcg_binary())
         .env("HOME", &home_dir)
-        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("USERPROFILE", &home_dir)
         // Ensure system allowlist doesn't interfere
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "/nonexistent")
         .stdin(std::process::Stdio::piped())

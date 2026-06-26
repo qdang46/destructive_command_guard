@@ -34,7 +34,7 @@ fn dcg_binary() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // Remove test binary name
     path.pop(); // Remove deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -57,7 +57,10 @@ fn apply_hermetic_env(cmd: &mut Command, home: &std::path::Path) {
         cmd.env("PATH", path);
     }
     cmd.env("HOME", home)
+        .env("USERPROFILE", home)
         .env("TMPDIR", home.join("tmp"))
+        .env("TEMP", home.join("tmp"))
+        .env("TMP", home.join("tmp"))
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("NO_COLOR", "1");
     let _ = std::fs::create_dir_all(home.join("tmp"));

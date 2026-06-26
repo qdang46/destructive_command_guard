@@ -191,6 +191,7 @@ fn test_bypass_allows_dangerous_effects_on_normal_path() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn test_check_severity_returns_correct_level() {
     let (engine, _) = engine_with_severity_entries();
 

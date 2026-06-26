@@ -105,7 +105,7 @@ fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop(); // test binary name
     path.pop(); // deps/
-    path.push("dcg");
+    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
     path
 }
 
@@ -200,7 +200,10 @@ pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcom
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", &tmp_path)
+        .env("TEMP", &tmp_path)
+        .env("TMP", &tmp_path)
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -262,7 +265,10 @@ pub fn run_hook_raw_with_config(
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", &tmp_path)
+        .env("TEMP", &tmp_path)
+        .env("TMP", &tmp_path)
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -680,7 +686,10 @@ fn codex_warn_path_exits_zero_with_stderr_warning() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -944,7 +953,10 @@ fn claude_warn_path_exits_zero_with_ask_json() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1104,7 +1116,10 @@ fn claude_deny_writes_history_entry() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
@@ -1162,7 +1177,10 @@ fn claude_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1203,7 +1221,10 @@ fn claude_allow_once_round_trip() {
         .env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .output()
         .expect("failed to run allow-once redeem");
@@ -1222,7 +1243,10 @@ fn claude_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1764,7 +1788,16 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 /// Extract the allow-once short_code from the pending_exceptions.jsonl
 /// in the hermetic HOME directory.
 fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
-    let pending_path = home.join(".config/dcg/pending_exceptions.jsonl");
+    // Check XDG-style path first, then macOS native path
+    let xdg_path = home.join(".config/dcg/pending_exceptions.jsonl");
+    let mac_path = home.join("Library/Application Support/dcg/pending_exceptions.jsonl");
+    let pending_path = if xdg_path.exists() {
+        xdg_path
+    } else if mac_path.exists() {
+        mac_path
+    } else {
+        xdg_path // fall through to the original behavior (will return None)
+    };
     let content = std::fs::read_to_string(&pending_path).ok()?;
     for line in content.lines() {
         let line = line.trim();
@@ -1794,7 +1827,10 @@ fn codex_deny_creates_pending_exception_with_code() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1840,7 +1876,10 @@ fn codex_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1877,7 +1916,10 @@ fn codex_allow_once_round_trip() {
         .env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .output()
         .expect("failed to run allow-once redeem");
@@ -1896,7 +1938,10 @@ fn codex_allow_once_round_trip() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", &home_path)
+        .env("USERPROFILE", &home_path)
         .env("TMPDIR", home_path.join("tmp"))
+        .env("TEMP", home_path.join("tmp"))
+        .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1949,7 +1994,10 @@ fn run_with_user_allowlist(allowlist_toml: &str, command: &str, use_codex: bool)
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
         .stdin(Stdio::piped())
@@ -2107,7 +2155,10 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
@@ -2163,7 +2214,10 @@ fn codex_deny_with_history_disabled_still_exits_2() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2227,7 +2281,10 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
             .env_clear()
             .env("PATH", &system_path)
             .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
             .env("TMPDIR", home.path().join("tmp"))
+            .env("TEMP", home.path().join("tmp"))
+            .env("TMP", home.path().join("tmp"))
             .env("NO_COLOR", "1")
             .env("DCG_HISTORY_DB", &db_path)
             .stdin(Stdio::piped())
@@ -2276,10 +2333,18 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     let readonly_dir = home.path().join("readonly");
     std::fs::create_dir_all(&readonly_dir).unwrap();
     let db_path = readonly_dir.join("history.db");
-    // Make the directory read-only so DB creation fails
+    // Make the directory read-only so DB creation fails. This premise is
+    // Unix-only: on Windows the read-only *attribute* on a directory does NOT
+    // prevent creating files inside it, so we skip the read-only setup there.
+    // The assertions below (exit 2, stderr present, no panic) hold whether or
+    // not the history write fails, so on Windows the test still exercises
+    // deny-without-panic with history writes succeeding.
     let mut perms = std::fs::metadata(&readonly_dir).unwrap().permissions();
-    perms.set_readonly(true);
-    std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
+    #[cfg(unix)]
+    {
+        perms.set_readonly(true);
+        std::fs::set_permissions(&readonly_dir, perms.clone()).unwrap();
+    }
 
     let payload = build_codex_payload("git reset --hard HEAD~1");
     let system_path = std::env::var("PATH").unwrap_or_default();
@@ -2288,7 +2353,10 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     cmd.env_clear()
         .env("PATH", &system_path)
         .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env("TMPDIR", home.path().join("tmp"))
+        .env("TEMP", home.path().join("tmp"))
+        .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())

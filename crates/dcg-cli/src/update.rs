@@ -391,18 +391,7 @@ pub fn rollback(target_version: Option<&str>) -> Result<String, VersionCheckErro
 
     #[cfg(windows)]
     {
-        // On Windows, rename old and copy new
-        let backup_old = current_exe.with_extension("exe.old");
-        fs::rename(&current_exe, &backup_old).map_err(|e| {
-            VersionCheckError::BackupError(format!("Failed to move current executable: {e}"))
-        })?;
-        fs::copy(&backup_path, &current_exe).map_err(|e| {
-            // Try to restore old binary on failure
-            let _ = fs::rename(&backup_old, &current_exe);
-            VersionCheckError::BackupError(format!("Failed to restore backup: {e}"))
-        })?;
-        // Clean up old binary
-        let _ = fs::remove_file(&backup_old);
+        swap_running_executable(&current_exe, &backup_path)?;
     }
 
     Ok(format!(
@@ -410,6 +399,32 @@ pub fn rollback(target_version: Option<&str>) -> Result<String, VersionCheckErro
         backup.version,
         current_version()
     ))
+}
+
+/// Windows-only: atomically replace the running executable with a backup.
+///
+/// On Windows the running `.exe` is file-locked and cannot be overwritten in
+/// place, so this renames the current binary aside (`<name>.exe.old`), copies the
+/// backup into the original path, and — if the copy fails — renames the old
+/// binary back so the install is never left broken. The `.exe.old` is removed on
+/// success. Extracted from `rollback` so the swap/restore semantics are
+/// unit-testable (see the `#[cfg(windows)]` test below).
+#[cfg(windows)]
+fn swap_running_executable(
+    current_exe: &std::path::Path,
+    backup_path: &std::path::Path,
+) -> Result<(), VersionCheckError> {
+    let backup_old = current_exe.with_extension("exe.old");
+    fs::rename(current_exe, &backup_old).map_err(|e| {
+        VersionCheckError::BackupError(format!("Failed to move current executable: {e}"))
+    })?;
+    fs::copy(backup_path, current_exe).map_err(|e| {
+        // Restore the old binary on failure so we never leave a missing exe.
+        let _ = fs::rename(&backup_old, current_exe);
+        VersionCheckError::BackupError(format!("Failed to restore backup: {e}"))
+    })?;
+    let _ = fs::remove_file(&backup_old);
+    Ok(())
 }
 
 /// Format backup list for display.
@@ -870,6 +885,35 @@ fn disable_env_flag_enabled(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// win-test-rollback-bom: the Windows rename-then-copy executable swap must
+    /// replace the binary on success and restore the original on failure (the
+    /// running exe is locked on Windows, so it can never be left missing).
+    #[cfg(windows)]
+    #[test]
+    fn swap_running_executable_replaces_and_restores() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let current = dir.path().join("dcg.exe");
+        let backup = dir.path().join("backup.exe");
+        std::fs::write(&current, b"OLD").unwrap();
+        std::fs::write(&backup, b"NEW").unwrap();
+
+        // Success: current becomes the backup's contents; `.exe.old` cleaned up.
+        swap_running_executable(&current, &backup).expect("swap should succeed");
+        assert_eq!(std::fs::read(&current).unwrap(), b"NEW");
+        assert!(!current.with_extension("exe.old").exists());
+
+        // Failure (missing backup source): current must be restored, not lost.
+        std::fs::write(&current, b"OLD2").unwrap();
+        let missing = dir.path().join("does-not-exist.exe");
+        let err = swap_running_executable(&current, &missing);
+        assert!(err.is_err(), "missing backup source must error");
+        assert_eq!(
+            std::fs::read(&current).unwrap(),
+            b"OLD2",
+            "current executable must be restored on copy failure"
+        );
+    }
 
     #[test]
     fn test_current_version() {
@@ -1498,6 +1542,39 @@ mod tests {
         // Should contain ANSI escape codes for colored message
         assert!(output.contains("\x1b["));
         assert!(output.contains("No backup versions available"));
+    }
+
+    #[test]
+    fn backup_list_and_update_notice_emit_no_escapes_when_color_disabled() {
+        // win-vt-ansi-enable (.1.6): with color disabled (NO_COLOR / non-TTY ->
+        // use_color=false), the hand-rolled ANSI emitters must produce ZERO
+        // escape sequences on every platform.
+        let entries = vec![BackupEntry {
+            version: "0.2.12".to_string(),
+            created_at: 1_737_200_000,
+            artifact_name: None,
+            original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
+        }];
+        let populated = format_backup_list(&entries, false);
+        assert!(
+            !populated.contains('\u{1b}'),
+            "backup list leaked an escape: {populated:?}"
+        );
+        assert!(populated.contains("v0.2.12"));
+
+        let empty = format_backup_list(&[], false);
+        assert!(
+            !empty.contains('\u{1b}'),
+            "empty backup list leaked an escape"
+        );
+
+        let notice = get_update_notice(false);
+        if let Some(notice) = notice {
+            assert!(
+                !notice.contains('\u{1b}'),
+                "update notice leaked an escape: {notice:?}"
+            );
+        }
     }
 
     // =========================================================================

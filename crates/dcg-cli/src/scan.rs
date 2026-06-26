@@ -838,6 +838,8 @@ pub fn scan_paths_with_progress(
         let is_package_json = is_package_json_path(file);
         let is_terraform = is_terraform_path(file);
         let is_compose = is_docker_compose_path(file);
+        let is_powershell = is_powershell_script_path(file);
+        let is_batch = is_batch_script_path(file);
 
         if !is_shell
             && !is_docker
@@ -849,6 +851,8 @@ pub fn scan_paths_with_progress(
             && !is_package_json
             && !is_terraform
             && !is_compose
+            && !is_powershell
+            && !is_batch
         {
             files_skipped += 1;
             record_skip(&mut skipped, file, SkipReason::NoExtractor);
@@ -942,6 +946,22 @@ pub fn scan_paths_with_progress(
 
         if is_compose {
             extracted.extend(extract_docker_compose_from_str(
+                &file_label,
+                &content,
+                &ctx.enabled_keywords,
+            ));
+        }
+
+        if is_powershell {
+            extracted.extend(extract_powershell_from_str(
+                &file_label,
+                &content,
+                &ctx.enabled_keywords,
+            ));
+        }
+
+        if is_batch {
+            extracted.extend(extract_batch_from_str(
                 &file_label,
                 &content,
                 &ctx.enabled_keywords,
@@ -2861,6 +2881,123 @@ pub fn extract_makefile_from_str(
 }
 
 // ============================================================================
+// PowerShell (.ps1/.psm1/.psd1) and Windows batch (.cmd/.bat) extractors
+// ============================================================================
+
+fn is_powershell_script_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext: &str| {
+            matches!(ext.to_ascii_lowercase().as_str(), "ps1" | "psm1" | "psd1")
+        })
+}
+
+fn is_batch_script_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext: &str| matches!(ext.to_ascii_lowercase().as_str(), "cmd" | "bat"))
+}
+
+/// Replace PowerShell `<# ... #>` block comments with spaces, preserving
+/// newlines so line numbers stay accurate for findings.
+fn strip_powershell_block_comments(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    let mut in_block = false;
+    while let Some(ch) = rest.chars().next() {
+        if !in_block && rest.starts_with("<#") {
+            in_block = true;
+            out.push_str("  ");
+            rest = &rest[2..];
+            continue;
+        }
+        if in_block && rest.starts_with("#>") {
+            in_block = false;
+            out.push_str("  ");
+            rest = &rest[2..];
+            continue;
+        }
+        if in_block {
+            // Preserve line structure; blank out everything else.
+            out.push(if ch == '\n' || ch == '\r' { ch } else { ' ' });
+        } else {
+            out.push(ch);
+        }
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// Extract executable command lines from a PowerShell script.
+///
+/// Skips `<#…#>` block comments (stripped first) and `#` line comments (handled
+/// by the shared per-line extractor — PowerShell's line-comment char matches the
+/// shell's). Each non-comment line is evaluated like a shell command line, so
+/// the same evaluator/keyword path applies. CRLF-safe via `str::lines()`.
+#[must_use]
+pub fn extract_powershell_from_str(
+    file: &str,
+    content: &str,
+    enabled_keywords: &[&'static str],
+) -> Vec<ExtractedCommand> {
+    const EXTRACTOR_ID: &str = "powershell.script";
+
+    let stripped = strip_powershell_block_comments(content);
+    let mut out = Vec::new();
+    for (idx, raw) in stripped.lines().enumerate() {
+        let line_no = idx + 1;
+        if let Some(mut cmd) = extract_shell_command_line(file, line_no, raw, enabled_keywords) {
+            cmd.extractor_id = EXTRACTOR_ID.to_string();
+            out.push(cmd);
+        }
+    }
+    out
+}
+
+/// Extract executable command lines from a Windows batch (`.cmd`/`.bat`) script.
+///
+/// Skips `rem`/`::` comments, `:label` lines, blank lines, and a leading `@`
+/// (e.g. `@echo off`, `@del …`). Each remaining line is evaluated like a shell
+/// command line (keyword-filtered + assignment-aware). CRLF-safe via
+/// `str::lines()`.
+#[must_use]
+pub fn extract_batch_from_str(
+    file: &str,
+    content: &str,
+    enabled_keywords: &[&'static str],
+) -> Vec<ExtractedCommand> {
+    const EXTRACTOR_ID: &str = "batch.script";
+
+    let mut out = Vec::new();
+    for (idx, raw) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let mut line = raw.trim();
+        // A leading `@` suppresses echo for that one command; the command follows.
+        if let Some(rest) = line.strip_prefix('@') {
+            line = rest.trim();
+        }
+        if line.is_empty() {
+            continue;
+        }
+        // Comments and labels: `rem ...`, `::...`, `:label`.
+        let lower = line.to_ascii_lowercase();
+        if lower == "rem" || lower.starts_with("rem ") || lower.starts_with("rem\t") {
+            continue;
+        }
+        if line.starts_with(':') {
+            // Covers both `::comment` and `:label`. A real command never starts
+            // with a colon (drive-qualified paths start with a letter).
+            continue;
+        }
+        if let Some(mut cmd) = extract_shell_command_line(file, line_no, line, enabled_keywords) {
+            cmd.extractor_id = EXTRACTOR_ID.to_string();
+            out.push(cmd);
+        }
+    }
+    out
+}
+
+// ============================================================================
 // package.json extractor
 // ============================================================================
 
@@ -4099,6 +4236,108 @@ resource "null_resource" "test" {
         let extracted = extract_terraform_from_str("main.tf", content, &[]);
         assert_eq!(extracted.len(), 1);
         assert_eq!(extracted[0].command, "rm -rf ./tmp");
+    }
+
+    #[test]
+    fn powershell_extractor_extracts_commands_and_skips_comments() {
+        let content = "# a line comment with rm -rf / that must be ignored\n\
+<#\n  block comment: del /s /q C:\\src should be ignored\n#>\n\
+Remove-Item -Recurse -Force C:\\src\n\
+Write-Host 'done'\n";
+        let kw: &[&'static str] = &["Remove-Item", "del", "rm"];
+        let extracted = extract_powershell_from_str("deploy.ps1", content, kw);
+        assert_eq!(extracted.len(), 1, "got: {extracted:?}");
+        assert!(extracted[0].command.contains("Remove-Item -Recurse -Force"));
+        assert_eq!(extracted[0].extractor_id, "powershell.script");
+    }
+
+    #[test]
+    fn batch_extractor_extracts_commands_and_skips_comments_labels() {
+        let content = "@echo off\n\
+rem this rd /s /q comment must be ignored\n\
+:: another comment del /s /q\n\
+:label\n\
+rd /s /q C:\\build\n\
+@del /q C:\\tmp\\x\n";
+        let kw: &[&'static str] = &["rd", "del"];
+        let extracted = extract_batch_from_str("clean.cmd", content, kw);
+        assert!(
+            extracted.iter().any(|c| c.command.contains("rd /s /q")),
+            "got: {extracted:?}"
+        );
+        assert!(extracted.iter().any(|c| c.command.contains("del /q")));
+        assert!(extracted.iter().all(|c| c.extractor_id == "batch.script"));
+        // rem/::/label lines (which also contain destructive-looking text) are skipped.
+        assert!(!extracted.iter().any(|c| c.command.contains("comment")));
+    }
+
+    #[test]
+    fn powershell_and_batch_paths_are_detected() {
+        use std::path::Path;
+        assert!(is_powershell_script_path(Path::new("a/b/Deploy.PS1")));
+        assert!(is_powershell_script_path(Path::new("mod.psm1")));
+        assert!(is_batch_script_path(Path::new("clean.CMD")));
+        assert!(is_batch_script_path(Path::new("run.bat")));
+        assert!(!is_powershell_script_path(Path::new("x.sh")));
+        assert!(!is_batch_script_path(Path::new("x.ps1")));
+    }
+
+    #[test]
+    fn extractors_handle_crlf_line_endings_identically_to_lf() {
+        // Windows files use CRLF (`\r\n`). Every extractor splits via
+        // `str::lines()`, which strips the trailing `\r`, so CRLF input must
+        // yield byte-identical commands to the LF version and must never leak a
+        // stray `\r` into a matched command. This regression test locks in that
+        // CRLF-safety — a future switch to manual `'\n'` splitting would fail here
+        // (see win-scan-crlf / the Windows-native packs work).
+        fn assert_crlf_parity(lf: &str, extract: impl Fn(&str) -> Vec<String>) {
+            let crlf = lf.replace('\n', "\r\n");
+            let from_lf = extract(lf);
+            let from_crlf = extract(crlf.as_str());
+            assert!(
+                !from_lf.is_empty(),
+                "test fixture should extract at least one command"
+            );
+            assert_eq!(from_lf, from_crlf, "CRLF extraction diverged from LF");
+            for cmd in &from_crlf {
+                assert!(
+                    !cmd.contains('\r'),
+                    "extracted command leaked a CR: {cmd:?}"
+                );
+            }
+        }
+
+        let shell = "#!/bin/bash\nrm -rf ./build\ngit reset --hard\n";
+        assert_crlf_parity(shell, |c| {
+            extract_shell_script_from_str("clean.sh", c, &["rm", "git"])
+                .into_iter()
+                .map(|e| e.command)
+                .collect()
+        });
+
+        let dockerfile = "FROM ubuntu:22.04\nRUN rm -rf ./tmp # cleanup\n";
+        assert_crlf_parity(dockerfile, |c| {
+            extract_dockerfile_from_str("Dockerfile", c, &["rm"])
+                .into_iter()
+                .map(|e| e.command)
+                .collect()
+        });
+
+        let makefile = "build:\n\trm -rf ./out\n\tgit reset --hard\n";
+        assert_crlf_parity(makefile, |c| {
+            extract_makefile_from_str("Makefile", c, &["rm", "git"])
+                .into_iter()
+                .map(|e| e.command)
+                .collect()
+        });
+
+        let workflow = "jobs:\n  build:\n    steps:\n      - run: rm -rf ./dist\n";
+        assert_crlf_parity(workflow, |c| {
+            extract_github_actions_workflow_from_str(".github/workflows/ci.yml", c, &["rm"])
+                .into_iter()
+                .map(|e| e.command)
+                .collect()
+        });
     }
 
     #[test]

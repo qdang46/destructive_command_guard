@@ -27,7 +27,7 @@ fn run_dcg_scan(args: &[&str]) -> std::process::Output {
             let mut path = std::env::current_exe().expect("current_exe");
             path.pop(); // test binary name
             path.pop(); // deps/
-            path.push("dcg");
+            path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
             path
         });
 

@@ -65,13 +65,36 @@ const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
 ///
 /// Disables colors if stderr is not a terminal (e.g., piped to a file).
 fn configure_colors() {
-    if std::env::var_os("NO_COLOR").is_some() || dcg_cli::output::env_flag_enabled("DCG_NO_COLOR") {
+    let color_disabled = std::env::var_os("NO_COLOR").is_some()
+        || dcg_cli::output::env_flag_enabled("DCG_NO_COLOR")
+        || !io::stderr().is_terminal();
+
+    if color_disabled {
         colored::control::set_override(false);
         return;
     }
 
-    if !io::stderr().is_terminal() {
-        colored::control::set_override(false);
+    // Color is enabled on a real terminal — enable Windows VT processing.
+    enable_windows_ansi();
+}
+
+/// Enable Windows virtual-terminal processing so the hand-rolled ANSI escapes
+/// used across the codebase (output/denial.rs, update.rs, trace.rs, …) render as
+/// colors instead of a literal `<-[33m` on legacy conhost. `colored`'s helper
+/// targets the STDOUT handle (covers `dcg explain`, `dcg packs`, `dcg update
+/// --list-backups`, …). Idempotent; a no-op off-Windows.
+///
+/// The blocked-command panel is written to STDERR. Modern Windows consoles
+/// (Windows Terminal, PowerShell 7, Win10 1607+) enable VT for stderr
+/// automatically; enabling it on the stderr handle on *legacy* conhost would
+/// require an unsafe `SetConsoleMode`, which this crate forbids
+/// (`#![forbid(unsafe_code)]`). That legacy-conhost stderr path is validated on
+/// a real Windows box in win-validate-color (.7.4).
+#[inline]
+fn enable_windows_ansi() {
+    #[cfg(windows)]
+    {
+        let _ = colored::control::set_virtual_terminal(true);
     }
 }
 

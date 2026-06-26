@@ -33,7 +33,7 @@ memchr = "2.7"
 aho-corasick = "1.1"
 
 # Small utilities
-smallvec = "1.15.1"
+smallvec = "1.15.2"
 
 # Hashing for allow-once codes
 sha2 = "0.11"

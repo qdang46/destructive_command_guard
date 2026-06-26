@@ -7,9 +7,8 @@ This document describes packs in the `platform` category.
 - [GitHub Platform](#platformgithub)
 - [GitLab Platform](#platformgitlab)
 - [Railway Platform](#platformrailway)
-- [Kamal](#platformkamal)
-
 - [Modal Platform](#platformmodal)
+- [Kamal](#platformkamal)
 
 ---
 
@@ -330,6 +329,7 @@ risk_acknowledged = true
 ```
 
 ---
+
 ## Kamal
 
 **Pack ID:** `platform.kamal`
@@ -348,26 +348,26 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `kamal-audit` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?:\s|$)` |
-| `kamal-details` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+details(?:\s|$)` |
-| `kamal-config` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?:\s|$)` |
-| `kamal-secrets` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets(?:\s|$)` |
-| `kamal-deploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+deploy(?:\s|$)` |
-| `kamal-redeploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+redeploy(?:\s|$)` |
-| `kamal-setup` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+setup(?:\s|$)` |
-| `kamal-build` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?:\s|$)` |
-| `kamal-rollback` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+rollback(?:\s|$)` |
-| `kamal-upgrade` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+upgrade(?:\s|$)` |
-| `kamal-registry` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+registry\s+(?:login|logout)(?:\s|$)` |
-| `kamal-lock` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+lock(?:\s|$)` |
-| `kamal-server-bootstrap` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+server\s+bootstrap(?:\s|$)` |
-| `kamal-init` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?:\s|$)` |
-| `kamal-docs` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+docs(?:\s|$)` |
-| `kamal-help` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+help(?:\s|$)` |
-| `kamal-version` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?:\s|$)` |
-| `kamal-app-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|containers|images|logs|version|stale_containers|maintenance|live)(?:\s|$)` |
-| `kamal-accessory-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|logs|upgrade)(?:\s|$)` |
-| `kamal-proxy-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|boot_config|start|restart|details|logs)(?:\s|$)` |
+| `kamal-audit` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?:\s\|$)` |
+| `kamal-details` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+details(?:\s\|$)` |
+| `kamal-config` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?:\s\|$)` |
+| `kamal-secrets` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets(?:\s\|$)` |
+| `kamal-deploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+deploy(?:\s\|$)` |
+| `kamal-redeploy` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+redeploy(?:\s\|$)` |
+| `kamal-setup` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+setup(?:\s\|$)` |
+| `kamal-build` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?:\s\|$)` |
+| `kamal-rollback` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+rollback(?:\s\|$)` |
+| `kamal-upgrade` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+upgrade(?:\s\|$)` |
+| `kamal-registry` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+registry\s+(?:login\|logout)(?:\s\|$)` |
+| `kamal-lock` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+lock(?:\s\|$)` |
+| `kamal-server-bootstrap` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+server\s+bootstrap(?:\s\|$)` |
+| `kamal-init` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?:\s\|$)` |
+| `kamal-docs` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+docs(?:\s\|$)` |
+| `kamal-help` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+help(?:\s\|$)` |
+| `kamal-version` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?:\s\|$)` |
+| `kamal-app-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|start\|restart\|details\|containers\|images\|logs\|version\|stale_containers\|maintenance\|live)(?:\s\|$)` |
+| `kamal-accessory-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|start\|restart\|details\|logs\|upgrade)(?:\s\|$)` |
+| `kamal-proxy-safe` | `kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot\|boot_config\|start\|restart\|details\|logs)(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

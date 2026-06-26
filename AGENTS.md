@@ -159,6 +159,36 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ---
 
+## Windows Support (native, `x86_64-pc-windows-msvc`)
+
+dcg ships a **native Windows** binary (built/tested on `windows-latest` with the
+nightly toolchain) and a `check (windows)` CI job. When touching anything
+platform-sensitive, follow these conventions:
+
+- **Separate command-pattern DATA from dcg's own paths.** Destructive-command
+  patterns (`rm -rf /`, `normalize.rs` stripping `/usr/bin/git`, `/etc`, `/tmp`)
+  are DATA about Unix commands and must STAY — Windows users still run git-bash.
+  Only dcg's *own* config/state paths get Windows-ified (resolve via the `dirs`
+  crate; the system layer is `%ProgramData%\dcg`, helper `config::system_config_dir()`).
+- **`.exe` suffix.** When constructing a path to the dcg binary, use
+  `env!("CARGO_BIN_EXE_dcg")` / `assert_cmd::cargo::cargo_bin("dcg")` in tests, or
+  `std::env::consts::EXE_SUFFIX` in `src`. **Never** a bare `push("dcg")` — the
+  Windows CI job greps for it and fails. Use `dirs::home_dir()` (not `HOME`,
+  which is unset on Windows) and set `USERPROFILE`/`TEMP`/`TMP` alongside `HOME`
+  in test isolation.
+- **Verify Windows branches from Linux** without a Windows box: `mingw` + the
+  `x86_64-pc-windows-gnu` target are installed, so
+  `cargo check --target x86_64-pc-windows-gnu --lib` (or `--bin dcg` / `--tests`)
+  compile-checks every `#[cfg(windows)]` path. `pwsh` is also available to run the
+  PowerShell installer/test scripts.
+- **Windows packs.** `src/packs/windows/` holds the native-Windows packs
+  (`windows.filesystem`/`windows.system` default-ON on Windows, `windows.misc`/
+  `windows.powershell` opt-in). Patterns use inline `(?i)`; keyword arrays
+  enumerate realistic casings because the keyword quick-reject is case-sensitive
+  (see `src/packs/windows/mod.rs`). See [`docs/windows.md`](docs/windows.md).
+
+---
+
 ## Testing
 
 ### Testing Policy

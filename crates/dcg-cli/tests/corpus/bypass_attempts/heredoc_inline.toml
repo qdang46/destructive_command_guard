@@ -21,6 +21,19 @@ description = "python3 -c with os.remove (potentially destructive)"
 command = "python3 -c \"import os; os.remove('/etc/passwd')\""
 expected = "deny"
 
+# Value-taking flags whose value is NOT a clean bareword (it contains '::') must
+# not let the inline -c slip past Tier-1/Tier-2 — these would ALLOW under a
+# bareword-only flag-value token (the under-block fixed alongside these cases).
+[[case]]
+description = "python -W <filter> -c with shutil.rmtree (non-bareword value)"
+command = "python -W ignore::DeprecationWarning -c \"import shutil; shutil.rmtree('/home/user')\""
+expected = "deny"
+
+[[case]]
+description = "python3 -W <filter> -c with os.remove (non-bareword value)"
+command = "python3 -W error::DeprecationWarning -c \"import os; os.remove('/etc/passwd')\""
+expected = "deny"
+
 # NOTE: python subprocess calls depend on heredoc scanner detecting nested commands
 # [[case]]
 # description = "python -c with subprocess git reset"

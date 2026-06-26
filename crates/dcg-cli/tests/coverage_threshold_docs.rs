@@ -14,8 +14,8 @@ fn parse_ci_thresholds(workflow: &str) -> BTreeMap<&'static str, f64> {
     for line in workflow.lines().map(str::trim) {
         for (env_name, label) in [
             ("OVERALL_MIN", "Overall"),
-            ("EVALUATOR_MIN", "crates/dcg-cli/src/evaluator.rs"),
-            ("HOOK_MIN", "crates/dcg-cli/src/hook.rs"),
+            ("EVALUATOR_MIN", "src/evaluator.rs"),
+            ("HOOK_MIN", "src/hook.rs"),
         ] {
             let prefix = format!("{env_name}=\"");
             let Some(rest) = line.strip_prefix(&prefix) else {
@@ -39,8 +39,11 @@ fn parse_agents_thresholds(agents: &str) -> BTreeMap<&'static str, f64> {
     let mut thresholds = BTreeMap::new();
     for (label, marker) in [
         ("Overall", "- **Overall:** >= "),
-        ("src/evaluator.rs", "- **src/evaluator.rs:** >= "),
-        ("src/hook.rs", "- **src/hook.rs:** >= "),
+        (
+            "src/evaluator.rs",
+            "- **crates/dcg-cli/src/evaluator.rs:** >= ",
+        ),
+        ("src/hook.rs", "- **crates/dcg-cli/src/hook.rs:** >= "),
     ] {
         let line = agents
             .lines()

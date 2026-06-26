@@ -465,7 +465,22 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
-    // Cursor IDE detection (set by dcg's Cursor hook script before invoking dcg)
+    // Cursor IDE detection (set by dcg's Cursor hook script before invoking dcg).
+    //
+    // NOTE (git_safety_guard-...5w9v.1.7): Cursor is integrated via a generated
+    // hook script that translates Cursor's `beforeShellExecution` `{command, cwd}`
+    // payload into dcg's hook shape and maps the result back to Cursor's
+    // `{permission, continue, userMessage, ...}` response — a Python bridge on
+    // Unix and a *pure-PowerShell* bridge on Windows (install.ps1
+    // `Configure-CursorHook`, no interpreter dependency). A fully NATIVE Cursor
+    // wire format in `hook.rs` was evaluated and deliberately deferred: unlike
+    // every other protocol (silent-on-allow), Cursor expects a response on the
+    // ALLOW path too, which would require emitting an allow payload across all of
+    // main.rs's allow exit points (no-match / whitelist / allow-once / bypass) —
+    // cross-cutting and fail-closed-risky for an optional feature whose bridge
+    // already works and is verified end-to-end. Revisit if the bridge proves
+    // insufficient. The `CURSOR_IDE` env var below is the bridge's agent-identity
+    // signal (it does not change protocol dispatch).
     if std::env::var("CURSOR_IDE").is_ok() {
         return Some(DetectionResult::new(
             Agent::CursorIde,
@@ -662,6 +677,12 @@ fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
+// Only the Linux parent-process detector parses `/proc/<pid>/cmdline` (NUL-
+// separated argv); on other platforms this helper is unused outside of tests,
+// so gate it to avoid a dead-code warning on Windows/macOS non-test builds
+// (which would fail Windows CI's `-D warnings`). `test` keeps its unit tests
+// available on every platform.
+#[cfg(any(target_os = "linux", test))]
 fn nul_separated_args_to_string(bytes: &[u8]) -> Option<String> {
     let mut args = Vec::new();
 
