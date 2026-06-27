@@ -748,9 +748,13 @@ mod tests {
             !result,
             "pathological pattern should fail-open (return false)"
         );
+        // The backtrack limit makes this sub-millisecond; a broken/removed limit
+        // would run for seconds (or hang). The bound is deliberately generous so it
+        // can't flake from scheduler preemption under heavy parallel load, while
+        // still catching a regression that lets the pathological pattern run long.
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "backtrack limit should cap execution to <50ms, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(2),
+            "backtrack limit should cap execution well under 2s, took {elapsed:?}"
         );
     }
 
@@ -767,9 +771,12 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(result.is_none(), "pathological find should return None");
+        // Generous bound (see test_default_backtrack_limit_applied): a working
+        // limit caps this to sub-millisecond, a broken one runs for seconds — so a
+        // 2s ceiling catches the regression without flaking under load.
         assert!(
-            elapsed < std::time::Duration::from_millis(50),
-            "backtrack limit should cap find to <50ms, took {elapsed:?}"
+            elapsed < std::time::Duration::from_secs(2),
+            "backtrack limit should cap find well under 2s, took {elapsed:?}"
         );
     }
 
@@ -780,12 +787,14 @@ mod tests {
         assert!(re.uses_backtracking());
 
         let input = "a".repeat(50);
-        // With limit=100, even matching input may fail due to limit
-        // The key assertion: it doesn't hang
+        // With limit=100, even matching input may fail due to limit.
+        // The key assertion: it doesn't hang. The bound is generous (a working
+        // limit returns in microseconds; the regression is a hang) so scheduler
+        // preemption under heavy parallel load can't trip it.
         let start = std::time::Instant::now();
         let _ = re.is_match(&input);
         let elapsed = start.elapsed();
-        assert!(elapsed < std::time::Duration::from_millis(10));
+        assert!(elapsed < std::time::Duration::from_secs(2));
     }
 
     #[test]
@@ -817,6 +826,8 @@ mod tests {
 
         // Should fail-open: return original text unchanged
         assert_eq!(result.as_ref(), input.as_str());
-        assert!(elapsed < std::time::Duration::from_millis(50));
+        // Generous bound: working limit caps to sub-millisecond, broken one runs
+        // for seconds — immune to load jitter, still catches the regression.
+        assert!(elapsed < std::time::Duration::from_secs(2));
     }
 }

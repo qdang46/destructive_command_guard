@@ -13,7 +13,7 @@
 
 A high-performance hook for AI coding agents that blocks destructive commands before they execute, protecting your work from accidental deletion across Claude Code, Codex CLI, Gemini CLI, Copilot, Cursor, Hermes Agent, Grok (xAI), and related tools.
 
-**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
+**Supported:** [Claude Code](https://claude.ai/code), [Codex CLI 0.125.0+](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [GitHub Copilot CLI](https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks), [Cursor IDE](https://cursor.com), [Hermes Agent](https://github.com/NousResearch/hermes-agent), [Grok (xAI)](https://x.ai/news/grok-build-cli) (native `~/.grok/hooks/` plus Claude compatibility layer), [Antigravity CLI (`agy`)](https://antigravity.google) (native `~/.gemini/config/hooks.json` via `dcg install --agy`), [OpenCode](https://opencode.ai) (via [community plugin](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js)), [Pi](https://github.com/earendil-works/pi) (via [extension recipe](docs/pi-integration.md)), [Aider](https://aider.chat/) (limited—git hooks only), [Continue](https://continue.dev) (detection only)
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -22,7 +22,15 @@ A high-performance hook for AI coding agents that blocks destructive commands be
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
-<p><em>Works on Linux, macOS, and Windows (WSL). Auto-detects your platform, downloads the right binary, and configures supported agent hooks including Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, and Grok (xAI) (via <code>dcg install --grok</code> for a native <code>~/.grok/hooks/dcg.json</code>, or via the Claude compatibility layer automatically picked up by Grok).</em></p>
+<p><em>Works on Linux, macOS, and Windows via WSL. Auto-detects your platform, downloads the right binary, and configures supported agent hooks including Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, and Grok (xAI) (via <code>dcg install --grok</code> for a native <code>~/.grok/hooks/dcg.json</code>, or via the Claude compatibility layer automatically picked up by Grok). For native Windows, use the PowerShell installer below.</em></p>
+
+<h4>Windows (native, PowerShell)</h4>
+
+```powershell
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
+```
+
+<p><em>Installs native <code>dcg.exe</code>, verifies the SHA256 checksum (and the Sigstore/cosign signature when <code>cosign</code> is present), adds it to your User <code>PATH</code> (<code>-EasyMode</code>), runs a self-test (<code>-Verify</code>), and configures detected agent hooks for Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent. Copilot hooks are repo-local, so run the installer from each protected repo or use <code>-EasyMode</code>/<code>-Force</code> intentionally. On Windows the <code>windows.filesystem</code> and <code>windows.system</code> packs are on by default, so <code>del /s</code>, <code>rd /s</code>, <code>Remove-Item -Recurse -Force</code>, <code>format</code>, and <code>vssadmin delete shadows</code> are blocked out of the box. Pin a version with <code>-Version vX.Y.Z</code>.</em></p>
 </div>
 
 ---
@@ -164,13 +172,32 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - Full pack ID index: `docs/packs/README.md`
 - Canonical descriptions + pattern counts: `dcg packs --verbose`
 
-### Core Packs (enabled by default)
-- `core.filesystem` - Protects against dangerous rm -rf commands outside temp directories
-- `core.git` - Protects against destructive git commands that can lose uncommitted work, rewrite history, or destroy stashes
+### Enabled by default (no config file)
 
-**Common packs enabled by default:**
-- `database.postgresql` - Protects against destructive PostgreSQL operations
-- `containers.docker` - Protects against destructive Docker operations like system prune
+With **no config file present**, dcg enables only the packs that guard against the
+most catastrophic, unrecoverable mistakes:
+
+- `core.filesystem` - Dangerous `rm -rf` outside temp directories *(always on; cannot be disabled)*
+- `core.git` - Destructive git commands that lose uncommitted work, rewrite history, or destroy stashes *(always on; cannot be disabled)*
+- `system.disk` - `mkfs`, `dd`-to-device, `fdisk`, `parted`, `mdadm`, `lvm` removal, `wipefs` *(on by default; opt out with `disabled = ["system.disk"]`)*
+
+On **Windows**, two additional packs are on by default so a fresh install blocks the
+catastrophic native-Windows operations with no config:
+
+- `windows.filesystem` - cmd `del /s`, `rd /s`, `format <drive>:` and PowerShell `Remove-Item -Recurse -Force` (and aliases), `Clear-Content`, `Clear-RecycleBin` *(default-on **on Windows only**; opt out with `disabled = ["windows.filesystem"]` or `["windows"]`)*
+- `windows.system` - `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `cipher /w`, `bcdedit /delete` *(default-on **on Windows only**; opt out with `disabled = ["windows.system"]` or `["windows"]`)*
+
+The broader `windows.misc` (`reg delete`, `net user /delete`, `wsl --unregister`, `robocopy /MIR`) and
+`windows.powershell` (registry/provider deletes, `Remove-LocalUser`, `Disable-ComputerRestore`, `Remove-VM`)
+packs are opt-in on every platform. On Unix the `windows.*` packs are registered but off by default; enable
+them (e.g. to scan committed `.ps1`/`.cmd` scripts in CI) via `[packs] enabled = ["windows"]`.
+
+Every other pack — including `database.postgresql` and `containers.docker` — is
+**opt-in** and is *not* active until a config file enables it. Running `dcg init`
+writes a starter `~/.config/dcg/config.toml` whose `[packs] enabled` list turns on
+`database.postgresql` and `containers.docker` as common examples, but that is a
+generated starter config, not the no-config default. Enable any pack below by adding
+it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection).
 
 ### Storage Packs
 - `storage.s3` - Protects against destructive S3 operations like bucket removal, recursive deletes, and sync --delete.
@@ -246,6 +273,7 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 ### Platform Packs
 - `platform.github` - Protects against destructive GitHub CLI operations like deleting repositories, gists, releases, or SSH keys.
 - `platform.gitlab` - Protects against destructive GitLab platform operations like deleting projects, releases, protected branches, and webhooks.
+- `platform.kamal` - Protects against destructive Kamal 2.x operations that tear down the stack (`kamal remove`), delete accessory data directories (`kamal accessory remove`), drop proxy routing, take the app offline, or prune the images that `kamal rollback` relies on.
 - `platform.modal` - Protects against destructive Modal serverless platform operations like recursive volume removal, app stops with `--force`, and secret deletion.
 - `platform.kamal` - Protects against destructive Kamal deployer operations like `kamal remove`, `kamal rollback`, and `kamal access`.
 - `platform.railway` - Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, functions, volumes, variables, or deployments.
@@ -302,6 +330,15 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 - `backup.rclone` - Protects against destructive rclone operations like sync, delete, purge, dedupe, and move.
 - `backup.restic` - Protects against destructive restic operations like forgetting snapshots, pruning data, removing keys, and cache cleanup.
 - `backup.velero` - Protects against destructive velero operations like deleting backups, schedules, and locations.
+
+### Windows Packs
+Native-Windows (cmd.exe + PowerShell) destructive-command protection. `windows.filesystem` and
+`windows.system` are **default-on on Windows** (off/opt-in on Unix); `windows.misc` and
+`windows.powershell` are opt-in everywhere. All patterns are case-insensitive.
+- `windows.filesystem` - Recursive/forced filesystem destruction: cmd `del /s`, `rd /s`/`rmdir /s`, `format <drive>:`; PowerShell `Remove-Item -Recurse -Force` (and aliases `rm`/`del`/`rd`/`ri`), `Clear-Content`, `Clear-RecycleBin`. Whitelists PowerShell `-WhatIf` previews only on cmdlets/aliases that honor it, plus temp-dir deletes.
+- `windows.system` - Catastrophic disk/system operations: `vssadmin delete shadows` and `wmic shadowcopy delete` (Volume Shadow Copy destruction — a ransomware hallmark), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`/`Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`.
+- `windows.misc` - Registry/account/service/WSL/copy destruction: `reg delete`, `net user|localgroup /delete`, `sc delete`, `schtasks /delete`, `wsl --unregister` (destroys a WSL distro), `robocopy /MIR` (mirror-delete).
+- `windows.powershell` - Destructive PowerShell cmdlets: registry/provider deletes (`Remove-Item HKLM:\`, `Remove-ItemProperty`, `Remove-PSDrive`), `Remove-LocalUser`/`Remove-LocalGroup`, `Unregister-ScheduledTask`, `Disable-ComputerRestore`, forced `Stop-Computer`/`Restart-Computer`, `Remove-VM`/`Remove-AppxPackage`.
 
 ### Other Packs
 - `package_managers` - Protects against dangerous package manager operations like publishing packages and removing critical system packages.
@@ -527,7 +564,8 @@ Environment variables override config files (highest priority):
 - `DCG_LEGACY_OUTPUT=1`: force plain output paths (same as `--legacy-output`)
 - `DCG_ROBOT=1`: enable robot mode for JSON stdout and quiet stderr
 - `DCG_HIGH_CONTRAST=1`: enable high-contrast output (ASCII borders + monochrome palette)
-- `DCG_FORMAT=text|json|sarif`: default output format (command-specific; SARIF applies to `dcg scan`)
+- `DCG_FORMAT=text|json|sarif`: default output format (command-specific — see [Output Formats](#output-formats-and-dcg_format) for which values each subcommand actually accepts; real SARIF is `dcg scan`-only)
+- `DCG_FAIL_CLOSED=1`: block (deny) on hook input that cannot be parsed, instead of the default fail-open allow (opt-in; see [Fail-Open Philosophy](#fail-open-philosophy))
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
 - `DCG_CONFIG=/path/to/config.toml`: use explicit config file
 - `DCG_HEREDOC_ENABLED=true|false`: enable/disable heredoc scanning
@@ -536,6 +574,32 @@ Environment variables override config files (highest priority):
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
 - `DCG_POLICY_DEFAULT_MODE=deny|warn|log`: global default decision mode
 - `DCG_HOOK_TIMEOUT_MS=200`: hook evaluation timeout budget (milliseconds)
+
+### Output Formats and `DCG_FORMAT`
+
+`--format` (and the `DCG_FORMAT` env var, which seeds the default) is
+**command-specific**: each subcommand accepts only its own set of values, and an
+unrecognized value is a usage error (exit 2). `DCG_FORMAT` applies wherever a
+command has a `--format` flag and is silently ignored by commands that don't.
+
+| Command | Accepted `--format` values | Notes |
+|---------|----------------------------|-------|
+| `dcg scan` | `pretty`, `json`, `markdown`, `sarif` | **Only** command that emits real SARIF 2.1.0 |
+| `dcg test` | `pretty` (alias `text`), `json` (aliases `sarif`, `structured`), `toon` | |
+| `dcg config` | `pretty` (alias `text`), `json` (alias `sarif`) | |
+| `dcg packs` | `pretty` (alias `text`), `json` (alias `sarif`) | |
+| `dcg explain` | `pretty`, `json` (alias `sarif`) | |
+| `dcg doctor` | `pretty`, `json` (alias `sarif`) | |
+| `dcg simulate` | `pretty`, `json` (alias `sarif`) | |
+| `dcg corpus` | `json`, `pretty` (alias `sarif`) | |
+| `dcg suggest-allowlist` | `text`, `json` (alias `sarif`) | |
+
+**`sarif` is a JSON alias on every command except `dcg scan`.** This is
+deliberate so that setting `DCG_FORMAT=sarif` globally degrades gracefully —
+`dcg scan` produces a real SARIF report while other commands fall back to their
+structured JSON rather than erroring. If you need machine-readable output from a
+non-scan command, prefer `--format json` (which is unambiguous); use `dcg scan
+--format sarif` for SARIF. `--robot` forces JSON regardless of `--format`.
 
 ### Configuration Hierarchy
 
@@ -624,13 +688,41 @@ dcg is designed with a **fail-open** philosophy: when the tool cannot safely ana
 
 **Configurable Strictness**:
 
-For high-security environments, fail-open can be disabled:
+For high-security environments, fail-open can be disabled.
+
+For **heredoc/inline-script** analysis specifically:
 
 ```toml
 [heredoc]
-fallback_on_parse_error = false  # Block on parse errors
-fallback_on_timeout = false      # Block on timeouts
+fallback_on_parse_error = false  # Block on heredoc parse errors
+fallback_on_timeout = false      # Block on heredoc timeouts
 ```
+
+For the **top-level hook input** (the JSON dcg reads from stdin), enable
+fail-closed mode so that input which cannot be parsed at all is **blocked**
+instead of allowed:
+
+```toml
+[general]
+fail_closed = true   # Deny when the hook input itself is unparseable
+```
+
+or at runtime:
+
+```bash
+DCG_FAIL_CLOSED=1   # env var overrides the config value
+```
+
+The default is **fail-open** (unparseable input is allowed) and is unchanged
+unless you opt in. With fail-closed enabled, a genuinely unparseable hook
+payload produces a deny (a `permissionDecision: deny` for Claude-style hooks; a
+`"decision":"deny"` line plus a non-zero exit for `dcg hook --batch`).
+Transient IO read errors still fail open even in this mode, since they are not
+attacker-controlled malformed payloads.
+
+> A leading UTF-8 BOM (`EF BB BF`) is stripped before parsing in all hook
+> paths, so a BOM-prefixed but otherwise-valid command is correctly evaluated
+> (and blocked if dangerous) rather than allowed through as "unparseable".
 
 With strict mode enabled, dcg will block commands when analysis fails, providing detailed error messages explaining why.
 
@@ -712,10 +804,12 @@ The installer also verifies Sigstore cosign bundles when available (falls back t
 - **Continue:** No shell command interception hooks. The installer detects Continue but cannot auto-configure protection. Use a [git pre-commit hook](docs/scan-precommit-guide.md) instead.
 - **Codex CLI:** PreToolUse hooks via `~/.codex/hooks.json` (stable in Codex 0.125.0+; the `codex_hooks` feature is on by default). Codex's hook input shape mirrors Claude Code's, but its JSON deny parser is strict (`#[serde(deny_unknown_fields)]`), so dcg detects Codex from the `turn_id` stdin field and switches to Codex's documented stderr deny path with exit code 2; the block message goes to stderr where Codex shows it to the model, without self-service allowlist or allow-once commands. The Unix installer and `install.ps1` both merge dcg's hook into the existing hooks object, detect an already-current dcg hook exactly, leave invalid JSON or malformed hook shapes untouched, and surface the failure reason in the install summary. `uninstall.sh` and `uninstall.ps1` remove only dcg-owned Codex hooks and preserve coexisting entries. See the [Codex integration notes](docs/codex-integration.md). Caveats: the model can still write scripts to disk to bypass hook-based blocking; and Codex's `PreToolUse` hooks [do not yet intercept the `unified_exec` shell path](docs/codex-integration.md#known-limitation-codex-unified_exec-path-windows-desktop--cli) (used by Codex Desktop / `codex exec` on Windows for `command_execution` events), so destructive commands routed that way are not blocked until [Codex extends hook coverage upstream](https://github.com/openai/codex/issues/16246).
 - **GitHub Copilot CLI:** Hooks are repository-local (`.github/hooks/*.json`). Run the installer from each repository where you want protection. The generated hook covers both Unix `bash` and Windows `powershell` tool payloads.
-- **Cursor IDE:** Hooks are configured through `~/.cursor/hooks.json` plus a generated `~/.cursor/hooks/dcg-pre-shell.py` bridge. The installer inserts dcg first in `beforeShellExecution`, collapses duplicate dcg entries, and preserves coexisting Cursor hooks.
+- **Cursor IDE:** Hooks are configured through `~/.cursor/hooks.json` plus a generated bridge (`dcg-pre-shell.ps1` on Windows). The installer inserts dcg first in `beforeShellExecution`, collapses duplicate dcg entries, and preserves coexisting Cursor hooks.
 - **Hermes Agent:** [NousResearch's Hermes Agent](https://github.com/NousResearch/hermes-agent) declares shell hooks in `~/.hermes/config.yaml` under `hooks.pre_tool_call`. The installer merges a single `matcher: "terminal"` entry that invokes dcg directly — no wrapper script — because Hermes' input JSON (`hook_event_name: "pre_tool_call"`, `tool_name: "terminal"`, `tool_input.command`) deserializes straight into dcg's existing `HookInput`. Hermes [explicitly documents](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md) that "non-zero exit codes... never abort the agent loop", so dcg switches to Hermes' JSON block protocol on output: `{"decision":"block","reason":...}` (plus the alternate `{"action":"block","message":...}` form for cross-version compatibility). The installer also sets `hooks_auto_accept: true` if not already set; Hermes silently drops un-allowlisted hooks in non-TTY runs (gateway/cron) without it. `unconfigure_hermes` in `uninstall.sh` removes only the dcg-owned entry and leaves `hooks_auto_accept` alone (other Hermes hooks may rely on it).
 - **Grok (xAI):** [Grok Build / Grok CLI](https://x.ai/news/grok-build-cli) auto-discovers every `*.json` under `~/.grok/hooks/`. `dcg install --grok` writes a self-contained `~/.grok/hooks/dcg.json` with a `PreToolUse` / `matcher: "Bash"` entry — Grok internally aliases Claude-style `"Bash"` to its own `run_terminal_cmd` tool, so a single rule covers every shell command. dcg detects Grok at runtime from the camelCase wire shape (`hookEventName: "pre_tool_use"`, `toolName: "run_terminal_cmd"`) or from the `GROK_SESSION_ID` / `GROK_HOOK_EVENT` / `GROK_WORKSPACE_ROOT` environment variables, and switches its output to Grok's JSON contract: `{"decision":"deny","reason":...}` (note `"deny"`, not Hermes' `"block"`). Grok also picks up dcg automatically through its `~/.claude/settings.json` compatibility layer, so existing Claude Code users get protection with no additional install step. Add `--project` to write `<repo>/.grok/hooks/dcg.json` for a per-repo install (Grok requires `/hooks-trust` the first time it opens a repo with hooks).
+- **Antigravity CLI (`agy`):** [Google Antigravity's `agy` CLI](https://antigravity.google) ships a Claude-Code-compatible hooks system. `dcg install --agy` merges a `PreToolUse` / `matcher: "Bash"` entry into `~/.gemini/config/hooks.json` (the canonical path; `agy` migrates the legacy `~/.gemini/antigravity-cli/hooks.json` here and symlinks the old path to it). `agy` runs the hook before its `run_command` shell tool; dcg detects `agy` at runtime from the distinctive nested `toolCall` envelope (`{"toolCall":{"name":"run_command","args":{"CommandLine":"…"}},"conversationId":…,"stepIdx":…}`) — the shell command is read from `toolCall.args.CommandLine` — or from the `ANTIGRAVITY_CONVERSATION_ID` environment variable / `agy` parent-process name. dcg switches its output to `agy`'s JSON contract: `{"decision":"block","reason":…}` with exit code 0 (verified: `agy` honors both `"block"` and `"deny"` and aborts the tool; a non-zero exit code is only logged and does NOT reliably block, so dcg always emits exit 0 + JSON). Add `--project` to write `<repo>/.gemini/config/hooks.json` for a per-repo install. Restart `agy` (start a new session) after installing.
 - **OpenCode:** Not auto-configured. Requires a Bun-based plugin with `"tool.execute.before"` hook key. A working community plugin: [aspiers/ai-config/dcg-guard.js](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js).
+- **Pi:** Not auto-configured. [Pi](https://github.com/earendil-works/pi) intercepts shell commands through user-authored TypeScript extensions (`pi.on("tool_call", …)`, auto-loaded from `~/.pi/agent/extensions/*.ts` or `<repo>/.pi/extensions/*.ts`). A ready-to-use `dcg-guard.ts` extension that routes each `bash` command through `dcg --robot test` (exit 1 = deny) and blocks with the dcg reason is documented in [docs/pi-integration.md](docs/pi-integration.md).
 
 </details>
 
@@ -768,7 +862,8 @@ Prebuilt binaries are available for:
 - Linux ARM64 (`aarch64-unknown-linux-gnu`)
 - macOS Intel (`x86_64-apple-darwin`)
 - macOS Apple Silicon (`aarch64-apple-darwin`)
-- Windows (`x86_64-pc-windows-msvc`)
+- Windows x64 (`x86_64-pc-windows-msvc`)
+- Windows ARM64 (`aarch64-pc-windows-msvc`)
 
 Download from [GitHub Releases](https://github.com/Dicklesworthstone/destructive_command_guard/releases) and verify the SHA256 checksum.
 If you have cosign installed, each release also includes a Sigstore bundle (`.sigstore.json`) so you can verify provenance with `cosign verify-blob`.
@@ -793,7 +888,7 @@ The Unix uninstaller:
 - Removes configuration (`~/.config/dcg/`) and history (`~/.local/share/dcg/`)
 - Prompts for confirmation before making changes
 
-The PowerShell uninstaller removes the Windows `dcg.exe` binary, the exact User PATH entry added by `install.ps1`, dcg hooks from Claude Code and Codex CLI, and dcg configuration/history directories.
+The PowerShell uninstaller removes the Windows `dcg.exe` binary, the exact User PATH entry added by `install.ps1`, dcg hooks from Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Grok, and Antigravity (`agy`), plus dcg configuration/history directories.
 
 Options:
 - `--yes` - Skip confirmation prompt
@@ -2014,6 +2109,7 @@ high-signal formatting.
 | JSON-hook deny | Claude Code, Gemini CLI, Copilot CLI, compatible hooks | Denial JSON | Rich or plain warning |
 | Hermes block | Hermes Agent shell hook (`pre_tool_call`) | `{"decision":"block","reason":...,"action":"block","message":...}` | Rich or plain warning |
 | Grok deny | Grok (xAI) PreToolUse hook (`pre_tool_use` event, `run_terminal_cmd` tool) | `{"decision":"deny","reason":...}` (exit 0) | Rich or plain warning |
+| Antigravity block | Antigravity CLI (`agy`) PreToolUse hook (`toolCall.name: "run_command"`) | `{"decision":"block","reason":...}` (exit 0) | Rich or plain warning |
 | Codex deny | Codex CLI 0.125.0+ hook input | Empty | Deny reason with command, rule, and remediation |
 | Robot mode | `--robot` or `DCG_ROBOT=1` | JSON | Silent |
 | Plain fallback | `DCG_NO_RICH=1`, `NO_COLOR=1`, `DCG_NO_COLOR=1`, `TERM=dumb`, `CI=1`, non-TTY output, or `--legacy-output` | Mode-specific data | Plain text only |
@@ -2389,12 +2485,13 @@ Runs on every push and pull request:
 
 Triggered on version tags (`v*`):
 
-- Builds optimized binaries for 5 platforms:
+- Builds optimized binaries for 6 platforms:
   - Linux x86_64 (`x86_64-unknown-linux-gnu`)
   - Linux ARM64 (`aarch64-unknown-linux-gnu`)
   - macOS Intel (`x86_64-apple-darwin`)
   - macOS Apple Silicon (`aarch64-apple-darwin`)
-  - Windows (`x86_64-pc-windows-msvc`)
+  - Windows x64 (`x86_64-pc-windows-msvc`)
+  - Windows ARM64 (`aarch64-pc-windows-msvc`)
 - Creates `.tar.xz` archives (Unix) or `.zip` (Windows)
 - Generates SHA256 checksums for verification
 - Publishes to GitHub Releases with auto-generated release notes

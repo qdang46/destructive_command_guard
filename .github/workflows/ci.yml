@@ -18,7 +18,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Validate Dependabot config
         run: |
@@ -169,11 +169,252 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # Native-Windows regression coverage. Until this existed, every CI job ran on
+  # ubuntu-latest, so Windows-specific breakage (cfg gating, .exe-suffix path
+  # bugs, behavior drift) was completely uncovered. Uses the nightly toolchain
+  # with the MSVC target because rust-toolchain.toml pins nightly / edition 2024.
+  check-windows:
+    name: check (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable git long paths
+        run: git config --global core.longpaths true
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy (all targets)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run full test suite
+        run: cargo nextest run --profile ci --no-fail-fast
+
+      - name: Regression guard - test binary paths must include EXE_SUFFIX
+        shell: bash
+        run: |
+          # win-test-binary-exe-suffix: the `dcg_binary()` test helpers spawn the
+          # built binary and must resolve `dcg.exe` on Windows. The original bug
+          # was `path.push("dcg")` (after popping to target/) with no suffix.
+          # Fail the build if that pattern returns — use env!("CARGO_BIN_EXE_dcg")
+          # or append std::env::consts::EXE_SUFFIX. (Config-dir `.join("dcg")`
+          # for ~/.config/dcg is legitimate and intentionally NOT matched.)
+          if grep -rnE 'push\("dcg"\)' tests/; then
+            echo "::error::Found a bare push(\"dcg\") test-binary path without EXE_SUFFIX (breaks Windows test isolation)."
+            exit 1
+          fi
+          echo "OK: no bare push(\"dcg\") test-binary paths."
+
+      - name: Installer pwsh unit tests (hook-merge / zip-slip / flags / local-source / detection)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tests = Get-ChildItem -Path tests/installer -Filter '*_test.ps1' | Sort-Object Name
+          if ($tests.Count -eq 0) { throw 'no installer pwsh tests found under tests/installer' }
+          $failed = @()
+          foreach ($t in $tests) {
+            Write-Host "== $($t.Name) =="
+            & pwsh -NoProfile -File $t.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $t.Name }
+          }
+          if ($failed.Count -gt 0) { throw ("installer tests failed: " + ($failed -join ', ')) }
+          Write-Host "All $($tests.Count) installer pwsh tests passed."
+
+      - name: Installer smoke (hermetic, network-free, real dcg.exe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Reuse the binary the test job already built (debug); fall back to a
+          # build only if absent. The smoke validates installer mechanics + that
+          # the REAL binary runs, not release optimization.
+          $exe = if (Test-Path 'target/release/dcg.exe') { 'target/release/dcg.exe' }
+                 elseif (Test-Path 'target/debug/dcg.exe') { 'target/debug/dcg.exe' }
+                 else { cargo build --bin dcg; 'target/debug/dcg.exe' }
+          Write-Host "Using binary: $exe"
+
+          # Stage + zip in the dist.yml layout: dcg-<target>/dcg.exe
+          $target = 'x86_64-pc-windows-msvc'
+          $work = Join-Path $env:RUNNER_TEMP ('smoke_' + [Guid]::NewGuid().ToString('N'))
+          $stageRoot = Join-Path $work 'stage'
+          $stage = Join-Path $stageRoot "dcg-$target"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item $exe (Join-Path $stage 'dcg.exe') -Force
+          $zip = Join-Path $work "dcg-$target.zip"
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zip)
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          $fileUri = ([System.Uri]("file://" + $zip)).AbsoluteUri
+          Write-Host "zip=$zip"
+          Write-Host "sha256=$hash"
+
+          # ---- Pass 1: hermetic install + -Verify, no agent config ----
+          Write-Host '== Pass 1: -NoConfigure -Verify (hermetic) =='
+          $dest1 = Join-Path $work 'bin1'
+          & pwsh -NoProfile -File ./install.ps1 -ArtifactUrl $fileUri -Checksum $hash -Dest $dest1 -NoConfigure -Verify
+          if ($LASTEXITCODE -ne 0) { throw "Pass 1 installer exited $LASTEXITCODE" }
+          $installed1 = Join-Path $dest1 'dcg.exe'
+          if (-not (Test-Path $installed1)) { throw "Pass 1: binary not installed at $installed1" }
+          # The installed real binary must run and DENY a destructive command...
+          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | & $installed1
+          if ($deny -notmatch 'permissionDecision') { throw "Pass 1: installed dcg.exe did not deny 'git reset --hard'" }
+          # ...and ALLOW (silent) a safe one.
+          $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | & $installed1
+          if (-not [string]::IsNullOrWhiteSpace($allow)) { throw "Pass 1: 'git status' should be allowed (silent), got: $allow" }
+          Write-Host 'Pass 1 OK: installed; denies destructive, allows safe'
+
+          # ---- Pass 2: agent hook creation into a sandboxed HOME/USERPROFILE ----
+          Write-Host '== Pass 2: Claude + Codex hook creation (sandboxed home, UTF-8 no BOM) =='
+          $home2 = Join-Path $work 'home2'
+          New-Item -ItemType Directory -Path (Join-Path $home2 '.codex') -Force | Out-Null  # make Codex "detected"
+          $dest2 = Join-Path $work 'bin2'
+          # Set both so the child pwsh derives $HOME from the sandbox.
+          $env:USERPROFILE = $home2
+          $env:HOMEDRIVE = (Split-Path -Qualifier $home2)
+          $env:HOMEPATH = (Split-Path -NoQualifier $home2)
+          $env:HOME = $home2
+          & pwsh -NoProfile -File ./install.ps1 -ArtifactUrl $fileUri -Checksum $hash -Dest $dest2 -Force
+          if ($LASTEXITCODE -ne 0) { throw "Pass 2 installer exited $LASTEXITCODE" }
+          function Assert-NoBom([string]$p) {
+            $b = [System.IO.File]::ReadAllBytes($p)
+            if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { throw "$p has a UTF-8 BOM" }
+          }
+          $claudeSettings = Join-Path $home2 '.claude/settings.json'
+          if (-not (Test-Path $claudeSettings)) { throw "Pass 2: Claude settings not created at $claudeSettings" }
+          Assert-NoBom $claudeSettings
+          $cfg = Get-Content -Raw $claudeSettings | ConvertFrom-Json
+          $cmds = @($cfg.hooks.PreToolUse | ForEach-Object { $_.hooks } | ForEach-Object { $_.command })
+          if (-not ($cmds | Where-Object { $_ -match 'dcg' })) { throw "Pass 2: Claude hook does not reference dcg" }
+          $codexHooks = Join-Path $home2 '.codex/hooks.json'
+          if (-not (Test-Path $codexHooks)) { throw "Pass 2: Codex hooks.json not created at $codexHooks" }
+          Assert-NoBom $codexHooks
+          Write-Host 'Pass 2 OK: Claude + Codex hooks created (UTF-8 no BOM, reference dcg)'
+          Write-Host '== Installer smoke PASSED =='
+
+      - name: E2E suite (scripts/e2e_test.ps1 against the real dcg.exe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Auto-discovers target\{release,debug}\dcg.exe; -Verbose for per-scenario
+          # logs, -Artifacts to capture any failure. Non-zero exit gates the build.
+          ./scripts/e2e_test.ps1 -Verbose -Artifacts "$env:RUNNER_TEMP/e2e-artifacts"
+          if ($LASTEXITCODE -ne 0) { throw "e2e_test.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: History DB concurrency / stale-lock stress (real-Windows fsqlite)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Validates the fsqlite history DB on a REAL Windows runtime (the
+          # cfg(not(unix)) WAL/lock fallback path): N concurrent writer PROCESSES
+          # must not corrupt the DB and a killed writer must not wedge later runs.
+          # (History itself is best-effort telemetry — a few records may drop under
+          # extreme contention by design; the test asserts no-corruption + no-wedge
+          # + hooks-never-break, not 100% record completeness.)
+          ./scripts/win_history_concurrency.ps1 -Count 24 -Verbose
+          if ($LASTEXITCODE -ne 0) { throw "win_history_concurrency.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Pending-exception lock concurrency (real-Windows LockFileEx)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # pending_exceptions.rs uses lock_exclusive() -> Windows LockFileEx
+          # (MANDATORY locking, unlike Unix advisory flock). Validates that N
+          # concurrent blocked-command recordings serialize under the lock with no
+          # sharing/lock violations, the lock releases on exit, and append-only
+          # NDJSON lines are never torn.
+          ./scripts/win_pending_exception_concurrency.ps1 -Count 24 -Verbose
+          if ($LASTEXITCODE -ne 0) { throw "win_pending_exception_concurrency.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: NO_COLOR / ANSI escape-leak guard (real Windows console)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Guards the high-risk hand-written-escape paths (update.rs writes raw
+          # \x1b[ that would render literally as <-[33m on legacy conhost): asserts
+          # ZERO raw ESC bytes across deny/explain/scan under NO_COLOR/DCG_NO_COLOR
+          # and when redirected. (Cross-console VISUAL color rendering is a manual
+          # eyeball step — see docs/windows.md.)
+          ./scripts/win_color_nocolor.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_color_nocolor.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: MCP stdio server smoke (real Windows pipe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Drives `dcg mcp-server` as a live MCP client over stdio with
+          # timeout-guarded reads, asserting initialize/tools-list/tools-call work
+          # with NO first-read hang (the Windows console-handle / newline-framing
+          # risk the rust-mcp-sdk StdioTransport could hit on Windows pipes).
+          ./scripts/win_mcp_stdio.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_mcp_stdio.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Update/rollback e2e (real-Windows running-binary swap)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Hermetic (no network): fabricates a backup and runs `dcg update
+          # --rollback`, which restores over the RUNNING file-locked binary via the
+          # Windows-only swap_running_executable (rename to .exe.old + copy + restore
+          # on failure). Validates backup discovery, the running-binary swap, and a
+          # clean no-backup error.
+          ./scripts/win_update_rollback.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_update_rollback.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Interactive prompts non-TTY no-hang guard
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # inquire Select/Confirm prompts must be is_terminal()-gated so they SKIP
+          # (never hang) when stdin is not a TTY — a missing gate would block CI /
+          # pipelines forever. Asserts each prompt-bearing command exits promptly
+          # with no panic under redirected stdin. (Real keyboard nav / Ctrl-C is a
+          # manual console check — see docs/windows.md.)
+          ./scripts/win_interactive_nontty.ps1
+          if ($LASTEXITCODE -ne 0) { throw "win_interactive_nontty.ps1 reported failures (exit $LASTEXITCODE)" }
+
+      - name: Upload Windows e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-artifacts-windows
+          path: ${{ runner.temp }}/e2e-artifacts
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload Windows test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-windows
+          path: target/nextest/ci/junit.xml
+          retention-days: 14
+          if-no-files-found: ignore
+
   fuzz-smoke:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -210,7 +451,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -264,7 +505,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -365,7 +606,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -485,7 +726,7 @@ jobs:
     # Only run on push to main, not on PRs (benchmarks are noisy)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -560,7 +801,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -636,7 +877,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -698,7 +939,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -837,7 +1078,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -915,7 +1156,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -1079,7 +1320,7 @@ jobs:
     # Only run on schedule or manual trigger, not on every PR
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:

@@ -500,7 +500,14 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         return Err(HookReadError::InputTooLarge(input.len()));
     }
 
-    serde_json::from_str(&input).map_err(HookReadError::Json)
+    // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
+    // a BOM; without this, BOM-prefixed but otherwise-valid hook input would
+    // fail to parse and (by default) fail open — silently allowing a command
+    // that should have been evaluated/blocked (issue #160). `serde_json` does
+    // not skip a leading BOM on its own.
+    let to_parse = input.strip_prefix('\u{feff}').unwrap_or(input.as_str());
+
+    serde_json::from_str(to_parse).map_err(HookReadError::Json)
 }
 
 /// Detect which hook protocol should be used for output formatting.
@@ -748,6 +755,26 @@ pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
         && (input.tool_input.is_some() || input.tool_args.is_some())
 }
 
+/// Extract the shell command from an Antigravity (`agy`) `toolCall` envelope.
+///
+/// `agy`'s `run_command` tool carries the command in
+/// `toolCall.args.CommandLine` (PascalCase). For robustness we also accept the
+/// lowercase `command` key used by other agents in case `agy` ever normalizes.
+fn extract_command_from_tool_call(tool_call: &ToolCall) -> Option<String> {
+    let args = tool_call.args.as_ref()?;
+    let serde_json::Value::Object(map) = args else {
+        return None;
+    };
+    for key in ["CommandLine", "commandLine", "command", "Command"] {
+        if let Some(serde_json::Value::String(s)) = map.get(key) {
+            if !s.is_empty() {
+                return Some(s.clone());
+            }
+        }
+    }
+    None
+}
+
 fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
     match tool_input.command.as_ref() {
         Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
@@ -784,6 +811,13 @@ pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookP
     // treat that distinctive envelope as a shell candidate too.
     if !is_shell_hook_candidate(input) {
         return None;
+    }
+
+    // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
+    if let Some(tool_call) = input.tool_call.as_ref() {
+        if let Some(command) = extract_command_from_tool_call(tool_call) {
+            return Some((command, protocol));
+        }
     }
 
     if let Some(tool_input) = input.tool_input.as_ref() {
@@ -2497,6 +2531,129 @@ mod tests {
         // command is actually evaluated rather than skipped.
         assert!(is_supported_shell_tool(Some("run_terminal_cmd")));
         assert!(is_supported_shell_tool(Some("RUN_TERMINAL_CMD")));
+    }
+
+    // =========================================================================
+    // Antigravity CLI (`agy`) protocol tests.
+    //
+    // The wire shapes below are taken verbatim from the stdin `agy` passes to a
+    // PreToolUse hook (captured empirically in a sandboxed $HOME):
+    //   {"toolCall":{"name":"run_command","args":{"CommandLine":"<cmd>",
+    //     "Cwd":"<dir>","WaitMsBeforeAsync":500}},"conversationId":"...",
+    //     "stepIdx":4,"transcriptPath":"...","workspacePaths":[...]}
+    // The block decision that `agy` honors is stdout {"decision":"block",
+    // "reason":...} with exit code 0.
+    // =========================================================================
+
+    #[test]
+    fn test_antigravity_detected_via_tool_call_envelope() {
+        let json = r#"{
+            "toolCall":{"name":"run_command","args":{"CommandLine":"echo hi","Cwd":"/tmp","WaitMsBeforeAsync":500}},
+            "conversationId":"a3bbcaba-0bb2-4e58-b614-49f42fa6f004",
+            "stepIdx":4,
+            "transcriptPath":"/home/u/.gemini/.../transcript_full.jsonl",
+            "workspacePaths":["/data/projects/dcg"]
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Antigravity);
+    }
+
+    #[test]
+    fn test_antigravity_command_extracted_from_command_line() {
+        let json = r#"{
+            "toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf /","Cwd":"/tmp"}},
+            "conversationId":"abc","stepIdx":1
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let (command, protocol) = extract_command_with_protocol(&input).expect("command");
+        assert_eq!(command, "rm -rf /");
+        assert_eq!(protocol, HookProtocol::Antigravity);
+    }
+
+    #[test]
+    fn test_antigravity_is_shell_hook_candidate() {
+        let json = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert!(is_shell_hook_candidate(&input));
+    }
+
+    #[test]
+    fn test_antigravity_hook_output_block_decision_json_shape() {
+        // `agy` aborts run_command on {"decision":"block","reason":...}.
+        // Verified empirically that both "block" and "deny" keywords block;
+        // we emit "block".
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Antigravity,
+            "rm -rf /",
+            "catastrophic filesystem deletion",
+            Some("core.filesystem"),
+            Some("rm-rf-root"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["decision"], "block");
+        assert!(
+            json["reason"]
+                .as_str()
+                .unwrap()
+                .contains("catastrophic filesystem deletion"),
+            "reason must surface the explanation, got: {}",
+            json["reason"]
+        );
+        // Must NOT carry other agents' decision keys.
+        assert!(json.get("action").is_none(), "no Hermes 'action'");
+        assert!(
+            json.get("permissionDecision").is_none(),
+            "no Claude 'permissionDecision'"
+        );
+        assert!(
+            json.get("hookSpecificOutput").is_none(),
+            "no Claude 'hookSpecificOutput'"
+        );
+        assert!(json.get("continue").is_none(), "no Copilot 'continue'");
+        assert!(
+            !stderr.is_empty(),
+            "denial must still surface stderr warning text"
+        );
+    }
+
+    #[test]
+    fn test_write_warning_antigravity_produces_allow() {
+        // `agy` has no "ask"/"warn" decision; a warn must NOT block, so we
+        // emit an explicit allow.
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Antigravity,
+            "git push --force",
+            "force push",
+            Some("core.git"),
+            Some("force-push"),
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+        assert_eq!(json["decision"], "allow");
     }
 
     #[test]

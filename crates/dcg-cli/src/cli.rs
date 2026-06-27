@@ -661,6 +661,14 @@ pub struct HookCommand {
     /// Continue processing on parse errors (skip invalid lines)
     #[arg(long)]
     pub continue_on_error: bool,
+
+    /// Additional packs to enable for this hook run (comma-separated)
+    ///
+    /// Mirrors `dcg test --with-packs`: enables extra packs (e.g.
+    /// `containers.docker`, `kubernetes.kubectl`) for the batch evaluation
+    /// without editing a config file (issue #151).
+    #[arg(long, value_delimiter = ',')]
+    pub with_packs: Option<Vec<String>>,
 }
 
 /// Output format for batch hook mode.
@@ -2314,7 +2322,20 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     let compiled_overrides = config.overrides.compile();
     let allowlists = crate::load_default_allowlists();
     let heredoc_settings = config.heredoc_settings();
+
+    // Fail-closed: when enabled, an unparseable line is treated as a deny
+    // rather than a passive error (issue #160).
+    let fail_closed = config.is_fail_closed();
+
     let mut enabled_packs = config.enabled_pack_ids();
+    // `--with-packs` enables extra packs for this run, mirroring `dcg test`
+    // (issue #151). Done before keyword collection so the extra packs' keywords
+    // participate in the quick-reject filter.
+    if let Some(extra) = cmd.with_packs.as_ref() {
+        for pack in extra {
+            enabled_packs.insert(pack.clone());
+        }
+    }
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
 
     // Load external packs from custom_paths (glob + tilde expansion).
@@ -2414,6 +2435,11 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         results.sort_by_key(|(order, _)| *order);
 
         for (_, mut result) in results {
+            // Fail-closed: an unparseable line is a DENY, not a passive error
+            // (issue #160).
+            if fail_closed && result.decision == "error" {
+                result.decision = "deny";
+            }
             result.index = emit_index;
             emit_index += 1;
             if result.decision == "deny" {
@@ -2462,6 +2488,11 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                 &allowlists,
                 &heredoc_settings,
             );
+            // Fail-closed: an unparseable line is a DENY, not a passive error
+            // (issue #160).
+            if fail_closed && result.decision == "error" {
+                result.decision = "deny";
+            }
             result.index = emit_index;
             emit_index += 1;
             if result.decision == "deny" {
@@ -2504,6 +2535,12 @@ fn evaluate_batch_line(
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
 ) -> BatchHookOutput {
+    // Strip a leading UTF-8 BOM (U+FEFF). It can only appear on the first
+    // physical line of stdin, but stripping per-line is harmless and ensures a
+    // BOM-prefixed but otherwise-valid hook line is parsed and evaluated rather
+    // than fail-open-allowed (issue #160). serde_json does not skip a BOM.
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+
     // Skip empty lines
     if line.trim().is_empty() {
         return BatchHookOutput {
@@ -12611,22 +12648,19 @@ fn allowlist_add_rule(
 /// `custom_paths`. Used to reject allowlist rules that reference nonexistent
 /// packs (issue #162).
 fn pack_id_is_known(pack_id: &str) -> bool {
-    let prefix = format!("{pack_id}.");
-    if REGISTRY.get(pack_id).is_some()
-        || REGISTRY
-            .all_pack_ids()
-            .iter()
-            .any(|id| *id == pack_id || id.starts_with(&prefix))
-    {
+    // Allowlist-rule matching compares the rule's pack_id to a matched rule's
+    // FULL concrete pack id exactly (see `allowlist.rs`: `rule_id.pack_id !=
+    // pack_id`). A bare group prefix like `core` (for `core.git`) therefore
+    // never matches anything, so it must NOT validate. `REGISTRY.get` is an
+    // exact full-id lookup, which is precisely what we need (issue #162).
+    if REGISTRY.get(pack_id).is_some() {
         return true;
     }
 
     // Fall back to external packs declared in config `custom_paths`.
     let config = Config::load();
     let external = load_external_packs(&config.packs.expand_custom_paths());
-    external
-        .pack_ids()
-        .any(|id| id == pack_id || id.starts_with(&prefix))
+    external.pack_ids().any(|id| id == pack_id)
 }
 
 /// Add a rule to the allowlist with optional path scoping.
@@ -15116,6 +15150,86 @@ mod tests {
         } else {
             unreachable!("Expected Install command");
         }
+    }
+
+    #[test]
+    fn test_cli_parse_install_agy() {
+        let cli = Cli::parse_from(["dcg", "install", "--agy"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+        }) = cli.command
+        {
+            assert!(!force);
+            assert!(!project);
+            assert!(!grok);
+            assert!(agy);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_install_agy_with_project() {
+        let cli = Cli::parse_from(["dcg", "install", "--agy", "--project"]);
+        if let Some(Command::Install {
+            force,
+            project,
+            grok,
+            agy,
+        }) = cli.command
+        {
+            assert!(!force);
+            assert!(project);
+            assert!(!grok);
+            assert!(agy);
+        } else {
+            unreachable!("Expected Install command");
+        }
+    }
+
+    #[test]
+    fn test_install_antigravity_hook_writes_valid_hook() {
+        // Writes the dcg PreToolUse hook into a hooks.json at the resolved
+        // Antigravity path and asserts the wire shape + command match what
+        // `agy` reads. Uses a temp HOME so the real ~/.gemini is never touched.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let hooks_path = tmp.path().join(".gemini").join("config").join("hooks.json");
+        std::fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+
+        // Mirror install_dcg_hook_into_settings against an empty config, which
+        // is exactly what install_antigravity_hook does for a fresh file.
+        let mut settings = serde_json::json!({});
+        let changed = install_dcg_hook_into_settings(&mut settings, false).expect("install");
+        assert!(changed, "first install should change settings");
+        std::fs::write(
+            &hooks_path,
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        // Re-read and validate the structure the way agy parses it.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let pre_tool_use = written["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("hooks.PreToolUse must be an array");
+        assert_eq!(pre_tool_use.len(), 1, "exactly one dcg hook entry");
+        let entry = &pre_tool_use[0];
+        assert_eq!(entry["matcher"], "Bash");
+        let cmd = &entry["hooks"][0];
+        assert_eq!(cmd["type"], "command");
+        assert_eq!(cmd["command"], "dcg");
+
+        // The written entry must be recognized as a dcg hook (idempotency).
+        assert!(is_dcg_hook_entry(entry));
+
+        // A second install without --force is a no-op (already installed).
+        let changed_again =
+            install_dcg_hook_into_settings(&mut settings, false).expect("second install");
+        assert!(!changed_again, "second install should be idempotent");
     }
 
     // ========================================================================

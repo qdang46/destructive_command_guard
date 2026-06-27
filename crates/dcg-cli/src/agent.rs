@@ -24,6 +24,11 @@
 //!   env var (set when Grok invokes hooks defined in `~/.grok/hooks/*.json`,
 //!   `.grok/hooks/*.json`, or `~/.claude/settings.json` via the Claude-Code
 //!   compatibility layer)
+//! - Antigravity CLI (`agy`): detected via the `agy` parent process name and/or
+//!   the `ANTIGRAVITY_CONVERSATION_ID` env var (set by `agy` for tool/hook
+//!   subprocesses). `agy` reads Claude-Code-compatible `PreToolUse` hooks from
+//!   `~/.gemini/config/hooks.json` (with `~/.gemini/antigravity-cli/hooks.json`
+//!   symlinked to it for backward compatibility).
 //!
 //! # Usage
 //!
@@ -161,6 +166,7 @@ impl Agent {
             "cursoride" | "cursor" => Self::CursorIde,
             "hermes" | "hermesagent" | "hermescli" => Self::Hermes,
             "grok" | "grokcli" | "grokbuild" | "xai" | "xaigrok" => Self::Grok,
+            "agy" | "antigravity" | "antigravitycli" => Self::Antigravity,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -548,6 +554,19 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // Antigravity CLI (`agy`) detection. `agy` exports
+    // `ANTIGRAVITY_CONVERSATION_ID=<uuid>` into the environment of the
+    // subprocesses it spawns (confirmed in the `agy` binary: the format
+    // string `ANTIGRAVITY_CONVERSATION_ID=%s`). This is the canonical session
+    // marker, mirroring CLAUDE_SESSION_ID / GROK_SESSION_ID.
+    if std::env::var("ANTIGRAVITY_CONVERSATION_ID").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Antigravity,
+            DetectionMethod::Environment,
+            Some("ANTIGRAVITY_CONVERSATION_ID".to_string()),
+        ));
+    }
+
     None
 }
 
@@ -809,6 +828,7 @@ mod tests {
         assert_eq!(Agent::CursorIde.config_key(), "cursor-ide");
         assert_eq!(Agent::Hermes.config_key(), "hermes");
         assert_eq!(Agent::Grok.config_key(), "grok");
+        assert_eq!(Agent::Antigravity.config_key(), "antigravity");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -852,6 +872,11 @@ mod tests {
         assert_eq!(Agent::from_name("grok_build"), Agent::Grok);
         assert_eq!(Agent::from_name("xai"), Agent::Grok);
         assert_eq!(Agent::from_name("xai-grok"), Agent::Grok);
+        assert_eq!(Agent::from_name("agy"), Agent::Antigravity);
+        assert_eq!(Agent::from_name("antigravity"), Agent::Antigravity);
+        assert_eq!(Agent::from_name("antigravity-cli"), Agent::Antigravity);
+        assert_eq!(Agent::from_name("Antigravity"), Agent::Antigravity);
+        assert_eq!(Agent::from_name("ANTIGRAVITY_CLI"), Agent::Antigravity);
 
         // Custom agents
         assert_eq!(
@@ -872,6 +897,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::CursorIde), "Cursor IDE");
         assert_eq!(format!("{}", Agent::Hermes), "Hermes Agent");
         assert_eq!(format!("{}", Agent::Grok), "Grok (xAI)");
+        assert_eq!(format!("{}", Agent::Antigravity), "Antigravity CLI");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -888,6 +914,7 @@ mod tests {
         assert!(Agent::CursorIde.is_known());
         assert!(Agent::Hermes.is_known());
         assert!(Agent::Grok.is_known());
+        assert!(Agent::Antigravity.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -952,6 +979,19 @@ mod tests {
             agent_from_process_name("/home/user/.local/bin/grok"),
             Some(Agent::Grok)
         );
+        assert_eq!(agent_from_process_name("agy"), Some(Agent::Antigravity));
+        assert_eq!(
+            agent_from_process_name("antigravity"),
+            Some(Agent::Antigravity)
+        );
+        assert_eq!(
+            agent_from_process_name("antigravity-cli"),
+            Some(Agent::Antigravity)
+        );
+        assert_eq!(
+            agent_from_process_name("/home/user/.local/bin/agy"),
+            Some(Agent::Antigravity)
+        );
     }
 
     #[test]
@@ -993,6 +1033,11 @@ mod tests {
         assert_eq!(agent_from_process_name("xgrok"), None);
         assert_eq!(agent_from_process_name("anti-grok"), None);
         assert_eq!(agent_from_process_name("grokking"), None);
+        // "agy" / "antigravity" must be exact; near-misses are not agy.
+        assert_eq!(agent_from_process_name("agyx"), None);
+        assert_eq!(agent_from_process_name("legacy"), None);
+        assert_eq!(agent_from_process_name("antigravity-helper"), None);
+        assert_eq!(agent_from_process_name("xantigravity"), None);
     }
 
     #[test]
@@ -1150,6 +1195,7 @@ mod env_tests {
         "GROK_SESSION_ID",
         "GROK_HOOK_EVENT",
         "GROK_WORKSPACE_ROOT",
+        "ANTIGRAVITY_CONVERSATION_ID",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
@@ -1338,6 +1384,19 @@ mod env_tests {
             assert_eq!(
                 result.matched_value,
                 Some("GROK_WORKSPACE_ROOT".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn test_detect_antigravity_conversation_id_env() {
+        with_env_var("ANTIGRAVITY_CONVERSATION_ID", "conv-uuid-123", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Antigravity);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(
+                result.matched_value,
+                Some("ANTIGRAVITY_CONVERSATION_ID".to_string())
             );
         });
     }

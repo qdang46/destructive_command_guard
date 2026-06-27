@@ -263,6 +263,7 @@ struct GeneralConfigLayer {
     max_hook_input_bytes: Option<usize>,
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
+    fail_closed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -1175,6 +1176,16 @@ pub struct GeneralConfig {
     /// mid-session.
     /// Default: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.
     pub self_heal_hook: bool,
+
+    /// Fail-closed mode for unparseable hook input.
+    ///
+    /// When `true`, hook input that cannot be parsed as JSON is BLOCKED
+    /// (denied) instead of allowed. The default (`false`) is the documented
+    /// fail-open behavior: malformed input is allowed so a transient encoding
+    /// glitch never blocks legitimate work. Intended for high-security
+    /// environments. Override at runtime with the `DCG_FAIL_CLOSED` env var
+    /// (a truthy value forces fail-closed, a falsy value forces fail-open).
+    pub fail_closed: bool,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1194,6 +1205,7 @@ impl Default for GeneralConfig {
             max_findings_per_command: None,
             check_updates: true,
             self_heal_hook: true,
+            fail_closed: false,
         }
     }
 }
@@ -3260,6 +3272,9 @@ impl Config {
         if let Some(self_heal_hook) = general.self_heal_hook {
             self.general.self_heal_hook = self_heal_hook;
         }
+        if let Some(fail_closed) = general.fail_closed {
+            self.general.fail_closed = fail_closed;
+        }
     }
 
     const fn merge_output_layer(&mut self, output: OutputConfigLayer) {
@@ -3822,6 +3837,24 @@ impl Config {
             .ok()
             .and_then(|value| parse_env_bool(&value))
             .unwrap_or(false)
+    }
+
+    /// Whether dcg should fail CLOSED (block) on hook input it cannot parse.
+    ///
+    /// The `DCG_FAIL_CLOSED` environment variable overrides the config value:
+    /// a truthy value forces fail-closed, a falsy value forces fail-open. When
+    /// the env var is unset, the configured `general.fail_closed` is used
+    /// (default: `false`, i.e. fail-open). Default behavior is unchanged for
+    /// anyone who does not opt in (issue #160).
+    #[must_use]
+    pub fn is_fail_closed(&self) -> bool {
+        if let Some(value) = env::var(format!("{ENV_PREFIX}_FAIL_CLOSED"))
+            .ok()
+            .and_then(|value| parse_env_bool(&value))
+        {
+            return value;
+        }
+        self.general.fail_closed
     }
 
     /// Get the effective pack configuration for a specific project path.
@@ -4768,6 +4801,24 @@ database_path = "/tmp/dcg-history.db"
             config.history.database_path.as_deref(),
             Some("/tmp/dcg-history.db")
         );
+    }
+
+    #[test]
+    fn config_file_fail_closed_survives_layer_merge() {
+        // Regression (issue #160): `[general] fail_closed = true` from a config
+        // FILE must be carried through the layered load/merge into the final
+        // config. It was previously dropped because `GeneralConfigLayer` lacked
+        // the field, so `fail_closed` was always its default `false` from a file.
+        let layer: ConfigLayer = toml::from_str("[general]\nfail_closed = true\nverbose = true\n")
+            .expect("layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+        assert!(
+            config.general.fail_closed,
+            "fail_closed from a config file must survive the layer merge"
+        );
+        // Sibling field from the same section is honored too (sanity).
+        assert!(config.general.verbose);
     }
 
     #[test]

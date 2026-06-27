@@ -42,6 +42,7 @@ pub mod secrets;
 pub mod storage;
 pub mod strict_git;
 pub mod system;
+pub mod windows;
 
 pub mod windows;
 
@@ -1683,6 +1684,8 @@ static PACK_ENTRIES: [PackEntry; 90] = [
             "remove-vm",
             "Remove-VMSnapshot",
             "remove-vmsnapshot",
+            "Remove-AppxPackage",
+            "remove-appxpackage",
         ],
         windows::powershell::create_pack,
     ),

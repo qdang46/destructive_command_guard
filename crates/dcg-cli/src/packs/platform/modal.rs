@@ -121,30 +121,30 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Volume — read-only and non-destructive ops
         safe_pattern!(
             "modal-volume-list",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list|ls)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list|ls)\b"
         ),
         safe_pattern!(
             "modal-volume-get",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:get|cp|cat)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:get|cp|cat)\b"
         ),
         safe_pattern!(
             "modal-volume-create",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:create|rename)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:create|rename)\b"
         ),
         // App — inspection only
         safe_pattern!(
             "modal-app-readonly",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+(?:list|ls|logs|history|dashboard|rollback|rollover)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+(?:list|ls|logs|history|dashboard|rollback|rollover)\b"
         ),
         // Container — inspection / exec (exec is interactive, not a destructive resource op)
         safe_pattern!(
             "modal-container-readonly",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+(?:list|ls|logs|exec)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+(?:list|ls|logs|exec)\b"
         ),
         // Secret — list and create-without-force
         safe_pattern!(
             "modal-secret-list",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:list|ls)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:list|ls)\b"
         ),
         safe_pattern!(
             "modal-secret-create-no-force",
@@ -155,36 +155,39 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             // Mirrors the destructive pattern's `(?:[^;&|\r\n]|\\\r?\n)*` body.
             // The pattern is allow-listed in `pattern_audit.rs` because the
             // `(?!...)` lookahead forces use of the backtracking engine.
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:--force|--overwrite)\b)"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:--force|--overwrite)\b)"
         ),
         // Environment — list and non-destructive lifecycle
         safe_pattern!(
             "modal-environment-list",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:list|ls)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:list|ls)\b"
         ),
         safe_pattern!(
             "modal-environment-mutate",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:create|update)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:create|update)\b"
         ),
         // Dict — read-only and create
         safe_pattern!(
             "modal-dict-readonly",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:list|ls|get|items|create)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:list|ls|get|items|create)\b"
         ),
         // Queue — read-only and create
         safe_pattern!(
             "modal-queue-readonly",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:list|ls|peek|len|create)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:list|ls|peek|len|create)\b"
         ),
         // Shell / deploy / serve / token — non-destructive
-        safe_pattern!("modal-shell", r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+shell\b"),
+        safe_pattern!(
+            "modal-shell",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+shell\b"
+        ),
         safe_pattern!(
             "modal-deploy",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:deploy|serve|run|profile|launch)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:deploy|serve|run|profile|launch)\b"
         ),
         safe_pattern!(
             "modal-token",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+token\s+(?:info|new|set)\b"
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+token\s+(?:info|new|set)\b"
         ),
     ]
 }
@@ -194,7 +197,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // --- Critical: deletion of named first-class resources ---
         destructive_pattern!(
             "modal-environment-delete",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:delete|remove|rm)\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+environment\s+(?:delete|remove|rm)\b",
             "modal environment delete schedules removal of an entire Modal environment.",
             Critical,
             "Deleting a Modal environment removes the environment and every Modal app inside it — irrecoverable. Agents passing --yes bypass Modal's confirmation prompt entirely.",
@@ -202,7 +205,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-volume-delete",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:delete|remove)\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:delete|remove)\b",
             "modal volume delete removes a Modal Volume and all data inside it.",
             Critical,
             "Deleting a Modal Volume destroys persistent ML artifacts: model weights, datasets, checkpoints. There is no undo. Agents passing --yes bypass Modal's confirmation prompt entirely.",
@@ -210,7 +213,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-secret-delete",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:delete|remove|rm)\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+(?:delete|remove|rm)\b",
             "modal secret delete permanently removes a published Modal Secret.",
             Critical,
             "Deleting a Modal Secret can immediately break every running app that references it (API keys, DB credentials, OAuth tokens). Agents passing --yes bypass Modal's confirmation prompt entirely.",
@@ -218,7 +221,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-dict-delete",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:delete|remove|rm)\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+(?:delete|remove|rm)\b",
             "modal dict delete removes a named Modal Dict and all its data.",
             Critical,
             "Deleting a Modal Dict can destroy authoritative state that an app treats as a transient cache when it actually is not. Agents passing --yes bypass Modal's confirmation prompt entirely.",
@@ -226,7 +229,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-queue-delete",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:delete|remove|rm)\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+(?:delete|remove|rm)\b",
             "modal queue delete removes a named Modal Queue and all its data.",
             Critical,
             "Deleting a Modal Queue discards every message currently in flight or buffered. Agents passing --yes bypass Modal's confirmation prompt entirely.",
@@ -235,7 +238,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // --- High: terminate work / wipe contents (recoverable in principle) ---
         destructive_pattern!(
             "modal-app-stop",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+stop\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app\s+stop\b",
             "modal app stop terminates a Modal app and its running containers.",
             High,
             "Stopping a Modal app permanently stops it and terminates running containers; in-progress inputs are lost or reassigned. Use `modal app rollback` to roll back without stopping.",
@@ -243,7 +246,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-container-stop",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+stop\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+container\s+stop\b",
             "modal container stop terminates a running Modal container and reassigns inputs.",
             High,
             "Stopping a Modal container interrupts in-flight work. The platform may reassign inputs, but exactly-once semantics are not guaranteed.",
@@ -251,7 +254,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-volume-rm-recursive",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+rm\b(?:[^;&|\r\n]|\\\r?\n)*(?:\s|=)(?:-r\b|-R\b|--recursive\b)",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+rm\b(?:[^;&|\r\n]|\\\r?\n)*(?:\s|=)(?:-r\b|-R\b|--recursive\b)",
             "modal volume rm -r recursively deletes files inside a Modal Volume.",
             High,
             "Recursive `modal volume rm` can wipe entire subdirectories of persistent storage (datasets, checkpoints). Catastrophic when the target is wrong.",
@@ -259,7 +262,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-dict-clear",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+clear\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+dict\s+clear\b",
             "modal dict clear empties a Modal Dict.",
             High,
             "Clearing a Modal Dict deletes every entry but leaves the Dict object. If the Dict holds authoritative state, this is data loss.",
@@ -267,7 +270,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-queue-clear",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+clear\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+queue\s+clear\b",
             "modal queue clear drains every message from a Modal Queue.",
             High,
             "Clearing a Modal Queue drops every buffered message. If consumers have not yet processed them, the work is lost.",
@@ -282,7 +285,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // pattern rather than falling through to this Medium pattern. Same
             // asymmetry-fix as the secret-create-no-force lookahead above.
             // Allow-listed in `pattern_audit.rs`.
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+rm\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:\s|=)(?:-r\b|-R\b|--recursive\b))",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+rm\b(?!(?:[^;&|\r\n]|\\\r?\n)*(?:\s|=)(?:-r\b|-R\b|--recursive\b))",
             "modal volume rm deletes a file inside a Modal Volume.",
             Medium,
             "Single-file deletion inside a Volume is recoverable only if you have an external copy. Verify the target path before running.",
@@ -290,7 +293,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "modal-secret-create-force",
-            r"\bmodal(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?:[^;&|\r\n]|\\\r?\n)*(?:--force|--overwrite)\b",
+            r"(?<![\w-])modal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secret\s+create\b(?:[^;&|\r\n]|\\\r?\n)*(?:--force|--overwrite)\b",
             "modal secret create --force overwrites an existing Modal Secret in place.",
             Medium,
             "Overwriting a Secret with --force changes the value used by every app that references it on next cold start — common cause of unintended prod credential rotation.",
@@ -363,6 +366,10 @@ mod tests {
         let pack = create_pack();
         let checks = [
             // Critical — first-class resource deletion
+            (
+                "/usr/local/bin/modal environment delete prod --yes",
+                "modal-environment-delete",
+            ),
             (
                 "modal environment delete prod --yes",
                 "modal-environment-delete",
@@ -472,6 +479,14 @@ mod tests {
             "modal app list | modal app stop my-app --yes",
             "modal-app-stop",
         );
+    }
+
+    #[test]
+    fn ignores_prefixed_modal_lookalikes() {
+        let pack = create_pack();
+        assert_no_match(&pack, "notmodal volume delete model-weights");
+        assert_no_match(&pack, "my-modal app stop prod");
+        assert_no_match(&pack, "xmodal secret create --force key VALUE=new");
     }
 
     #[test]

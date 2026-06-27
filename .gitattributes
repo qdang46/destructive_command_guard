@@ -1,3 +1,17 @@
 
 # Use bd merge for beads JSONL files
 .beads/issues.jsonl merge=beads
+
+# --- Test artifacts: force LF on checkout (win-test-line-endings) ---
+# Golden artifacts and insta snapshots are compared exactly; a Windows checkout
+# with core.autocrlf=true would otherwise rewrite them to CRLF and flake the
+# comparisons on Windows CI. dcg's own output is always LF (Rust does not
+# translate line endings), and golden JSON is compared as *parsed* JSON (already
+# CRLF-robust) — these rules cover snapshots and any raw-text fixture/golden
+# comparison so Windows and Unix CI agree regardless of git's autocrlf setting.
+tests/golden/** text eol=lf
+*.snap text eol=lf
+tests/snapshots/** text eol=lf
+tests/e2e/fixtures/** text eol=lf
+# E2E shell harnesses must stay LF (they run under bash / git-bash).
+*.sh text eol=lf

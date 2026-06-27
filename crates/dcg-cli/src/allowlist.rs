@@ -2876,5 +2876,12 @@ mod tests {
         assert!(is_builtin_inspection_wrapper_call(
             "ee preflight check --stdin --json"
         ));
+        // --stdin with plain flags (no redirect) still allowed
+        assert!(is_builtin_inspection_wrapper_call(
+            "ee preflight check --stdin --json"
+        ));
+        assert!(is_builtin_inspection_wrapper_call(
+            "ee preflight verify --cmd \"dd if=/dev/zero of=/dev/sda\""
+        ));
     }
 }

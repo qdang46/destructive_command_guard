@@ -129,43 +129,43 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         safe_pattern!(
             "railway-status",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?:\s|$)"
         ),
         safe_pattern!(
             "railway-project-list",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|ls)(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|ls)(?:\s|$)"
         ),
         safe_pattern!(
             "railway-project-subcommand-list",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+project\s+(?:list|ls)(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+project\s+(?:list|ls)(?:\s|$)"
         ),
         safe_pattern!(
             "railway-whoami",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?:\s|$)"
         ),
         safe_pattern!(
             "railway-logs",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?:\s|$)"
         ),
         safe_pattern!(
             "railway-service-list",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:list|ls)(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:list|ls)(?:\s|$)"
         ),
         safe_pattern!(
             "railway-function-list",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function|functions|func|funcs|fn|fns)\s+(?:list|ls)(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function|functions|func|funcs|fn|fns)\s+(?:list|ls)(?:\s|$)"
         ),
         safe_pattern!(
             "railway-environment-list",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment|env)\s+(?:list|ls)(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment|env)\s+(?:list|ls)(?:\s|$)"
         ),
         safe_pattern!(
             "railway-volume-list",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list|ls)(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list|ls)(?:\s|$)"
         ),
         safe_pattern!(
             "railway-variable-list",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:list|ls)(?:\s|$)"
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:list|ls)(?:\s|$)"
         ),
     ]
 }
@@ -174,7 +174,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         destructive_pattern!(
             "railway-project-delete",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+delete(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+delete(?:\s|$)",
             "railway delete schedules deletion of the entire Railway project.",
             Critical,
             "Deleting a Railway project can remove every service, database, volume, variable, and deployment attached to it.",
@@ -182,7 +182,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-project-subcommand-delete",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+project\s+(?:delete|remove|rm)(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+project\s+(?:delete|remove|rm)(?:\s|$)",
             "railway project delete schedules deletion of the entire Railway project.",
             Critical,
             "Deleting a Railway project can remove every service, database, volume, variable, and deployment attached to it.",
@@ -190,7 +190,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-environment-delete",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment|env)\s+(?:delete|remove|rm)(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment|env)\s+(?:delete|remove|rm)(?:\s|$)",
             "railway environment delete removes a Railway environment and its resources.",
             Critical,
             "Deleting an environment can remove production services, database instances, volumes, and variables in that environment.",
@@ -198,7 +198,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-service-delete",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:delete|remove|rm)(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:delete|remove|rm)(?:\s|$)",
             "railway service delete permanently deletes a Railway service.",
             Critical,
             "Deleting a service can remove the production app or managed database service and its deployment history.",
@@ -206,7 +206,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-function-delete",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function|functions|func|funcs|fn|fns)\s+(?:delete|remove|rm)(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function|functions|func|funcs|fn|fns)\s+(?:delete|remove|rm)(?:\s|$)",
             "railway functions delete removes a Railway serverless function.",
             Critical,
             "Deleting a Railway function can remove production serverless code, HTTP endpoints, or scheduled jobs.",
@@ -214,7 +214,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-volume-delete",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:delete|remove|rm)(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:delete|remove|rm)(?:\s|$)",
             "railway volume delete removes persistent Railway storage.",
             Critical,
             "Deleting a Railway volume can destroy persistent database storage and is catastrophic when the volume backs production data.",
@@ -222,7 +222,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-volume-detach",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+detach(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+detach(?:\s|$)",
             "railway volume detach disconnects persistent storage from a service.",
             High,
             "Detaching a volume can take a production database or stateful service offline even when the bytes are not immediately deleted.",
@@ -230,7 +230,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-variable-delete",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:delete|remove|rm)(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:delete|remove|rm)(?:\s|$)",
             "railway variable delete removes Railway environment variables.",
             High,
             "Deleting environment variables can break production deploys, database connections, credentials, and service-to-service links.",
@@ -238,7 +238,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-database-variable-set",
-            r#"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:set|upsert)(?:[^;&|\r\n]|\\\r?\n)*(?:\s|[^=\\]\\?["'])(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)(?:\s|=|\\?["']\s*:|$)"#,
+            r#"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:set|upsert)(?:[^;&|\r\n]|\\\r?\n)*(?:\s|[^=\\]\\?["'])(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)(?:\s|=|\\?["']\s*:|$)"#,
             "railway variable set is changing a database connection variable.",
             High,
             "Overwriting database connection variables can redirect production traffic or disconnect an app from its production database.",
@@ -246,7 +246,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-database-variable-legacy-set",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+--set(?:=|\s+)|\s+--set-from-stdin(?:=|\s+))(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)(?:\s|=|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)(?:\s+--?\S+(?:\s+\S+)?)*(?:\s+--set(?:=|\s+)|\s+--set-from-stdin(?:=|\s+))(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)(?:\s|=|$)",
             "railway variable legacy flags are changing a database connection variable.",
             High,
             "Legacy Railway variable flags can still overwrite database connection variables and break production database access.",
@@ -254,7 +254,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-deployment-remove",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+down(?:\s|$)",
+            r"(?<![\w-])railway\b(?:\s+--?\S+(?:\s+\S+)?)*\s+down(?:\s|$)",
             "railway down removes the latest successful deployment.",
             High,
             "Removing a deployment can interrupt production service availability.",
@@ -401,6 +401,10 @@ mod tests {
     fn blocks_destructive_cli_commands() {
         let pack = create_pack();
         let checks = [
+            (
+                "/usr/local/bin/railway delete --yes",
+                "railway-project-delete",
+            ),
             ("railway delete --yes", "railway-project-delete"),
             (
                 "railway project remove --project prod --yes",
@@ -668,6 +672,14 @@ mod tests {
             "railway service list & railway volume delete --volume prod-db --yes",
             "railway-volume-delete",
         );
+    }
+
+    #[test]
+    fn ignores_prefixed_railway_lookalikes() {
+        let pack = create_pack();
+        assert_no_match(&pack, "notrailway delete --yes");
+        assert_no_match(&pack, "my-railway volume delete --volume prod-db --yes");
+        assert_no_match(&pack, "xrailway variable set DATABASE_URL=postgres://prod");
     }
 
     #[test]

@@ -20,7 +20,10 @@ Param(
   [switch]$KeepHistory,
   [switch]$KeepPath,
   [switch]$Purge,
-  [switch]$Quiet
+  [switch]$Quiet,
+  # Testing hook: dot-source (`. ./uninstall.ps1 -LoadFunctionsOnly`) to load the
+  # functions WITHOUT running the uninstall body (see tests/installer/*.ps1).
+  [switch]$LoadFunctionsOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +32,16 @@ function Write-Info { param($msg) if (-not $Quiet) { Write-Host "[*] $msg" -Fore
 function Write-Ok { param($msg) if (-not $Quiet) { Write-Host "[+] $msg" -ForegroundColor Green } }
 function Write-Warn { param($msg) if (-not $Quiet) { Write-Host "[!] $msg" -ForegroundColor Yellow } }
 function Write-Err { param($msg) Write-Host "[-] $msg" -ForegroundColor Red }
+
+function Test-CommandTokenLooksLikePath {
+  param([string]$Token)
+
+  if ([string]::IsNullOrEmpty($Token)) { return $false }
+  ($Token -match '^[A-Za-z]:[\\/]' -or
+    $Token.StartsWith('\') -or
+    $Token.StartsWith('/') -or
+    $Token -match '[\\/]')
+}
 
 function Get-DcgCommandName {
   param([string]$Command)
@@ -51,7 +64,23 @@ function Get-DcgCommandName {
       $program = $trimmed.Trim("'")
     }
   } else {
+    # A BARE (unquoted) value may be a path that itself contains spaces (e.g. an
+    # install under `C:\Users\John Doe\.local\bin\dcg.exe`). Splitting on
+    # whitespace and keeping token 0 would yield `C:\Users\John` -> wrong basename.
+    # Mirror install.ps1: if token 0 looks like a path, take the trailing
+    # `/\`-segment's first token as the program, UNLESS some other executable
+    # (`*.exe/.cmd/.bat/.ps1 `) appears before it (then dcg is just an argument).
     $program = ($trimmed -split '\s+', 2)[0]
+    if (Test-CommandTokenLooksLikePath $program) {
+      $normalizedTrimmed = $trimmed -replace '\\', '/'
+      $leafFromFullPath = ($normalizedTrimmed -split '/')[-1]
+      $leafCommand = (($leafFromFullPath -split '\s+', 2)[0]).Trim('"').Trim("'")
+      $prefixBeforeLeaf = $normalizedTrimmed.Substring(0, $normalizedTrimmed.Length - $leafFromFullPath.Length)
+      if ((($leafCommand -eq "dcg") -or ($leafCommand -eq "dcg.exe")) -and
+          ($prefixBeforeLeaf -notmatch '(?i)\.(?:exe|cmd|bat|ps1)\s')) {
+        $program = $leafCommand
+      }
+    }
   }
 
   (($program -replace '\\', '/') -split '/')[-1].ToLowerInvariant()
@@ -129,7 +158,16 @@ function Test-EmptyObject {
 }
 
 function Remove-DcgHooksFromJsonFile {
-  param([string]$Path, [switch]$DeleteEmptyFile)
+  # Strip dcg's hook from a Claude-Code-style hooks file. Defaults to
+  # PreToolUse/Bash (Claude + Codex); pass -EventName/-Matcher for Gemini
+  # (BeforeTool/run_shell_command). Removes ONLY dcg-owned inner hooks, preserves
+  # coexisting hooks/matchers, prunes emptied containers. UTF-8 no BOM.
+  param(
+    [string]$Path,
+    [switch]$DeleteEmptyFile,
+    [string]$EventName = "PreToolUse",
+    [string]$Matcher = "Bash"
+  )
 
   if (-not (Test-Path $Path -PathType Leaf)) { return $false }
 
@@ -145,15 +183,15 @@ function Remove-DcgHooksFromJsonFile {
   $hooks = Get-ObjectPropertyValue $config "hooks"
   if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $false }
 
-  if (-not (Test-ObjectPropertyExists $hooks "PreToolUse")) { return $false }
-  $preToolUse = Get-ObjectPropertyValue $hooks "PreToolUse"
+  if (-not (Test-ObjectPropertyExists $hooks $EventName)) { return $false }
+  $preToolUse = Get-ObjectPropertyValue $hooks $EventName
   if (-not (Test-JsonArray $preToolUse)) { return $false }
 
   $newPreToolUse = @()
   $removed = $false
 
   foreach ($entry in (Get-JsonArray $preToolUse)) {
-    if ((Get-ObjectPropertyValue $entry "matcher") -ne "Bash") {
+    if ((Get-ObjectPropertyValue $entry "matcher") -ne $Matcher) {
       $newPreToolUse += $entry
       continue
     }
@@ -185,9 +223,9 @@ function Remove-DcgHooksFromJsonFile {
   if (-not $removed) { return $false }
 
   if ($newPreToolUse.Count -gt 0) {
-    Set-ObjectPropertyValue $hooks "PreToolUse" $newPreToolUse
+    Set-ObjectPropertyValue $hooks $EventName $newPreToolUse
   } else {
-    Remove-ObjectPropertyValue $hooks "PreToolUse"
+    Remove-ObjectPropertyValue $hooks $EventName
   }
 
   if (Test-EmptyObject $hooks) {
@@ -237,6 +275,130 @@ function Remove-DcgFromUserPath {
   $removed
 }
 
+function Unconfigure-CursorHook {
+  # Remove dcg from ~/.cursor/hooks.json (beforeShellExecution[]) and delete our
+  # marker-guarded bridge script. Preserves coexisting hooks. Returns $true if any
+  # dcg artifact was removed.
+  param([string]$HomeDir = $HOME)
+  $removed = $false
+  $cursorDir = Join-Path $HomeDir ".cursor"
+  $bridge = Join-Path (Join-Path $cursorDir "hooks") "dcg-pre-shell.ps1"
+  if ((Test-Path $bridge -PathType Leaf) -and
+      ((Get-Content -Raw -LiteralPath $bridge) -match 'dcg-cursor-hook')) {
+    Remove-Item -Force -LiteralPath $bridge -ErrorAction SilentlyContinue
+    $removed = $true
+  }
+  $hooksFile = Join-Path $cursorDir "hooks.json"
+  if (-not (Test-Path $hooksFile -PathType Leaf)) { return $removed }
+  try { $config = Get-Content -Raw -LiteralPath $hooksFile | ConvertFrom-Json }
+  catch { Write-Warn "Could not parse $hooksFile; leaving it unchanged"; return $removed }
+  if ($null -eq $config -or $config -isnot [psobject]) { return $removed }
+  $hooks = Get-ObjectPropertyValue $config "hooks"
+  if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $removed }
+  if (-not (Test-ObjectPropertyExists $hooks "beforeShellExecution")) { return $removed }
+  $entries = Get-JsonArray (Get-ObjectPropertyValue $hooks "beforeShellExecution")
+  $kept = @()
+  foreach ($e in $entries) {
+    $cmd = [string](Get-ObjectPropertyValue $e "command")
+    if (($cmd -match 'dcg-pre-shell') -or ((Get-DcgCommandName $cmd) -in @('dcg', 'dcg.exe'))) {
+      $removed = $true; continue
+    }
+    $kept += $e
+  }
+  if (-not $removed) { return $false }
+  if ($kept.Count -gt 0) { Set-ObjectPropertyValue $hooks "beforeShellExecution" $kept }
+  else { Remove-ObjectPropertyValue $hooks "beforeShellExecution" }
+  if (Test-EmptyObject $hooks) { Remove-ObjectPropertyValue $config "hooks" }
+  $remainingKeys = @($config.PSObject.Properties.Name | Where-Object { $_ -ne 'version' })
+  if ($remainingKeys.Count -eq 0) {
+    Remove-Item -Force -LiteralPath $hooksFile  # dcg-created file; nothing left but version
+  } else {
+    [System.IO.File]::WriteAllText($hooksFile, ($config | ConvertTo-Json -Depth 20),
+      (New-Object System.Text.UTF8Encoding $false))
+  }
+  $true
+}
+
+function Unconfigure-CopilotHook {
+  # Remove dcg from a repo-local <repo>/.github/hooks/dcg.json (preToolUse[]):
+  # strip the dcg bash/powershell fields, drop an entry only if it has no other
+  # platform field, preserve coexisting hooks. Returns $true if removed.
+  param([string]$RepoRoot)
+  if ([string]::IsNullOrEmpty($RepoRoot)) {
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $false }
+    $RepoRoot = (& git rev-parse --show-toplevel 2>$null)
+    if ([string]::IsNullOrWhiteSpace($RepoRoot)) { return $false }
+    $RepoRoot = $RepoRoot.Trim()
+  }
+  $hookFile = Join-Path (Join-Path (Join-Path $RepoRoot ".github") "hooks") "dcg.json"
+  if (-not (Test-Path $hookFile -PathType Leaf)) { return $false }
+  try { $config = Get-Content -Raw -LiteralPath $hookFile | ConvertFrom-Json } catch { return $false }
+  if ($null -eq $config -or $config -isnot [psobject]) { return $false }
+  $hooks = Get-ObjectPropertyValue $config "hooks"
+  if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $false }
+  if (-not (Test-ObjectPropertyExists $hooks "preToolUse")) { return $false }
+  $entries = Get-JsonArray (Get-ObjectPropertyValue $hooks "preToolUse")
+  $kept = @()
+  $removed = $false
+  foreach ($e in $entries) {
+    if ($e -isnot [psobject]) { $kept += $e; continue }
+    foreach ($field in @("bash", "powershell")) {
+      $val = Get-ObjectPropertyValue $e $field
+      if ($null -ne $val -and ((Get-DcgCommandName ([string]$val)) -in @('dcg', 'dcg.exe'))) {
+        Remove-ObjectPropertyValue $e $field
+        $removed = $true
+      }
+    }
+    $hasPlatform = (Test-ObjectPropertyExists $e "bash") -or (Test-ObjectPropertyExists $e "powershell")
+    if ($hasPlatform) { $kept += $e }  # else: drop the now-empty dcg entry
+  }
+  if (-not $removed) { return $false }
+  if ($kept.Count -gt 0) { Set-ObjectPropertyValue $hooks "preToolUse" $kept }
+  else { Remove-ObjectPropertyValue $hooks "preToolUse" }
+  if (Test-EmptyObject $hooks) { Remove-ObjectPropertyValue $config "hooks" }
+  $remainingKeys = @($config.PSObject.Properties.Name | Where-Object { $_ -ne 'version' })
+  if ($remainingKeys.Count -eq 0) {
+    Remove-Item -Force -LiteralPath $hookFile
+  } else {
+    [System.IO.File]::WriteAllText($hookFile, ($config | ConvertTo-Json -Depth 20),
+      (New-Object System.Text.UTF8Encoding $false))
+  }
+  $true
+}
+
+function Unconfigure-HermesHook {
+  # Remove dcg from ~/.hermes/config.yaml. With powershell-yaml: strip the dcg
+  # pre_tool_call entry (leave hooks_auto_accept, which other hooks may rely on).
+  # Without the module: never edit arbitrary YAML — warn the user to remove it.
+  # Returns $true if removed.
+  param([string]$HomeDir = $HOME)
+  $cfg = Join-Path (Join-Path $HomeDir ".hermes") "config.yaml"
+  if (-not (Test-Path $cfg -PathType Leaf)) { return $false }
+  if ($null -eq (Get-Module -ListAvailable -Name powershell-yaml -ErrorAction SilentlyContinue)) {
+    Write-Warn "powershell-yaml not installed; remove the dcg entry from $cfg manually."
+    return $false
+  }
+  Import-Module powershell-yaml -ErrorAction SilentlyContinue
+  try { $doc = (Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Yaml) } catch { return $false }
+  if ($doc -isnot [System.Collections.IDictionary]) { return $false }
+  $hooks = $doc["hooks"]
+  if ($hooks -isnot [System.Collections.IDictionary]) { return $false }
+  $list = $hooks["pre_tool_call"]
+  if ($null -eq $list) { return $false }
+  $kept = @(@($list) | Where-Object {
+      -not (($_ -is [System.Collections.IDictionary]) -and
+            ((Get-DcgCommandName ([string]$_["command"])) -in @('dcg', 'dcg.exe')))
+    })
+  if ($kept.Count -eq @($list).Count) { return $false }
+  if ($kept.Count -gt 0) { $hooks["pre_tool_call"] = $kept } else { $hooks.Remove("pre_tool_call") }
+  [System.IO.File]::WriteAllText($cfg, (ConvertTo-Yaml $doc), (New-Object System.Text.UTF8Encoding $false))
+  $true
+}
+
+# Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the
+# functions above are available without running the uninstall body below.
+if ($LoadFunctionsOnly) { return }
+
 if ($Purge) {
   $KeepConfig = $false
   $KeepHistory = $false
@@ -261,6 +423,38 @@ if (Remove-DcgHooksFromJsonFile -Path $claudeSettings) {
 $codexHooks = Join-Path (Join-Path $HOME ".codex") "hooks.json"
 if (Remove-DcgHooksFromJsonFile -Path $codexHooks -DeleteEmptyFile) {
   Write-Ok "Removed Codex CLI hook"
+}
+
+# Gemini CLI (BeforeTool / run_shell_command).
+$geminiSettings = Join-Path (Join-Path $HOME ".gemini") "settings.json"
+if (Remove-DcgHooksFromJsonFile -Path $geminiSettings -EventName "BeforeTool" -Matcher "run_shell_command" -DeleteEmptyFile) {
+  Write-Ok "Removed Gemini CLI hook"
+}
+
+# Cursor IDE (hooks.json + PowerShell bridge).
+if (Unconfigure-CursorHook) { Write-Ok "Removed Cursor IDE hook + bridge" }
+
+# GitHub Copilot CLI (repo-local .github/hooks/dcg.json).
+if (Unconfigure-CopilotHook) { Write-Ok "Removed GitHub Copilot CLI hook (this repo)" }
+
+# Hermes Agent (~/.hermes/config.yaml).
+if (Unconfigure-HermesHook) { Write-Ok "Removed Hermes hook" }
+
+# Grok (xAI): ~/.grok/hooks/dcg.json is a dcg-OWNED file — delete it outright
+# (user-level and any project-local copy).
+foreach ($grokHook in @((Join-Path (Join-Path (Join-Path $HOME ".grok") "hooks") "dcg.json"),
+                        (Join-Path (Join-Path (Join-Path (Get-Location) ".grok") "hooks") "dcg.json"))) {
+  if (Test-Path $grokHook -PathType Leaf) {
+    Remove-Item -Force -LiteralPath $grokHook -ErrorAction SilentlyContinue
+    Write-Ok "Removed Grok hook ($grokHook)"
+  }
+}
+
+# Antigravity (agy): ~/.gemini/config/hooks.json uses the PreToolUse/Bash shape;
+# strip the dcg entry, preserving any coexisting hooks.
+$agyHooks = Join-Path (Join-Path (Join-Path $HOME ".gemini") "config") "hooks.json"
+if (Remove-DcgHooksFromJsonFile -Path $agyHooks -DeleteEmptyFile) {
+  Write-Ok "Removed Antigravity (agy) hook"
 }
 
 if (Test-Path $binary -PathType Leaf) {

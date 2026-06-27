@@ -11,7 +11,103 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [v0.1.0](https://github.com/quangdang46/destructive_command_guard/releases/tag/v0.1.0) -- 2026-06-21 [Release]
+## [v0.6.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.3) -- 2026-06-25 [Release]
+
+Patch release for Windows command normalization coverage.
+
+### Fixed
+
+- **Block wrapper flag-value command substitutions.** `env` and `sudo` wrapper
+  normalization no longer strips option values that contain command/process
+  substitutions, preserving destructive payloads for detection.
+- **Normalize quoted Windows binary paths with backslashes.** Quoted paths such
+  as `"C:\Program Files\Git\bin\git.exe" reset --hard` now normalize to the
+  `git` command instead of being mangled by escape handling.
+- **Tighten quick-reject keyword coverage.** Windows uppercase destructive
+  aliases and Redis-compatible `valkey-cli` / `keydb-cli` commands now reach the
+  destructive pattern matchers instead of being skipped by the fast path.
+
+## [v0.6.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.2) -- 2026-06-25 [Release]
+
+Patch release for the native-Windows installer.
+
+### Fixed
+
+- **Fix checksum resolution on Windows PowerShell 5.1.** GitHub release
+  sidecars such as `dcg-x86_64-pc-windows-msvc.zip.sha256` can be returned by
+  `Invoke-WebRequest` as `byte[]` when uploaded as octet-stream assets. The
+  installer now decodes byte-array checksum content as UTF-8 before parsing,
+  so the pinned one-liner verifies and installs the Windows zip correctly.
+
+## [v0.6.1](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.1) -- 2026-06-25 [Release]
+
+Patch release candidate for the native-Windows launch, superseding the
+unpublished `v0.6.0` tag.
+
+### Fixed
+
+- **Close an inline-script extraction under-block.** Interpreter wrapper flags
+  whose values are not simple barewords (`python -W ignore::... -c`, `node
+  --max-old-space-size 4096 -e`, `bash --rcfile /path -c`, PowerShell
+  `-Version 5.1 -Command`, and attached Perl flags like `-MFile::Spec`) are now
+  skipped correctly before extracting the dangerous inline script payload.
+- **Refresh Windows release docs.** README and `docs/windows.md` now describe
+  Windows x64 + ARM64 artifacts, the ARM64-to-x64 fallback for older releases,
+  the Windows Cursor PowerShell bridge, and the full PowerShell uninstall hook
+  coverage.
+
+## [v0.6.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.0) -- 2026-06-24 [Tag]
+
+Native Windows support, PowerShell installer automation, Windows release
+artifacts, heredoc data-sink masking for `git` stdin targets, plus a soundness
+fix to heredoc target resolution.
+
+### Added
+
+- **Native-Windows destructive-command protection.** New `windows.filesystem`
+  and `windows.system` packs are **on by default on Windows** — blocking cmd
+  `del /s`, `rd /s`, `format <drive>:`, PowerShell `Remove-Item -Recurse -Force`
+  (and aliases), `Clear-Content`/`Clear-RecycleBin`, plus `vssadmin delete
+  shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction),
+  `diskpart`, `Format-Volume`, `Clear-Disk`, `cipher /w`, and `bcdedit /delete`.
+  Opt-in `windows.misc` (`reg delete`, `net user /delete`, `wsl --unregister`,
+  `robocopy /MIR`) and `windows.powershell` (registry/provider deletes,
+  `Remove-LocalUser`, `Disable-ComputerRestore`, `Remove-VM`, …) packs round out
+  coverage. All patterns are case-insensitive.
+- **Windows-aware engine + scan.** Command normalization handles drive-letter
+  paths (`C:\Windows\System32\del.exe`) and case-insensitive verbs; `dcg scan`
+  now extracts commands from PowerShell (`.ps1`/`.psm1`/`.psd1`) and batch
+  (`.cmd`/`.bat`) scripts.
+- **Windows install one-liner + docs.** README gains the PowerShell
+  `& ([scriptblock]::Create((irm ".../install.ps1"))) -EasyMode -Verify`
+  installer; new [`docs/windows.md`](docs/windows.md) documents Windows behavior,
+  paths (`%ProgramData%\dcg` system layer), and limitations.
+- **Windows CI.** A `check (windows)` job (clippy + full test suite on
+  `windows-latest`, nightly/MSVC) now guards against Windows regressions.
+
+### Fixed
+
+- **Stop false positives on `git` commit/object messages read from stdin (#136,
+  data-sink half).** `git commit -F -`, `git commit --file=-` / `--file -` /
+  `-F-`, and `git hash-object --stdin` consume the heredoc body as *data* (a
+  commit/tag/note message or object content) that git never executes as shell.
+  Their heredoc body is now masked out of the raw-shell rescan exactly like
+  `cat`/`tee` (#109), so a commit message that merely contains "restore" or
+  "reset --hard" no longer trips the `core.git:*` rules. The unsound
+  interpreter-stdin case (`python3 -`/`node -`, whose body *is* executed) remains
+  deliberately unmasked.
+- **Soundness: heredoc target resolution is now bounded to the heredoc's own
+  physical line.** `tokenize_backwards` does not treat newlines as command
+  boundaries, so an unbounded backward scan could resolve a data-sink target (or
+  the new git stdin sentinel) from an *earlier* line and mask a *later*,
+  genuinely-executing heredoc body — e.g. `cat f\nbash <<EOF\nrm -rf /\nEOF` or
+  `git commit -F - f\nbash <<EOF\nrm -rf /\nEOF` were wrongly allowed. Both
+  `extract_heredoc_target_command` and the new `is_git_stdin_data_sink` now scan
+  only the heredoc operator's own line. This closes a false negative (the
+  conservative direction: at worst a false positive, never a missed destructive
+  command). Found via adversarial review.
+
+## [v0.5.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.6) -- 2026-05-26 [Release]
 
 Port of upstream changes from commits #125-#141.
 

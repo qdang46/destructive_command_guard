@@ -1,10 +1,14 @@
-//! Terraform patterns - protections against destructive terraform commands.
+//! Terraform/OpenTofu patterns - protections against destructive commands.
+//!
+//! OpenTofu (`tofu`) is a drop-in fork of Terraform with an identical CLI
+//! surface, so every rule here matches both the `terraform` and `tofu`
+//! binaries via a leading `(?:terraform|tofu)\b` anchor.
 //!
 //! This includes patterns for:
-//! - terraform destroy
-//! - terraform taint
-//! - terraform apply with -auto-approve
-//! - terraform state rm
+//! - terraform/tofu destroy
+//! - terraform/tofu taint
+//! - terraform/tofu apply with -auto-approve
+//! - terraform/tofu state rm
 
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
@@ -15,9 +19,9 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "infrastructure.terraform".to_string(),
         name: "Terraform",
-        description: "Protects against destructive Terraform operations like destroy, \
-                      taint, and apply with -auto-approve",
-        keywords: &["terraform", "destroy", "taint", "state"],
+        description: "Protects against destructive Terraform/OpenTofu operations like \
+                      destroy, taint, and apply with -auto-approve",
+        keywords: &["terraform", "tofu", "destroy", "taint", "state"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -37,56 +41,56 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // plan is safe (read-only)
         safe_pattern!(
             "terraform-plan",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s|$)(?!\s+.*-destroy)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s|$)(?!\s+.*-destroy)"
         ),
         // init is safe
         safe_pattern!(
             "terraform-init",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s|$)"
         ),
         // validate is safe
         safe_pattern!(
             "terraform-validate",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s|$)"
         ),
         // fmt is safe
         safe_pattern!(
             "terraform-fmt",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s|$)"
         ),
         // show is safe
         safe_pattern!(
             "terraform-show",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s|$)"
         ),
         // output is safe
         safe_pattern!(
             "terraform-output",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s|$)"
         ),
         // state list/show are safe (read-only)
         safe_pattern!(
             "terraform-state-list",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s|$)"
         ),
         safe_pattern!(
             "terraform-state-show",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s|$)"
         ),
         // graph is safe
         safe_pattern!(
             "terraform-graph",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s|$)"
         ),
         // version is safe
         safe_pattern!(
             "terraform-version",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s|$)"
         ),
         // providers is safe
         safe_pattern!(
             "terraform-providers",
-            r"terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s|$)"
+            r"(?:terraform|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s|$)"
         ),
     ]
 }
@@ -97,8 +101,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // broader destroy rule so the preview keeps its Medium severity.
         destructive_pattern!(
             "plan-destroy",
-            r"terraform\b.*?\bplan\s+.*-destroy",
-            "terraform plan -destroy shows what would be destroyed. Review carefully before applying.",
+            r"(?:terraform|tofu)\b.*?\bplan\s+.*-destroy",
+            "terraform/tofu plan -destroy shows what would be destroyed. Review carefully before applying.",
             Medium,
             "terraform plan -destroy shows destruction preview:\n\n\
              - This is a read-only operation (safe to run)\n\
@@ -110,8 +114,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // (a plan file literally named `destroy-plan.tf`) doesn't false-match.
         destructive_pattern!(
             "destroy",
-            r"terraform\b.*?\bdestroy(?=\s|$)",
-            "terraform destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first.",
+            r"(?:terraform|tofu)\b.*?\bdestroy(?=\s|$)",
+            "terraform/tofu destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first.",
             Critical,
             "terraform destroy removes ALL managed infrastructure:\n\n\
              - Every resource in your state file is destroyed\n\
@@ -123,8 +127,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // apply with -auto-approve (skips confirmation)
         destructive_pattern!(
             "apply-auto-approve",
-            r"terraform\b.*?\bapply\s+.*-auto-approve",
-            "terraform apply -auto-approve skips confirmation. Remove -auto-approve for safety.",
+            r"(?:terraform|tofu)\b.*?\bapply\s+.*-auto-approve",
+            "terraform/tofu apply -auto-approve skips confirmation. Remove -auto-approve for safety.",
             High,
             "terraform apply -auto-approve skips confirmation:\n\n\
              - No opportunity to review changes before applying\n\
@@ -135,8 +139,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // taint marks resource for recreation
         destructive_pattern!(
             "taint",
-            r"terraform\b.*?\btaint\b",
-            "terraform taint marks a resource to be destroyed and recreated on next apply.",
+            r"(?:terraform|tofu)\b.*?\btaint\b",
+            "terraform/tofu taint marks a resource to be destroyed and recreated on next apply.",
             High,
             "terraform taint marks resource for recreation:\n\n\
              - Resource will be destroyed on next apply\n\
@@ -148,8 +152,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // state rm removes from state (orphans resource)
         destructive_pattern!(
             "state-rm",
-            r"terraform\b.*?\bstate\s+rm\b",
-            "terraform state rm removes resource from state without destroying it. Resource becomes unmanaged.",
+            r"(?:terraform|tofu)\b.*?\bstate\s+rm\b",
+            "terraform/tofu state rm removes resource from state without destroying it. Resource becomes unmanaged.",
             High,
             "terraform state rm orphans resources:\n\n\
              - Resource removed from Terraform state\n\
@@ -161,8 +165,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // state mv can cause issues if done incorrectly
         destructive_pattern!(
             "state-mv",
-            r"terraform\b.*?\bstate\s+mv\b",
-            "terraform state mv moves resources in state. Incorrect moves can cause resource recreation.",
+            r"(?:terraform|tofu)\b.*?\bstate\s+mv\b",
+            "terraform/tofu state mv moves resources in state. Incorrect moves can cause resource recreation.",
             High,
             "terraform state mv moves resources in state:\n\n\
              - Renames resource address in state file\n\
@@ -174,8 +178,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // force-unlock
         destructive_pattern!(
             "force-unlock",
-            r"terraform\b.*?\bforce-unlock\b",
-            "terraform force-unlock removes state lock. Only use if lock is stale.",
+            r"(?:terraform|tofu)\b.*?\bforce-unlock\b",
+            "terraform/tofu force-unlock removes state lock. Only use if lock is stale.",
             High,
             "terraform force-unlock removes state locks:\n\n\
              - Forces removal of a state lock\n\
@@ -187,8 +191,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // workspace delete
         destructive_pattern!(
             "workspace-delete",
-            r"terraform\b.*?\bworkspace\s+delete\b",
-            "terraform workspace delete removes a workspace. Ensure it's not in use.",
+            r"(?:terraform|tofu)\b.*?\bworkspace\s+delete\b",
+            "terraform/tofu workspace delete removes a workspace. Ensure it's not in use.",
             Medium,
             "terraform workspace delete removes workspace:\n\n\
              - Workspace and its state file deleted\n\
@@ -329,5 +333,136 @@ mod tests {
         assert_no_match(&pack, "ls -la");
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo terraform");
+    }
+
+    // --- OpenTofu (`tofu`) parity -------------------------------------------
+    //
+    // OpenTofu is a drop-in fork of Terraform with an identical CLI surface,
+    // so every rule that fires for `terraform <x>` must fire identically for
+    // `tofu <x>`. Two things make this work and these tests pin both:
+    //   1. The leading `(?:terraform|tofu)\b` anchor on every pattern.
+    //   2. The `keywords` array (used by the `might_match` quick-reject) lists
+    //      "tofu" — without it, `tofu apply -auto-approve` / `force-unlock` /
+    //      `workspace delete` carry no other keyword and would be rejected
+    //      before any regex ran.
+
+    #[test]
+    fn tofu_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks(&pack, "tofu destroy", "destroy");
+        assert_blocks(&pack, "tofu plan -destroy", "plan -destroy");
+        assert_blocks(&pack, "tofu apply -auto-approve", "auto-approve");
+        assert_blocks(&pack, "tofu taint aws_instance.web", "taint");
+        assert_blocks(&pack, "tofu state rm aws_s3_bucket.data", "state rm");
+        assert_blocks(
+            &pack,
+            "tofu state mv aws_instance.a aws_instance.b",
+            "state mv",
+        );
+        assert_blocks(&pack, "tofu force-unlock 12345", "force-unlock");
+        assert_blocks(&pack, "tofu workspace delete staging", "workspace delete");
+    }
+
+    #[test]
+    fn tofu_blocks_with_correct_severity() {
+        // Severity must be identical to the terraform equivalents.
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "tofu destroy", Severity::Critical);
+        assert_blocks_with_severity(&pack, "tofu plan -destroy", Severity::Medium);
+        assert_blocks_with_severity(&pack, "tofu apply -auto-approve", Severity::High);
+        assert_blocks_with_severity(&pack, "tofu taint aws_instance.x", Severity::High);
+        assert_blocks_with_severity(&pack, "tofu state rm aws_instance.x", Severity::High);
+        assert_blocks_with_severity(&pack, "tofu state mv a b", Severity::High);
+        assert_blocks_with_severity(&pack, "tofu force-unlock 123", Severity::High);
+        assert_blocks_with_severity(&pack, "tofu workspace delete dev", Severity::Medium);
+    }
+
+    #[test]
+    fn tofu_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "tofu plan");
+        assert_safe_pattern_matches(&pack, "tofu init");
+        assert_safe_pattern_matches(&pack, "tofu validate");
+        assert_safe_pattern_matches(&pack, "tofu fmt");
+        assert_safe_pattern_matches(&pack, "tofu show");
+        assert_safe_pattern_matches(&pack, "tofu output");
+        assert_safe_pattern_matches(&pack, "tofu state list");
+        assert_safe_pattern_matches(&pack, "tofu state show aws_instance.web");
+        assert_safe_pattern_matches(&pack, "tofu graph");
+        assert_safe_pattern_matches(&pack, "tofu version");
+        assert_safe_pattern_matches(&pack, "tofu providers");
+    }
+
+    #[test]
+    fn tofu_interactive_apply_is_allowed() {
+        // Interactive `apply` (no -auto-approve) is intentionally NOT blocked,
+        // for parity with terraform — not stricter.
+        let pack = create_pack();
+        assert_allows(&pack, "tofu apply");
+    }
+
+    #[test]
+    fn tofu_patterns_match_with_chdir_flag() {
+        // The global `-chdir=<path>` flag precedes the subcommand for tofu
+        // exactly as it does for terraform.
+        let pack = create_pack();
+        assert_blocks(&pack, "tofu -chdir=./environments/prod destroy", "destroy");
+        assert_blocks(
+            &pack,
+            "tofu -chdir=./prod apply -auto-approve",
+            "auto-approve",
+        );
+        assert_blocks(
+            &pack,
+            "tofu -chdir=./prod state rm aws_instance.important",
+            "state",
+        );
+        assert_blocks(
+            &pack,
+            "tofu -chdir=./prod workspace delete prod-old",
+            "workspace",
+        );
+        assert_blocks(
+            &pack,
+            "tofu -chdir=./prod force-unlock abc123",
+            "force-unlock",
+        );
+    }
+
+    #[test]
+    fn tofu_safe_patterns_do_not_bypass_via_flag_value() {
+        // A flag value like `-chdir=./plan-output` must not falsely match a
+        // safe pattern and let a destructive command through.
+        let pack = create_pack();
+        assert_allows(&pack, "tofu plan");
+        assert_allows(&pack, "tofu -chdir=./prod plan");
+        assert_allows(&pack, "tofu show");
+        assert_allows(&pack, "tofu state list");
+        // Genuine destructive still blocks.
+        assert_blocks(&pack, "tofu destroy -auto-approve", "destroy");
+    }
+
+    #[test]
+    fn tofu_destroy_does_not_false_match_plan_file_name() {
+        // A plan file literally named `destroy-plan.tf` must not trip the
+        // destroy rule (the trailing `(?=\s|$)` guards this).
+        let pack = create_pack();
+        assert_allows(&pack, "tofu apply destroy-plan.tf");
+    }
+
+    #[test]
+    fn tofu_subcommand_as_substring_does_not_bypass() {
+        // A trailing arg containing a safe subcommand as a substring (e.g.
+        // "plan-stack") must not short-circuit a destructive command as safe.
+        let pack = create_pack();
+        assert_blocks(&pack, "tofu destroy plan-stack", "destroy");
+        assert_blocks(&pack, "tofu destroy init-resources", "destroy");
+    }
+
+    #[test]
+    fn tofu_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "echo tofu");
+        assert_no_match(&pack, "cat tofu-notes.txt");
     }
 }

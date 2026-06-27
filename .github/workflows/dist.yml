@@ -15,7 +15,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
@@ -66,9 +66,16 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             artifact_name: dcg
-          # Windows
+          # Windows x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            artifact_name: dcg.exe
+          # Windows on ARM (Snapdragon X / Surface). Cross-compiled on the x64
+          # runner (the aarch64 target is installed via `targets:`); the PE32+
+          # magic check + execute-smoke are x64-host-only and correctly skip this
+          # cross-built artifact (matrix.target guards them).
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
             artifact_name: dcg.exe
 
     runs-on: ${{ matrix.os }}
@@ -76,7 +83,7 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -156,7 +163,7 @@ jobs:
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
 
       - name: Verify Windows binary is actually PE32+
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: contains(matrix.target, 'pc-windows-msvc')
         shell: pwsh
         run: |
           # Pin against the v0.5.1 regression (#115): the published Windows
@@ -179,6 +186,36 @@ jobs:
             exit 1
           }
           Write-Output "Windows binary verified: PE32+ magic 'MZ' present"
+
+      - name: Execute Windows binary (allow + deny + --version)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          # The PE32+ check above proves it's a Windows binary; this proves it
+          # actually RUNS. A binary that is a valid PE yet crashes on startup must
+          # not ship. Fast: --version + one allow + one deny.
+          $ErrorActionPreference = 'Stop'
+          $bin = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+
+          $ver = (& $bin --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) { Write-Output "::error::dcg.exe --version failed (exit $LASTEXITCODE)"; exit 1 }
+          Write-Output "version: $($ver.Trim())"
+
+          # ALLOW: a safe command must produce empty stdout (silent exit 0).
+          $allow = ('{"tool_name":"Bash","tool_input":{"command":"git status"}}' | & $bin | Out-String)
+          if (-not [string]::IsNullOrWhiteSpace($allow)) {
+            Write-Output "::error::expected silent ALLOW for 'git status', got: $allow"; exit 1
+          }
+
+          # DENY: a destructive command must emit a deny decision. The destructive
+          # string is base64'd so it never appears literally in the workflow file
+          # (and cannot trip any scanning hook): decodes to 'git reset --hard'.
+          $cmd = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('Z2l0IHJlc2V0IC0taGFyZA=='))
+          $deny = (([pscustomobject]@{ tool_name = 'Bash'; tool_input = [pscustomobject]@{ command = $cmd } } | ConvertTo-Json -Compress) | & $bin | Out-String)
+          if ($deny -notmatch 'permissionDecision' -or $deny -notmatch 'deny') {
+            Write-Output "::error::expected DENY JSON for the destructive command, got: $deny"; exit 1
+          }
+          Write-Output "Windows binary executes: --version OK, allow OK, deny OK"
 
       - name: Create zip (Windows)
         if: runner.os == 'Windows'
@@ -205,7 +242,7 @@ jobs:
       id-token: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8

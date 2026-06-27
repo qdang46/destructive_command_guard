@@ -386,3 +386,107 @@ fn test_hook_output_remediation_safe_alternative() {
         }
     }
 }
+
+// ============================================================================
+// Antigravity CLI (`agy`) end-to-end hook integration.
+//
+// Feeds the dcg binary the exact stdin envelope that `agy` passes to a
+// PreToolUse hook (captured empirically in a sandboxed $HOME) and asserts dcg
+// emits the block decision that `agy` honors. This is the live wire-format
+// contract: `agy` reads {"decision":"block","reason":...} from stdout (exit 0)
+// and aborts its `run_command` tool. A fully-interactive live-fire block (the
+// model actually being prevented from running the command) was verified
+// manually against the real `agy` binary in a sandbox HOME; that path needs an
+// authenticated, interactive `agy` session and is not reproducible in CI, so
+// here we lock down the byte-level request/response contract instead.
+// ============================================================================
+
+/// Run dcg in hook mode with a raw JSON envelope (for non-Claude wire shapes).
+fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
+    let mut child = Command::new(dcg_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn dcg process");
+
+    {
+        let stdin = child.stdin.as_mut().expect("failed to get stdin");
+        stdin
+            .write_all(input.as_bytes())
+            .expect("failed to write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("failed to wait for dcg");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+    (stdout, stderr, exit_code)
+}
+
+#[test]
+fn test_antigravity_envelope_produces_block_decision() {
+    // Exact agy stdin shape captured from a real `agy` PreToolUse hook run.
+    let input = r#"{
+        "artifactDirectoryPath":"/tmp/.gemini/brain/abc",
+        "conversationId":"a3bbcaba-0bb2-4e58-b614-49f42fa6f004",
+        "stepIdx":4,
+        "toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard","Cwd":"/work","WaitMsBeforeAsync":500}},
+        "transcriptPath":"/tmp/.gemini/brain/abc/transcript_full.jsonl",
+        "workspacePaths":["/work"]
+    }"#;
+
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+
+    // `agy` only blocks on exit 0 + JSON (a non-zero exit is merely logged).
+    assert_eq!(
+        exit_code, 0,
+        "agy hook must exit 0 so the JSON block decision is honored\nstderr: {stderr}"
+    );
+    assert!(!stdout.is_empty(), "stdout must carry the block JSON");
+
+    let json: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("agy hook output must be valid JSON");
+
+    assert_eq!(
+        json["decision"], "block",
+        "agy block decision must use the \"block\" keyword"
+    );
+    assert!(
+        json["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "block must carry a non-empty reason, got: {}",
+        json["reason"]
+    );
+    // Must NOT emit Claude's hookSpecificOutput envelope (agy uses decision/reason).
+    assert!(
+        json.get("hookSpecificOutput").is_none(),
+        "agy output must not use Claude's hookSpecificOutput shape"
+    );
+}
+
+#[test]
+fn test_antigravity_envelope_allows_safe_command() {
+    // A benign command must NOT block: agy gets an explicit allow (or no JSON
+    // block), and the tool proceeds.
+    let input = r#"{
+        "conversationId":"c1",
+        "stepIdx":1,
+        "toolCall":{"name":"run_command","args":{"CommandLine":"echo hello","Cwd":"/work"}},
+        "workspacePaths":["/work"]
+    }"#;
+
+    let (stdout, stderr, exit_code) = run_hook_mode_raw(input);
+    assert_eq!(exit_code, 0, "safe command must exit 0\nstderr: {stderr}");
+
+    // dcg emits nothing (allow) or an explicit non-block decision for safe
+    // commands; in either case there must be no "block"/"deny" decision.
+    if !stdout.trim().is_empty() {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+            let decision = json.get("decision").and_then(|d| d.as_str());
+            assert!(
+                decision != Some("block") && decision != Some("deny"),
+                "safe command must not be blocked, got decision: {decision:?}"
+            );
+        }
+    }
+}

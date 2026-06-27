@@ -697,14 +697,7 @@ pub fn log_maintenance(
         return Ok(());
     }
 
-    let path = if log_file.starts_with("~/") {
-        std::env::var_os("HOME").map_or_else(
-            || PathBuf::from(log_file),
-            |home| PathBuf::from(format!("{}{}", home.to_string_lossy(), &log_file[1..])),
-        )
-    } else {
-        PathBuf::from(log_file)
-    };
+    let path = expand_log_path(log_file);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -728,14 +721,7 @@ pub fn log_maintenance(
 ///
 /// Returns any I/O errors encountered while opening or appending to the log file.
 pub fn log_allow_once_action(log_file: &str, action: &str, details: &str) -> io::Result<()> {
-    let path = if log_file.starts_with("~/") {
-        std::env::var_os("HOME").map_or_else(
-            || PathBuf::from(log_file),
-            |home| PathBuf::from(format!("{}{}", home.to_string_lossy(), &log_file[1..])),
-        )
-    } else {
-        PathBuf::from(log_file)
-    };
+    let path = expand_log_path(log_file);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1090,14 +1076,23 @@ pub fn log_entry_consumed(
 }
 
 fn expand_log_path(log_file: &str) -> PathBuf {
-    if log_file.starts_with("~/") {
-        std::env::var_os("HOME").map_or_else(
-            || PathBuf::from(log_file),
-            |home| PathBuf::from(format!("{}{}", home.to_string_lossy(), &log_file[1..])),
-        )
-    } else {
-        PathBuf::from(log_file)
+    // Expand a leading `~/` or `~\` using $HOME first (honored for test
+    // isolation), then the platform home dir (USERPROFILE on Windows) via the
+    // `dirs` crate. On native Windows `HOME` is normally unset, so without the
+    // fallback a `~`-prefixed log path would collapse into a junk relative path.
+    let Some(rest) = log_file
+        .strip_prefix("~/")
+        .or_else(|| log_file.strip_prefix("~\\"))
+    else {
+        return PathBuf::from(log_file);
+    };
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(home).join(rest);
     }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(rest);
+    }
+    PathBuf::from(log_file)
 }
 
 fn redact_for_log(command: &str, redaction: &RedactionConfig) -> String {
@@ -1431,6 +1426,37 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("pending.jsonl");
         (PendingExceptionStore::new(path), dir)
+    }
+
+    #[test]
+    fn expand_log_path_handles_tilde_forms() {
+        // Resolve the home base the same way the helper does, so the assertion
+        // holds whether $HOME is set (Unix/test) or only USERPROFILE is
+        // (native Windows). `~/x` and `~\x` must both anchor under home; bare
+        // paths and `~`-in-the-middle are returned unchanged.
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir);
+
+        if let Some(home) = home {
+            assert_eq!(expand_log_path("~/logs/dcg.log"), home.join("logs/dcg.log"));
+            assert_eq!(
+                expand_log_path("~\\logs\\dcg.log"),
+                home.join("logs\\dcg.log")
+            );
+        }
+
+        // No tilde prefix => unchanged.
+        assert_eq!(
+            expand_log_path("/var/log/dcg.log"),
+            PathBuf::from("/var/log/dcg.log")
+        );
+        // Tilde not at the start is not expanded.
+        assert_eq!(
+            expand_log_path("/data/~user/x.log"),
+            PathBuf::from("/data/~user/x.log")
+        );
     }
 
     fn redaction_config() -> RedactionConfig {

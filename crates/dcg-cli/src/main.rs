@@ -157,6 +157,132 @@ fn effective_agent_for_hook_protocol(
     }
 }
 
+/// Handle hook input that could not be parsed (issue #160).
+///
+/// Records an audit-trail entry to history — so operators can see malformed
+/// inputs even though dcg fails open by default — and, when fail-closed mode is
+/// enabled (`DCG_FAIL_CLOSED` / `general.fail_closed`) AND the failure is a JSON
+/// parse error, emits a Claude-compatible deny so the agent blocks the command
+/// instead of silently allowing it. Transient IO errors keep the historic
+/// fail-open behavior even under fail-closed, since they are not attacker-
+/// controlled malformed payloads.
+/// Map an env/process-detected [`Agent`] to its hook wire protocol.
+///
+/// Used when dcg must emit a denial WITHOUT a parsed payload (a fail-closed
+/// parse failure, issue #160): protocol detection normally reads the payload,
+/// which is exactly what failed here, so fall back to the detected agent so the
+/// deny matches what that agent actually understands (e.g. Codex needs exit 2,
+/// not Claude's `hookSpecificOutput` JSON).
+fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
+    match agent {
+        Agent::CodexCli => hook::HookProtocol::Codex,
+        Agent::GeminiCli => hook::HookProtocol::Gemini,
+        Agent::CopilotCli => hook::HookProtocol::Copilot,
+        Agent::Hermes => hook::HookProtocol::Hermes,
+        Agent::Grok => hook::HookProtocol::Grok,
+        Agent::Antigravity => hook::HookProtocol::Antigravity,
+        _ => hook::HookProtocol::ClaudeCompatible,
+    }
+}
+
+fn handle_unparseable_hook_input(
+    config: &Config,
+    detected_agent: &Agent,
+    read_err: &hook::HookReadError,
+    max_input_bytes: usize,
+) {
+    // Block when fail-closed AND the failure is an attacker-influenceable
+    // payload problem: a JSON parse error OR an oversized input (padding a
+    // command past the size limit must not skip evaluation under fail-closed —
+    // issue #160). Transient IO read errors always fail open; they are not
+    // malformed payloads.
+    let blockable = matches!(
+        read_err,
+        hook::HookReadError::Json(_) | hook::HookReadError::InputTooLarge(_)
+    );
+    let block = blockable && config.is_fail_closed();
+
+    // Audit trail: record the event to history (best-effort, never fatal).
+    if config.history.enabled {
+        let working_dir = std::env::current_dir().ok().map_or_else(
+            || "<unknown>".to_string(),
+            |p| p.to_string_lossy().to_string(),
+        );
+        let outcome = if block {
+            HistoryOutcome::Deny
+        } else {
+            HistoryOutcome::Allow
+        };
+        let writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let entry = build_history_entry(
+            detected_agent.config_key(),
+            "<unparseable hook input>",
+            &working_dir,
+            outcome,
+            Duration::ZERO,
+            None,
+            None,
+            Some("parse-error"),
+        );
+        writer.log(entry);
+        // Flush synchronously: the deny path may std::process::exit (Codex),
+        // which skips Drop, and the fall-through path returns immediately.
+        writer.flush_sync();
+    }
+
+    if !block {
+        // Fail-open (default). Keep the historic oversized-input warning so an
+        // operator can see why a large command was allowed; other errors warn
+        // only under verbose.
+        match read_err {
+            hook::HookReadError::InputTooLarge(len) => {
+                eprintln!(
+                    "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
+                );
+            }
+            _ if config.general.verbose => {
+                eprintln!(
+                    "[dcg] Warning: could not parse hook input; allowing command (fail-open)"
+                );
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Fail-closed: emit an agent-appropriate denial. Without a parsed payload we
+    // cannot run protocol detection, so derive the protocol from the
+    // env/process-detected agent.
+    let protocol = hook_protocol_for_agent(detected_agent);
+    let reason = if matches!(read_err, hook::HookReadError::InputTooLarge(_)) {
+        "BLOCKED by dcg: the hook input exceeds the size limit and cannot be evaluated; \
+         DCG_FAIL_CLOSED is set (fail-closed mode)."
+    } else {
+        "BLOCKED by dcg: the hook input could not be parsed; DCG_FAIL_CLOSED is set \
+         (fail-closed mode). Fix the malformed hook payload or unset DCG_FAIL_CLOSED."
+    };
+    hook::output_denial_for_protocol(
+        protocol,
+        "<unparseable hook input>",
+        reason,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+    );
+
+    // Codex ignores stdout JSON; only exit 2 + the stderr reason makes the
+    // block stick (mirrors the normal deny path). History was already flushed.
+    if matches!(protocol, hook::HookProtocol::Codex) {
+        std::process::exit(2);
+    }
+}
+
 /// Process-wide registry of shutdown actions.
 ///
 /// `std::process::exit` skips Drop, so any subsystem with cross-call buffered
@@ -461,13 +587,16 @@ fn main() {
     let max_input_bytes = config.general.max_hook_input_bytes();
     let hook_input = match hook::read_hook_input(max_input_bytes) {
         Ok(input) => input,
-        Err(hook::HookReadError::InputTooLarge(len)) => {
-            eprintln!(
-                "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
-            );
+        Err(read_err) => {
+            // Malformed, oversized, or unreadable hook input. The default is
+            // fail-open (allow), but we (a) record an audit-trail entry to
+            // history so operators can see it, and (b) BLOCK instead of allow
+            // when fail-closed mode is enabled — including oversized input,
+            // which is attacker-controllable (issue #160). Routing oversized
+            // input through the same handler is what closes the size-bypass.
+            handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
             return;
         }
-        Err(_) => return, // Fail open on IO or JSON errors
     };
 
     // Start evaluation deadline after input size checks (includes evaluation).
@@ -1041,9 +1170,13 @@ fn print_help() {
         "DCG_NO_COLOR".green()
     );
     eprintln!(
-        "    {}=text|json|sarif  Default output format (command-specific)",
+        "    {}=text|json|sarif  Default output format (command-specific).",
         "DCG_FORMAT".green()
     );
+    eprintln!("                          `sarif` is real SARIF only for `dcg scan`; on every");
+    eprintln!("                          other command `sarif`/`structured` is an alias for");
+    eprintln!("                          JSON, and `text` an alias for pretty. Per-command");
+    eprintln!("                          accepted values: see `dcg <command> --help`.");
     eprintln!(
         "    {}=/path  Use explicit config file",
         "DCG_CONFIG".green()
@@ -1055,6 +1188,10 @@ fn print_help() {
     eprintln!(
         "    {}=1      Robot mode for AI agents (JSON output, no stderr)",
         "DCG_ROBOT".green()
+    );
+    eprintln!(
+        "    {}=1  Block (deny) on unparseable hook input (default: fail-open)",
+        "DCG_FAIL_CLOSED".green()
     );
     eprintln!();
 

@@ -1,9 +1,10 @@
 # dcg on Windows (native)
 
-dcg runs as a **native Windows** binary (`x86_64-pc-windows-msvc`), not just under
-WSL. This page documents Windows-specific behavior, paths, default protection, and
-honest limitations. (Under WSL, dcg behaves exactly as on Linux — this page is
-about the native `dcg.exe`.)
+dcg runs as a **native Windows** binary (`x86_64-pc-windows-msvc` or
+`aarch64-pc-windows-msvc`), not just under WSL. This page documents
+Windows-specific behavior, paths, default protection, and honest limitations.
+(Under WSL, dcg behaves exactly as on Linux — this page is about the native
+`dcg.exe`.)
 
 ## Install / update / uninstall
 
@@ -19,9 +20,12 @@ Install with PowerShell:
 - `-Version vX.Y.Z` pins a specific release; `-Dest <dir>` changes the install
   location; `-ArtifactUrl <url|file://>` installs from a specific artifact.
 
-The installer downloads `dcg-x86_64-pc-windows-msvc.zip`, **verifies the SHA256
-checksum** (required), and verifies the **Sigstore/cosign** signature when
-`cosign` is on `PATH` (falls back to checksum-only otherwise).
+The installer auto-selects `dcg-x86_64-pc-windows-msvc.zip` or
+`dcg-aarch64-pc-windows-msvc.zip` from the host architecture, falling back to
+the x64 artifact under Windows-on-ARM emulation if an older release has no
+native ARM64 asset. It **verifies the SHA256 checksum** (required), and verifies
+the **Sigstore/cosign** signature when `cosign` is on `PATH` (falls back to
+checksum-only otherwise).
 
 Update via the built-in updater (re-runs `install.ps1`):
 
