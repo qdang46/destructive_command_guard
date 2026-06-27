@@ -44,8 +44,6 @@ pub mod strict_git;
 pub mod system;
 pub mod windows;
 
-pub mod windows;
-
 // Testing infrastructure
 pub mod test_helpers;
 #[cfg(test)]
