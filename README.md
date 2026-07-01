@@ -245,8 +245,9 @@ it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection
 
 ### Infrastructure Packs
 - `infrastructure.ansible` - Protects against destructive Ansible operations like dangerous shell commands and unchecked playbook runs.
+- `infrastructure.atmos` - Protects against destructive Atmos operations like terraform deploy (auto-approve), destroy, clean, state rm/taint, and helmfile destroy.
 - `infrastructure.pulumi` - Protects against destructive Pulumi operations like destroy and up with -y (auto-approve).
-- `infrastructure.terraform` - Protects against destructive Terraform operations like destroy, taint, and apply with -auto-approve.
+- `infrastructure.terraform` - Protects against destructive Terraform/OpenTofu operations like destroy, taint, and apply with -auto-approve.
 
 ### System Packs
 - `system.disk` - Protects against destructive disk operations including dd to devices, mkfs, partition table modifications (fdisk/parted), RAID management (mdadm), btrfs filesystem operations, device-mapper (dmsetup), network block devices (nbd-client), and LVM commands (pvremove, vgremove, lvremove, lvreduce, pvmove).

@@ -489,6 +489,20 @@ fn test_audit_backtracking_requirements() {
             HashSet::from(["playbook-all-hosts"]),
         ),
         (
+            "infrastructure.atmos",
+            HashSet::from([
+                "atmos-clean",
+                "atmos-deploy",
+                "atmos-destroy",
+                "atmos-helmfile-destroy",
+                "atmos-helmfile-diff",
+                "atmos-terraform-apply",
+                "atmos-terraform-output",
+                "atmos-terraform-plan",
+                "atmos-terraform-validate",
+            ]),
+        ),
+        (
             "infrastructure.pulumi",
             HashSet::from([
                 "destroy",

@@ -613,6 +613,189 @@ pub fn is_builtin_inspection_wrapper_call(command: &str) -> bool {
         .any(|prefix| command_prefix_safely_matches(command, prefix))
 }
 
+/// dcg's own *diagnostic* subcommands that consume a candidate command as data
+/// and report a decision without ever executing it.
+///
+/// These are deliberately limited to the read-only inspection surface — no
+/// dcg subcommand executes its argument, but restricting the exemption to this
+/// exact set keeps the contract tight and future-proof (a hypothetical
+/// command-running subcommand could never be smuggled through it). See dcg#170.
+const DCG_INSPECTION_SUBCOMMANDS: &[&str] = &["test", "explain", "classify"];
+
+/// Returns `true` when `command` is one of dcg's own non-executing diagnostic
+/// invocations (`dcg test`, `dcg explain`, `dcg classify`) with a candidate
+/// command supplied purely as data — see dcg#170.
+///
+/// # Why this is needed
+///
+/// When dcg is installed as a PreToolUse hook it scans the raw command line.
+/// An agent running `dcg explain "<candidate>"` to investigate a false positive
+/// would otherwise be blocked because the candidate appears (as inert text)
+/// inside the diagnostic invocation. `dcg test` / `dcg explain` / `dcg classify`
+/// never execute the candidate, so the invocation itself is safe regardless of
+/// how dangerous the candidate looks.
+///
+/// # Why this is not a bypass
+///
+/// The command is shell-split with the project's quote/substitution-aware
+/// [`crate::packs::split_command_segments`], and **every** resulting segment
+/// must independently be a bare dcg diagnostic call:
+///
+/// - Chained commands (`dcg test x; rm -rf /`, `... && reboot`, `... | sh`)
+///   split into multiple segments; the non-dcg segment fails the check, so the
+///   whole command falls through to normal pack evaluation.
+/// - Command/process substitutions (`dcg test "$(rm -rf /)"`, `<(...)`,
+///   backticks) are emitted as their own inner segments by the splitter, so the
+///   substituted command is evaluated normally.
+/// - Output redirections (`dcg test x > /etc/passwd`) are detected per-segment
+///   by [`parse_simple_command_argv`] (which bails on any unquoted redirect),
+///   so a redirect that could clobber a sensitive file is never exempted.
+///
+/// Because the per-segment tokenizer models shell quoting the same way bash does
+/// (single, double, and `$'...'` ANSI-C quoting, plus backslash escapes), a
+/// metacharacter that bash would treat as active is also seen as active here and
+/// refuses the exemption; one that is merely quoted data (e.g.
+/// `dcg test "rm -rf /; reboot"`) stays inside the candidate argument and is
+/// correctly exempted.
+#[must_use]
+pub fn is_dcg_self_inspection_call(command: &str) -> bool {
+    // Cheap gate: skip the split/tokenize work unless the binary name appears.
+    if !command.contains("dcg") && !command.contains("destructive_command_guard") {
+        return false;
+    }
+    let segments = crate::packs::split_command_segments(command);
+    !segments.is_empty()
+        && segments
+            .iter()
+            .all(|segment| segment_is_dcg_inspection_call(segment))
+}
+
+/// Returns `true` when a single (already shell-split) segment is a bare
+/// `dcg <test|explain|classify> ...` invocation with no redirection.
+fn segment_is_dcg_inspection_call(segment: &str) -> bool {
+    let Some(argv) = parse_simple_command_argv(segment) else {
+        // `None` means the segment contained a redirect or other shell control
+        // operator (or was empty): refuse the exemption.
+        return false;
+    };
+    let mut tokens = argv.iter();
+    let Some(arg0) = tokens.next() else {
+        return false;
+    };
+    if !is_dcg_binary_name(arg0) {
+        return false;
+    }
+    // Skip leading global option flags (`--robot`, `--no-color`, `-v`, ...) and
+    // require the first non-flag token to be a known diagnostic subcommand.
+    for token in tokens {
+        if token.starts_with('-') {
+            continue;
+        }
+        return DCG_INSPECTION_SUBCOMMANDS.contains(&token.as_str());
+    }
+    // A bare `dcg` (with only flags) is not a diagnostic invocation.
+    false
+}
+
+/// Returns `true` if `arg0` (after stripping any leading path) is the dcg
+/// binary name.
+fn is_dcg_binary_name(arg0: &str) -> bool {
+    let base = arg0.rsplit(['/', '\\']).next().unwrap_or(arg0);
+    base == "dcg" || base == "destructive_command_guard"
+}
+
+/// Tokenize a single shell command segment into its argv words, honoring shell
+/// quoting the way bash does, and return `None` if the segment contains any
+/// unquoted redirection or shell-control operator.
+///
+/// This is intentionally conservative: any construct that could direct dcg's
+/// output somewhere (`>`, `<`, `>>`, `2>`, `&>`), chain another command, or run
+/// a subshell causes an immediate `None`, which makes the caller refuse the
+/// self-inspection exemption and fall through to normal evaluation. Quoted
+/// occurrences of those characters are treated as ordinary data, exactly as
+/// bash would treat them.
+fn parse_simple_command_argv(segment: &str) -> Option<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut chars = segment.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            c if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            // Single quotes: literal until the next single quote.
+            '\'' => {
+                started = true;
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    cur.push(q);
+                }
+            }
+            // Double quotes: backslash escapes only ", \, $, ` (as in bash).
+            '"' => {
+                started = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '\\' => match chars.peek() {
+                            Some(&n) if matches!(n, '"' | '\\' | '$' | '`') => {
+                                cur.push(n);
+                                chars.next();
+                            }
+                            _ => cur.push('\\'),
+                        },
+                        '"' => break,
+                        _ => cur.push(q),
+                    }
+                }
+            }
+            // ANSI-C quoting $'...': backslash escapes the following character
+            // (including the closing quote), terminated by an unescaped quote.
+            '$' if chars.peek() == Some(&'\'') => {
+                started = true;
+                chars.next(); // consume the opening quote
+                while let Some(q) = chars.next() {
+                    match q {
+                        '\\' => {
+                            if let Some(n) = chars.next() {
+                                cur.push(n);
+                            }
+                        }
+                        '\'' => break,
+                        _ => cur.push(q),
+                    }
+                }
+            }
+            // Command substitution -> refuse (handled as its own segment too).
+            '$' if chars.peek() == Some(&'(') => return None,
+            // Backslash escape outside quotes.
+            '\\' => {
+                if let Some(n) = chars.next() {
+                    started = true;
+                    cur.push(n);
+                }
+            }
+            // Redirections and shell-control operators -> refuse the exemption.
+            '<' | '>' | ';' | '|' | '&' | '`' | '(' | ')' => return None,
+            _ => {
+                started = true;
+                cur.push(c);
+            }
+        }
+    }
+
+    if started {
+        words.push(cur);
+    }
+    if words.is_empty() { None } else { Some(words) }
+}
+
 /// Returns true if `tail` contains any shell metacharacter sequence that could
 /// chain a second command or redirect I/O after the allowlisted prefix. The
 /// set is intentionally conservative — false positives (refusing the allowlist
@@ -2883,5 +3066,126 @@ mod tests {
         assert!(is_builtin_inspection_wrapper_call(
             "ee preflight verify --cmd \"dd if=/dev/zero of=/dev/sda\""
         ));
+    }
+
+    // ---- dcg#170: dcg's own diagnostic subcommands (test/explain/classify) ----
+
+    #[test]
+    fn dcg_self_inspection_allows_simple_diagnostics() {
+        assert!(is_dcg_self_inspection_call("dcg test \"rm -rf /\""));
+        assert!(is_dcg_self_inspection_call(
+            "dcg explain \"git reset --hard\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "dcg classify \"git restore src/foo.py\""
+        ));
+        // Flags before and after the subcommand.
+        assert!(is_dcg_self_inspection_call("dcg --robot test \"rm -rf /\""));
+        assert!(is_dcg_self_inspection_call(
+            "dcg test --format json \"kubectl delete namespace prod\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "dcg explain --verbose \"rm -rf ~\""
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_allows_path_qualified_binary() {
+        assert!(is_dcg_self_inspection_call(
+            "/usr/local/bin/dcg test \"rm -rf /\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "./dcg explain \"git clean -fdx\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            "~/.local/bin/dcg test \"git reset --hard\""
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_allows_heredoc_argument() {
+        // The exact reproductions from dcg#170: a candidate command embedded in
+        // a `$'...'` ANSI-C string (with a `cat <<EOF` heredoc and a `git
+        // restore` mention). The literal `\'` and `\n` are backslash escapes in
+        // the pre-execution command text the hook actually receives.
+        let explain = "dcg explain --no-color $'cat <<\\'EOF\\'\\nreview note: \
+                       git restore src/foo.py would discard local work\\nEOF'";
+        assert!(
+            is_dcg_self_inspection_call(explain),
+            "issue #170 `dcg explain` heredoc repro must be exempt"
+        );
+        let test = "dcg test --no-heredoc-scan --explain --no-color \
+                    $'cat <<\\'EOF\\'\\nreview note: git restore src/foo.py \
+                    would discard local work\\nEOF'";
+        assert!(
+            is_dcg_self_inspection_call(test),
+            "issue #170 `dcg test` heredoc repro must be exempt"
+        );
+    }
+
+    #[test]
+    fn dcg_self_inspection_allows_quoted_metacharacter_argument() {
+        // Metacharacters that live entirely inside the quoted candidate are
+        // inert data and must not defeat the exemption.
+        assert!(is_dcg_self_inspection_call("dcg test \"rm -rf /; reboot\""));
+        assert!(is_dcg_self_inspection_call("dcg test \"a && rm -rf /\""));
+        assert!(is_dcg_self_inspection_call("dcg explain 'echo a > b'"));
+        assert!(is_dcg_self_inspection_call(
+            "dcg test \"echo \\$(rm -rf /)\""
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_chained_real_command() {
+        // A genuine second command outside the diagnostic invocation must fall
+        // through to normal evaluation (i.e. NOT be exempted).
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\"; rm -rf /"));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg explain \"x\" && rm -rf /"
+        ));
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\" | sh"));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg explain \"git restore x\"; git reset --hard"
+        ));
+        assert!(!is_dcg_self_inspection_call("cd /tmp && dcg test \"x\""));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_command_substitution() {
+        assert!(!is_dcg_self_inspection_call("dcg test \"$(rm -rf /)\""));
+        assert!(!is_dcg_self_inspection_call("dcg explain \"`rm -rf /`\""));
+        assert!(!is_dcg_self_inspection_call("dcg test <(rm -rf /)"));
+        // A nested *destructive* substitution still blocks even though the outer
+        // and one inner segment are dcg calls.
+        assert!(!is_dcg_self_inspection_call(
+            "dcg test \"$(dcg explain x; rm -rf /)\""
+        ));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_output_redirection() {
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\" > /etc/passwd"));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg explain \"x\" >> /etc/passwd"
+        ));
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\" 2> /tmp/err"));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_look_alikes() {
+        // Not a real dcg binary.
+        assert!(!is_dcg_self_inspection_call("not-dcg test \"rm -rf /\""));
+        assert!(!is_dcg_self_inspection_call("dcg_something test \"x\""));
+        // Unknown subcommand is not a diagnostic.
+        assert!(!is_dcg_self_inspection_call("dcg run \"rm -rf /\""));
+        assert!(!is_dcg_self_inspection_call("dcg scan ."));
+        // Only flags, no subcommand.
+        assert!(!is_dcg_self_inspection_call("dcg --robot --version"));
+    }
+
+    #[test]
+    fn dcg_self_inspection_rejects_empty_input() {
+        assert!(!is_dcg_self_inspection_call(""));
+        assert!(!is_dcg_self_inspection_call("   "));
     }
 }

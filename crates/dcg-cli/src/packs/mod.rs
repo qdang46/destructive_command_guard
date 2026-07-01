@@ -1000,7 +1000,7 @@ impl EnabledKeywordIndex {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 90] = [
+static PACK_ENTRIES: [PackEntry; 91] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1536,6 +1536,11 @@ static PACK_ENTRIES: [PackEntry; 90] = [
         "infrastructure.pulumi",
         &["pulumi"],
         infrastructure::pulumi::create_pack,
+    ),
+    PackEntry::new(
+        "infrastructure.atmos",
+        &["atmos"],
+        infrastructure::atmos::create_pack,
     ),
     PackEntry::new(
         "system.disk",

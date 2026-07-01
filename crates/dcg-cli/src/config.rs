@@ -4107,6 +4107,7 @@ verbose = false
 #   infrastructure.terraform - Terraform destroy commands
 #   infrastructure.ansible   - Ansible state=absent patterns
 #   infrastructure.pulumi    - Pulumi destroy commands
+#   infrastructure.atmos     - Atmos terraform deploy/clean, helmfile destroy
 #   system.permissions    - Dangerous permission changes
 #   system.services       - Service management commands
 #   strict_git            - Extra paranoid git protections

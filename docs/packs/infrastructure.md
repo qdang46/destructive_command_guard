@@ -7,6 +7,7 @@ This document describes packs in the `infrastructure` category.
 - [Terraform](#infrastructureterraform)
 - [Ansible](#infrastructureansible)
 - [Pulumi](#infrastructurepulumi)
+- [Atmos](#infrastructureatmos)
 
 ---
 
@@ -14,13 +15,14 @@ This document describes packs in the `infrastructure` category.
 
 **Pack ID:** `infrastructure.terraform`
 
-Protects against destructive Terraform operations like destroy, taint, and apply with -auto-approve
+Protects against destructive Terraform/OpenTofu operations like destroy, taint, and apply with -auto-approve
 
 ### Keywords
 
 Commands containing these keywords are checked against this pack:
 
 - `terraform`
+- `tofu`
 - `destroy`
 - `taint`
 - `state`
@@ -31,17 +33,17 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `terraform-plan` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
-| `terraform-init` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s\|$)` |
-| `terraform-validate` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
-| `terraform-fmt` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s\|$)` |
-| `terraform-show` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
-| `terraform-output` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
-| `terraform-state-list` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s\|$)` |
-| `terraform-state-show` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s\|$)` |
-| `terraform-graph` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s\|$)` |
-| `terraform-version` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
-| `terraform-providers` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s\|$)` |
+| `terraform-plan` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
+| `terraform-init` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s\|$)` |
+| `terraform-validate` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
+| `terraform-fmt` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s\|$)` |
+| `terraform-show` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| `terraform-output` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
+| `terraform-state-list` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s\|$)` |
+| `terraform-state-show` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s\|$)` |
+| `terraform-graph` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s\|$)` |
+| `terraform-version` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
+| `terraform-providers` | `(?:terraform\|tofu)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -49,14 +51,14 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `plan-destroy` | terraform plan -destroy shows what would be destroyed. Review carefully before applying. | medium |
-| `destroy` | terraform destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first. | critical |
-| `apply-auto-approve` | terraform apply -auto-approve skips confirmation. Remove -auto-approve for safety. | high |
-| `taint` | terraform taint marks a resource to be destroyed and recreated on next apply. | high |
-| `state-rm` | terraform state rm removes resource from state without destroying it. Resource becomes unmanaged. | high |
-| `state-mv` | terraform state mv moves resources in state. Incorrect moves can cause resource recreation. | high |
-| `force-unlock` | terraform force-unlock removes state lock. Only use if lock is stale. | high |
-| `workspace-delete` | terraform workspace delete removes a workspace. Ensure it's not in use. | medium |
+| `plan-destroy` | terraform/tofu plan -destroy shows what would be destroyed. Review carefully before applying. | medium |
+| `destroy` | terraform/tofu destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first. | critical |
+| `apply-auto-approve` | terraform/tofu apply -auto-approve skips confirmation. Remove -auto-approve for safety. | high |
+| `taint` | terraform/tofu taint marks a resource to be destroyed and recreated on next apply. | high |
+| `state-rm` | terraform/tofu state rm removes resource from state without destroying it. Resource becomes unmanaged. | high |
+| `state-mv` | terraform/tofu state mv moves resources in state. Incorrect moves can cause resource recreation. | high |
+| `force-unlock` | terraform/tofu force-unlock removes state lock. Only use if lock is stale. | high |
+| `workspace-delete` | terraform/tofu workspace delete removes a workspace. Ensure it's not in use. | medium |
 
 ### Allowlist Guidance
 
@@ -196,6 +198,70 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "infrastructure.pulumi:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Atmos
+
+**Pack ID:** `infrastructure.atmos`
+
+Protects against destructive Atmos operations like terraform deploy (auto-approve), destroy, clean, state rm/taint, and helmfile destroy
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `atmos`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `atmos-terraform-plan` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:terraform\|tofu\|opentofu\|tf)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
+| `atmos-terraform-apply` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:terraform\|tofu\|opentofu\|tf)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+apply(?=\s\|$)(?!\s+.*-auto-approve)` |
+| `atmos-terraform-output` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:terraform\|tofu\|opentofu\|tf)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
+| `atmos-terraform-validate` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:terraform\|tofu\|opentofu\|tf)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
+| `atmos-describe` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+describe\b` |
+| `atmos-helmfile-diff` | `atmos\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:helmfile\|hf)\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `atmos-plan-destroy` | atmos terraform plan -destroy previews destruction. Review carefully before deploying. | medium |
+| `atmos-destroy` | atmos terraform destroy removes ALL managed infrastructure for the component/stack. | critical |
+| `atmos-deploy` | atmos terraform deploy runs apply with -auto-approve (no confirmation). Preview with 'atmos terraform plan' first. | high |
+| `atmos-apply-auto-approve` | atmos terraform apply -auto-approve skips confirmation. Remove -auto-approve for safety. | high |
+| `atmos-clean` | atmos terraform clean deletes local Terraform state and generated files (.terraform/, varfiles, backend config; --everything also removes terraform.tfstate*). | high |
+| `atmos-taint` | atmos terraform taint marks a resource to be destroyed and recreated on next apply. | high |
+| `atmos-state-rm` | atmos terraform state rm removes a resource from state without destroying it. Resource becomes unmanaged. | high |
+| `atmos-state-mv` | atmos terraform state mv moves resources in state. Incorrect moves can cause resource recreation. | high |
+| `atmos-force-unlock` | atmos terraform force-unlock removes a state lock. Only use if the lock is stale. | high |
+| `atmos-workspace-delete` | atmos terraform workspace delete removes a workspace and its state. | medium |
+| `atmos-helmfile-destroy` | atmos helmfile destroy removes Helm releases from the cluster. | critical |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "infrastructure.atmos:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "infrastructure.atmos:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

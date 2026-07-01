@@ -1599,6 +1599,29 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
+    // Step 2: Self-inspection exemption (dcg#170).
+    //
+    // dcg's own diagnostic subcommands -- `dcg test`, `dcg explain`,
+    // `dcg classify` -- accept a candidate command *as data* and report a
+    // decision without ever executing it. When dcg runs as a PreToolUse hook,
+    // an agent invoking one of these diagnostics (e.g. to reproduce a false
+    // positive) would otherwise be blocked because the raw command line
+    // contains the destructive-looking candidate -- the very report the agent
+    // is trying to read. This runs *before* heredoc scanning (Step 3) and
+    // keyword/pack evaluation, so candidates embedded in heredocs or `$'...'`
+    // ANSI-C strings are also exempted (the issue's exact repro).
+    //
+    // The guard is precise and cannot be turned into a general bypass: every
+    // shell-split segment must itself be a bare `dcg <diagnostic>` invocation
+    // with no output redirection, so chained real commands, command
+    // substitutions, process substitutions, and redirects all fall through to
+    // normal evaluation and are blocked as usual. A user-configured block
+    // override (Step 1) still wins. See dcg#132 for the analogous `ee preflight`
+    // inspection-wrapper exemption.
+    if crate::allowlist::is_dcg_self_inspection_call(command) {
+        return EvaluationResult::allowed();
+    }
+
     if deadline_exceeded(deadline) {
         return EvaluationResult::allowed_due_to_budget();
     }
