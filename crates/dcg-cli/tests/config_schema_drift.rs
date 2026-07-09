@@ -12,7 +12,7 @@
 //! or re-run this test with `DCG_BLESS_SCHEMA=1` to rewrite the committed file:
 //!   `DCG_BLESS_SCHEMA=1 cargo test --test config_schema_drift`
 
-use dcg_cli::config::{config_json_schema_string, CONFIG_SCHEMA_ID};
+use dcg_cli::config::{CONFIG_SCHEMA_ID, config_json_schema_string};
 use std::fs;
 use std::path::PathBuf;
 
