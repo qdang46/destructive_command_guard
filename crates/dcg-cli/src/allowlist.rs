@@ -713,7 +713,8 @@ fn is_dcg_binary_name(arg0: &str) -> bool {
 /// a subshell causes an immediate `None`, which makes the caller refuse the
 /// self-inspection exemption and fall through to normal evaluation. Quoted
 /// occurrences of those characters are treated as ordinary data, exactly as
-/// bash would treat them.
+/// bash would, so a candidate command containing them inside quotes is still
+/// recognized as inert argument text.
 fn parse_simple_command_argv(segment: &str) -> Option<Vec<String>> {
     let mut words: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -3169,23 +3170,46 @@ mod tests {
             "dcg explain \"x\" >> /etc/passwd"
         ));
         assert!(!is_dcg_self_inspection_call("dcg test \"x\" 2> /tmp/err"));
+        assert!(!is_dcg_self_inspection_call(
+            "dcg test \"x\" 2> /etc/shadow"
+        ));
+        assert!(!is_dcg_self_inspection_call("dcg test \"x\" &> /etc/hosts"));
     }
 
     #[test]
-    fn dcg_self_inspection_rejects_look_alikes() {
+    fn dcg_self_inspection_rejects_not_a_dcg_binary_lookalikes() {
         // Not a real dcg binary.
         assert!(!is_dcg_self_inspection_call("not-dcg test \"rm -rf /\""));
         assert!(!is_dcg_self_inspection_call("dcg_something test \"x\""));
+        assert!(!is_dcg_self_inspection_call("mydcg test \"rm -rf /\""));
+        assert!(!is_dcg_self_inspection_call("dcgwrapper test \"rm -rf /\""));
         // Unknown subcommand is not a diagnostic.
         assert!(!is_dcg_self_inspection_call("dcg run \"rm -rf /\""));
         assert!(!is_dcg_self_inspection_call("dcg scan ."));
+        assert!(!is_dcg_self_inspection_call("dcg install --hook"));
+        assert!(!is_dcg_self_inspection_call("dcg hook"));
         // Only flags, no subcommand.
         assert!(!is_dcg_self_inspection_call("dcg --robot --version"));
+        // Token-boundary: `testfoo` is not `test`.
+        assert!(!is_dcg_self_inspection_call("dcg testfoo rm -rf /"));
+        // Plain destructive commands are unaffected.
+        assert!(!is_dcg_self_inspection_call("rm -rf /"));
+        assert!(!is_dcg_self_inspection_call("git reset --hard"));
+        // Bare `dcg` or empty input.
+        assert!(!is_dcg_self_inspection_call("dcg"));
+        assert!(!is_dcg_self_inspection_call(""));
+        assert!(!is_dcg_self_inspection_call("   "));
     }
 
     #[test]
-    fn dcg_self_inspection_rejects_empty_input() {
-        assert!(!is_dcg_self_inspection_call(""));
-        assert!(!is_dcg_self_inspection_call("   "));
+    fn dcg_self_inspection_allows_only_dcg_diagnostic_chains() {
+        // Two diagnostic invocations chained together are still all-inert.
+        assert!(is_dcg_self_inspection_call(
+            "dcg test \"rm -rf /\" && dcg explain \"git push -f\""
+        ));
+        // ...but one non-diagnostic dcg subcommand in the chain disqualifies it.
+        assert!(!is_dcg_self_inspection_call(
+            "dcg test \"rm -rf /\" && dcg install"
+        ));
     }
 }

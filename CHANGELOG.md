@@ -11,6 +11,45 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.6.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.5) -- 2026-07-02 [Release]
+
+Security re-release of v0.6.4 with correct per-architecture binaries. No code
+changes from v0.6.4 — this exists solely to publish a correctly-packaged
+release through the CI pipeline.
+
+### Fixed
+
+- **Cross-architecture release binaries are now built for the correct target
+  (#174).** The `v0.6.4` `dist` build installed the cross-target std against the
+  floating `@nightly` toolchain instead of the `nightly-2026-06-06` pinned in
+  `rust-toolchain.toml`, so the two cross-std targets
+  (`x86_64-unknown-linux-musl`, `aarch64-pc-windows-msvc`) failed to build with
+  `error[E0463]: can't find crate for core`. Because `release` needs `build`,
+  that skipped the GitHub-Actions publish and forced an out-of-band fallback
+  that shipped **wrong-arch binaries**: the `aarch64-unknown-linux-gnu` tarball
+  carried an x86-64 ELF and the `x86_64-apple-darwin` tarball carried an arm64
+  Mach-O. On `aarch64` Linux the installed guard could not execute
+  (`Exec format error`), and because Claude Code hooks are fail-open by design,
+  the guard was silently dead while appearing installed — every destructive
+  command was permitted with no visible error. The toolchain install now pins
+  `nightly-2026-06-06` and adds the target std to it, so all six targets build
+  on native runners and publish through CI. Explicit per-target arch-verify
+  gates (`file` / `objdump -T`) already guard against a recurrence.
+
+## [v0.6.4](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.4) -- 2026-06-27 [Release]
+
+Toolchain-pin release; superseded by v0.6.5 (its cross-arch tarballs were
+mispackaged — see #174 above).
+
+### Changed
+
+- **Pin the toolchain to `nightly-2026-06-06`.** Bare `nightly` could no longer
+  compile `rustix 1.1.4`, which had shipped v0.6.3 as Windows-only and broke
+  fresh installs on newer distros. Restores the full platform set and bundles
+  the 18-issue CLI/hook audit, the #160 fail-closed hardening
+  (BOM-strip + opt-in `DCG_FAIL_CLOSED` + protocol-aware denial + oversized-input
+  handling), and #151/#150/#155.
+
 ## [v0.6.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.3) -- 2026-06-25 [Release]
 
 Patch release for Windows command normalization coverage.

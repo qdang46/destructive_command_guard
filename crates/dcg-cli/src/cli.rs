@@ -472,12 +472,20 @@ pub enum Command {
         project_dir: Option<String>,
     },
 
-    /// Show current configuration
+    /// Show current configuration (or manage config tooling)
+    ///
+    /// With no subcommand, prints the effective merged configuration. The
+    /// `schema` subcommand emits the JSON Schema for `config.toml` (for editor
+    /// autocomplete/validation via Even Better TOML / taplo).
     #[command(name = "config")]
     ShowConfig {
         /// Output format (`pretty` for humans, `json` for agents/scripts)
         #[arg(long, value_enum, default_value_t = ConfigFormat::Pretty, env = "DCG_FORMAT")]
         format: ConfigFormat,
+
+        /// Config tooling subcommand (omit to show the effective configuration)
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
     },
 
     /// Scan files for destructive commands (CI/pre-commit integration)
@@ -1718,6 +1726,22 @@ pub enum AllowlistAction {
     },
 }
 
+/// Subcommands for the `config` command.
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Print the JSON Schema for dcg's `config.toml`
+    ///
+    /// The schema powers editor autocomplete and validation (e.g. the "Even
+    /// Better TOML" / taplo extensions). Point your `config.toml` at the
+    /// published schema, or write a local copy with `--output`.
+    #[command(name = "schema")]
+    Schema {
+        /// Write the schema to a file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
+    },
+}
+
 /// Subcommands for managing allow-once entries.
 #[derive(Subcommand, Debug, Clone)]
 pub enum AllowOnceAction {
@@ -2151,14 +2175,27 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 init_config(output, force)?;
             }
         }
-        Some(Command::ShowConfig { format }) => {
-            if !verbosity.quiet {
-                match format {
-                    ConfigFormat::Json => show_config_json(&config),
-                    ConfigFormat::Pretty => show_config(&config),
+        Some(Command::ShowConfig { format, action }) => match action {
+            Some(ConfigAction::Schema { output }) => {
+                let schema = crate::config::config_json_schema_string();
+                if let Some(path) = output {
+                    std::fs::write(&path, &schema)?;
+                    if !verbosity.quiet {
+                        println!("Wrote config JSON Schema to {}", path.display());
+                    }
+                } else {
+                    print!("{schema}");
                 }
             }
-        }
+            None => {
+                if !verbosity.quiet {
+                    match format {
+                        ConfigFormat::Json => show_config_json(&config),
+                        ConfigFormat::Pretty => show_config(&config),
+                    }
+                }
+            }
+        },
         Some(Command::Allowlist { action }) => {
             handle_allowlist_command(action, config.allowlist.auto_prune_expired)?;
         }
@@ -4904,6 +4941,17 @@ fn detect_project_packs(dir: &std::path::Path) -> Vec<PackDetection> {
         add_detection(
             "infrastructure.ansible",
             "Ansible config/playbooks",
+            &mut seen_packs,
+            &mut detections,
+        );
+    }
+    // Atmos (atmos.tools) keeps its root config in atmos.yaml/atmos.yml; the
+    // wrapper verbs (terraform deploy/clean, helmfile destroy) are guarded by
+    // the infrastructure.atmos pack.
+    if dir.join("atmos.yaml").exists() || dir.join("atmos.yml").exists() {
+        add_detection(
+            "infrastructure.atmos",
+            "atmos.yaml",
             &mut seen_packs,
             &mut detections,
         );
@@ -14895,6 +14943,20 @@ mod tests {
                 .map(|d| d.pack_id.as_str())
                 .any(|x| x == "infrastructure.terraform"),
             "Should detect terraform from main.tf"
+        );
+    }
+
+    #[test]
+    fn test_detect_project_packs_atmos() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("atmos.yaml"), "base_path: .").unwrap();
+        let detections = detect_project_packs(tmp.path());
+        assert!(
+            detections
+                .iter()
+                .map(|d| d.pack_id.as_str())
+                .any(|x| x == "infrastructure.atmos"),
+            "Should detect atmos from atmos.yaml"
         );
     }
 

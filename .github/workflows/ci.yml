@@ -33,7 +33,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -191,7 +191,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -432,7 +432,7 @@ jobs:
           tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -462,7 +462,7 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -613,7 +613,7 @@ jobs:
           toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -733,7 +733,7 @@ jobs:
           toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -808,7 +808,7 @@ jobs:
           toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -884,7 +884,7 @@ jobs:
           toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -946,7 +946,7 @@ jobs:
           toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -1085,7 +1085,7 @@ jobs:
           toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -1163,7 +1163,7 @@ jobs:
           toolchain: nightly-2026-05-25
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -1336,7 +1336,7 @@ jobs:
           tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz corpus
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

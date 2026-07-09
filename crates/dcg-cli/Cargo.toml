@@ -39,6 +39,7 @@ dcg-core = { path = "../dcg-core", version = "0.1.0" }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.150"
+schemars = "1.0"            # JSON Schema generation for config.toml (editor autocomplete/validation)
 serde_yaml = "0.9"          # External pack YAML parsing
 toml = "1.0"
 toml_edit = "0.25"         # Preserves formatting when editing TOML files

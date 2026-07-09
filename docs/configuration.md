@@ -230,3 +230,64 @@ extra_packs = ["paranoid"]
 
 See [agents.md](agents.md) for full documentation on agent detection, trust
 levels, and profile configuration.
+
+## Editor Autocomplete & Validation (JSON Schema)
+
+dcg publishes a JSON Schema for `config.toml` so editors can offer field
+autocomplete, inline docs, and validation. The schema is committed at the repo
+root as [`config.schema.json`](../config.schema.json) and is generated directly
+from dcg's Rust config types, so it always matches the running binary.
+
+### Even Better TOML (VS Code)
+
+Install the **Even Better TOML** extension, then either add a schema directive
+comment at the top of your `config.toml`:
+
+```toml
+#:schema https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json
+
+[packs]
+enabled = ["kubernetes"]
+```
+
+or associate the schema in your VS Code `settings.json`:
+
+```json
+{
+  "evenBetterToml.schema.associations": {
+    "**/dcg/config.toml": "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json",
+    "**/.dcg.toml": "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json"
+  }
+}
+```
+
+### taplo (CLI / LSP)
+
+Point taplo at the schema in a `.taplo.toml` at your repo root:
+
+```toml
+[[rule]]
+include = ["**/dcg/config.toml", "**/.dcg.toml"]
+
+[rule.schema]
+path = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json"
+```
+
+### Regenerating the schema
+
+Print the schema to stdout or write it to a file with the `config schema`
+subcommand:
+
+```bash
+# Print to stdout
+dcg config schema
+
+# Write (or overwrite) the committed schema
+dcg config schema --output config.schema.json
+```
+
+A test (`tests/config_schema_drift.rs`) asserts the committed
+`config.schema.json` matches what the current config types generate, so CI fails
+if a config struct changes without the schema being regenerated. To bless an
+intentional change, run `DCG_BLESS_SCHEMA=1 cargo test --test config_schema_drift`
+(or just re-run the `--output` command above).
