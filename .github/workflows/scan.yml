@@ -41,7 +41,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6

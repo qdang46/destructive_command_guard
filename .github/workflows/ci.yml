@@ -24,9 +24,9 @@ jobs:
         run: |
           ruby -e 'require "yaml"; config = YAML.load_file(".github/dependabot.yml"); puts "Dependabot config:"; puts config.inspect'
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
           components: rustfmt, clippy
 
       - name: Install cargo-nextest
@@ -182,8 +182,9 @@ jobs:
       - name: Enable git long paths
         run: git config --global core.longpaths true
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: nightly-2026-06-06
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
@@ -416,14 +417,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
-          # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
-          # because libFuzzer + AddressSanitizer require statically-linked
-          # libc; without this target installed, the build fails with
-          # "sanitizer is incompatible with statically linked libc" and
-          # "can't find crate for `core`".
+          toolchain: nightly-2026-06-06
           targets: x86_64-unknown-linux-musl
 
       - name: Install cargo-fuzz
@@ -453,9 +449,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -579,7 +575,7 @@ jobs:
           fi
 
           if [ -z "$evaluator" ] || [ "$evaluator" = "null" ]; then
-            echo "::error::Failed to parse crates/dcg-cli/crates/dcg-cli/src/evaluator.rs coverage from coverage.json"
+            echo "::error::Failed to parse crates/dcg-cli/src/evaluator.rs coverage from coverage.json"
             failures=$((failures + 1))
           elif awk -v v="$evaluator" -v min="$EVALUATOR_MIN" 'BEGIN{exit !(v+0 < min+0)}'; then
             printf "::error::crates/dcg-cli/src/evaluator.rs coverage %.2f%% is below ${EVALUATOR_MIN}%%\n" "$evaluator"
@@ -587,7 +583,7 @@ jobs:
           fi
 
           if [ -z "$hook" ] || [ "$hook" = "null" ]; then
-            echo "::error::Failed to parse crates/dcg-cli/crates/dcg-cli/src/hook.rs coverage from coverage.json"
+            echo "::error::Failed to parse crates/dcg-cli/src/hook.rs coverage from coverage.json"
             failures=$((failures + 1))
           elif awk -v v="$hook" -v min="$HOOK_MIN" 'BEGIN{exit !(v+0 < min+0)}'; then
             printf "::error::crates/dcg-cli/src/hook.rs coverage %.2f%% is below ${HOOK_MIN}%%\n" "$hook"
@@ -608,9 +604,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -728,9 +724,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -803,9 +799,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -879,9 +875,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -941,9 +937,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -1080,9 +1076,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -1158,9 +1154,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -1322,9 +1318,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: nightly-2026-05-25
+          toolchain: nightly-2026-06-06
           components: llvm-tools-preview
           # See fuzz-smoke job above — cargo-fuzz needs the musl target to
           # link libFuzzer + AddressSanitizer with a statically-linked libc.

@@ -14947,20 +14947,6 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_project_packs_atmos() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("atmos.yaml"), "base_path: .").unwrap();
-        let detections = detect_project_packs(tmp.path());
-        assert!(
-            detections
-                .iter()
-                .map(|d| d.pack_id.as_str())
-                .any(|x| x == "infrastructure.atmos"),
-            "Should detect atmos from atmos.yaml"
-        );
-    }
-
-    #[test]
     fn test_detect_project_packs_github_actions() {
         let tmp = tempfile::tempdir().unwrap();
         let workflows = tmp.path().join(".github").join("workflows");

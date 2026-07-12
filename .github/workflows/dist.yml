@@ -17,8 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: nightly-2026-06-06
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -100,7 +101,7 @@ jobs:
         # x86_64-darwin got an arm64 binary; #174). Install the SAME pinned
         # nightly here and add the target std to it. Keep this channel in sync
         # with rust-toolchain.toml.
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: nightly-2026-06-06
           targets: ${{ matrix.target }}

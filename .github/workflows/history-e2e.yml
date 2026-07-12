@@ -28,7 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly-2026-06-06
 
       - name: Build release
         run: cargo build --release
