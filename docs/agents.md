@@ -15,6 +15,7 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Codex CLI | Environment | `CODEX_CLI=1` |
 | Gemini CLI | Environment | `GEMINI_CLI=1` |
 | GitHub Copilot CLI | Environment | `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` |
+| VS Code Copilot Chat | Hook payload | `tool_name` is `runTerminalCommand`, `run_in_terminal`, or `runInTerminal` |
 | Cursor IDE | Environment | `CURSOR_IDE=1` (set by dcg's hook script) |
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
@@ -273,10 +274,10 @@ All robot-mode responses are pure JSON on stdout:
 ### Hook Mode vs Robot Mode
 
 **Hook mode** (default when no subcommand) follows the active hook protocol:
-- Claude Code, Gemini CLI, Copilot CLI, and compatible JSON-hook protocols emit
+- Claude Code, Gemini CLI, Copilot CLI, VS Code Copilot Chat, and compatible JSON-hook protocols emit
   JSON on stdout for denials and empty stdout for allows.
-- Codex CLI 0.125.0+ uses strict hook parsing, so dcg denies with exit code 2
-  and a stderr reason instead of stdout JSON.
+- Codex CLI uses strict hook parsing, so dcg emits a minimal
+  `hookSpecificOutput` denial on stdout and exits 0.
 - Rich output always goes to stderr for human visibility.
 
 **Robot mode** with subcommands uses standardized exit codes:
@@ -291,8 +292,8 @@ is the compatibility contract for rich terminal formatting.
 
 | Stream | Purpose | Hook-mode content | Robot-mode content |
 |--------|---------|-------------------|--------------------|
-| stdout | Agent and script parsing | Protocol JSON for JSON-hook denials, empty for allows, empty for Codex denies | JSON only |
-| stderr | Human-visible diagnostics | Rich or plain text warning boxes and Codex deny reasons | Silent |
+| stdout | Agent and script parsing | Protocol JSON for denials, empty for allows | JSON only |
+| stderr | Human-visible diagnostics | Rich or plain text warning boxes | Silent |
 
 Rich output is display-only. It must never be parsed by agents and must never be
 written to stdout. When dcg prints Unicode boxes, colors, highlighted commands,
@@ -325,9 +326,9 @@ dcg < hook-input.json >hook-stdout.json 2>human-warning.txt
 dcg --robot test "rm -rf /" >decision.json 2>/dev/null
 ```
 
-For Codex hook integrations, treat exit code 2 plus non-empty stderr as a deny.
-For Claude-compatible JSON hook integrations, parse stdout when it is non-empty
-and treat empty stdout as allow.
+For Codex and Claude-compatible hook integrations, parse stdout when it is
+non-empty and treat empty stdout with exit 0 as allow. Codex's denial payload is
+minimal and intentionally omits dcg-only metadata.
 
 ### Example: Agent Integration
 

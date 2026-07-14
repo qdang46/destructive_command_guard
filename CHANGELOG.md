@@ -11,6 +11,54 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.6.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.6) -- 2026-07-11 [Release]
+
+Critical hook-protocol correctness release for Codex, GitHub Copilot CLI, and
+VS Code Copilot Chat, with a targeted heredoc false-positive fix and dependency
+security refresh.
+
+### Fixed
+
+- **Restore enforcement on Codex CLI 0.144.x for native Windows (#183).** Codex
+  denials now use its accepted minimal three-field `hookSpecificOutput` JSON
+  with exit code 0. The previous exit-code-2 contract is collapsed to exit 1 by
+  Codex's PowerShell wrapper, which Codex classifies as hook failure and then
+  fails open. The new response is strict-parser-safe and retains the full
+  operator explanation on stderr.
+- **Honor GitHub Copilot CLI's native camelCase `preToolUse` protocol (#182).**
+  Copilot responses now contain exactly its documented top-level
+  `permissionDecision` and `permissionDecisionReason` fields, without legacy
+  control or dcg-only metadata that caused the decision to be discarded. Unix
+  and PowerShell installers now write a user-level hook under
+  `${COPILOT_HOME:-~/.copilot}/hooks`, protecting every workspace; uninstallers
+  remove that hook while preserving coexisting entries and also clean the
+  legacy repo-local hook when present.
+- **Protect VS Code Copilot Chat terminal tools (#184).** `runTerminalCommand`,
+  `run_in_terminal`, and `runInTerminal` now route through the
+  Claude-compatible deny protocol and read `tool_input.command`, covering both
+  the documented and observed VS Code payload names.
+- **Treat `spx session handoff` heredocs as structured stdin data (#181).** The
+  narrowly-scoped, line-bounded sink masks handoff prose without masking other
+  `spx` subcommands or commands after the heredoc terminator.
+- **Correct the dcg skill's missing-binary install guidance (#185).** All five
+  managed skill copies now point to this repository and the working easy-mode
+  installer instead of the nonexistent `anthropics/destructive-command-guard`
+  URL; the public skill manifest checksum was refreshed and validated.
+- **Keep catastrophic JavaScript deletes blocking under contention.** A
+  lexer-aware pre-AST backstop catches literal `fs.rmSync()` calls targeting
+  catastrophic paths before the bounded AST worker can fail open, while
+  ignoring comments, template text, and non-catastrophic targets.
+
+### Security and maintenance
+
+- Upgrade `self_update` to `1.0.0-rc.4` and narrow `rich_rust` to the Markdown
+  feature, removing the obsolete syntax-parser dependency stack while retaining
+  dcg's purpose-built regex highlighter. `cargo audit` reports no known
+  vulnerabilities.
+- Make AST-heavy protocol tests deterministic on saturated CI hosts without
+  changing the production 20 ms fail-open ceiling, and expand the platform
+  backtracking audit plus PowerShell/batch extractor documentation sentinels.
+
 ## [v0.6.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.5) -- 2026-07-02 [Release]
 
 Security re-release of v0.6.4 with correct per-architecture binaries. No code
