@@ -11,11 +11,36 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [v0.6.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.6) -- 2026-07-11 [Release]
+## [v0.6.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.6) -- 2026-07-13 [Release]
 
-Critical hook-protocol correctness release for Codex, GitHub Copilot CLI, and
-VS Code Copilot Chat, with a targeted heredoc false-positive fix and dependency
-security refresh.
+Security and correctness release. Closes a critical, attacker-triggerable
+guard-bypass (an exponential-time hang in command-substitution preprocessing),
+enforces path-scoped allowlists across every evaluation entrypoint, lands
+hook-protocol correctness fixes for Codex, GitHub Copilot CLI, and VS Code
+Copilot Chat, and adds heredoc/pack false-positive fixes plus a dependency
+refresh.
+
+### Security
+
+- **Fix an exponential-time hang in command-substitution preprocessing that let
+  a destructive command bypass the guard (#189).** A ~90-byte payload of a
+  destructive command followed by ~30 unterminated `$(` drove
+  `split_command_segments` into 2^n re-scans, hanging `dcg` far past its 200 ms
+  hook budget; because agents fail open on a hung hook, the destructive command
+  then executed. The command-substitution scanners now propagate an
+  unterminated nested construct instead of rescanning the suffix per opener
+  (2^n → linear, output-equivalent on well-formed input), and the matching
+  blowup in the `$((` arithmetic/command-substitution disambiguation is closed
+  too. `$(`, `<(`, `>(`, and `$((` openers are all bounded; a payload that
+  previously hung now blocks in well under a millisecond.
+- **Enforce path-scoped allowlists across all evaluation entrypoints (#186).**
+  `paths = [...]` allowlist entries were silently applied globally whenever no
+  heredoc content-allowlist project was configured, because the shared project
+  path resolved to `None` and path-aware matchers skip path checks on `None`.
+  The explicit working directory is now authoritative regardless of heredoc
+  config, and the hook, `dcg test`, `dcg hook --batch`, and `dcg classify` all
+  thread the real cwd; the heredoc-AST allowlist branches use the path-scoped
+  matcher.
 
 ### Fixed
 
@@ -40,6 +65,17 @@ security refresh.
 - **Treat `spx session handoff` heredocs as structured stdin data (#181).** The
   narrowly-scoped, line-bounded sink masks handoff prose without masking other
   `spx` subcommands or commands after the heredoc terminator.
+- **Stop inert prose in quoted no-op-builtin heredocs from tripping git/
+  filesystem rules (#181).** `true <<'EOF' … EOF` and `: <<'EOF' … EOF` (the
+  shell block-comment idiom) now have their bodies masked as data — but only for
+  quoted delimiters, which suppress expansion. An unquoted delimiter still
+  expands command substitutions, so those keep flowing through pack matching (no
+  false negative), and commands after the terminator are unaffected.
+- **Render pack styling and separate the legend in `dcg packs` (#187, #188).**
+  Styled tree labels are parsed through `rich_rust`'s markup renderer instead of
+  being emitted as literal `[bold]`/`[dim]`/`[green]` tags; unstyled labels keep
+  literal brackets. The legend and config hint move out of the tree hierarchy
+  into a footer beneath it.
 - **Correct the dcg skill's missing-binary install guidance (#185).** All five
   managed skill copies now point to this repository and the working easy-mode
   installer instead of the nonexistent `anthropics/destructive-command-guard`
@@ -58,6 +94,20 @@ security refresh.
 - Make AST-heavy protocol tests deterministic on saturated CI hosts without
   changing the production 20 ms fail-open ceiling, and expand the platform
   backtracking audit plus PowerShell/batch extractor documentation sentinels.
+
+### Documentation
+
+- **Correct the modular-pack docs (#187, #190).** README, `docs/agents.md`, and
+  `docs/configuration.md` now use real pack/category IDs and document that a
+  category ID (e.g. `database`) expands to all its sub-packs, including in
+  agent-profile `extra_packs`/`disabled_packs`; the bogus
+  `extra_packs = ["paranoid"]` / `["core","database","filesystem"]` examples are
+  replaced, and `"paranoid"` is clarified as a graduation mode, not a pack.
+- **Document the stdin/pipe/redirection REPL bypass as a known limitation
+  (#191).** A destructive payload reaching a stdin-driven REPL binary
+  (`redis-cli`/`psql`/`mysql`/`mongosh`/`sqlite3`) via a pipe, `<` redirection,
+  or command substitution used as an argument is not yet traced (direct args and
+  here-strings are still blocked); a data-flow-aware fix is tracked separately.
 
 ## [v0.6.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.5) -- 2026-07-02 [Release]
 

@@ -1,6 +1,11 @@
 [package]
+<<<<<<< ours
 name = "dcg-cli"
 version = "0.1.0"
+=======
+name = "destructive_command_guard"
+version = "0.6.6"
+>>>>>>> theirs
 edition = "2024"
 authors = [
     "Jeffrey Emanuel <jeff@jeffreyemanuel.dev>",
