@@ -1,14 +1,10 @@
 #[cfg(test)]
 #[allow(clippy::uninlined_format_args)]
 mod tests {
-<<<<<<< ours
-    use dcg_cli::heredoc::{is_non_executing_heredoc_command, mask_non_executing_heredocs};
-=======
-    use destructive_command_guard::heredoc::{
+    use dcg_cli::heredoc::{
         is_non_executing_heredoc_command, mask_non_executing_heredocs,
     };
-    use destructive_command_guard::{Config, evaluator::evaluate_detailed};
->>>>>>> theirs
+    use dcg_cli::{Config, evaluator::evaluate_detailed};
 
     #[test]
     fn test_grep_argument_masking() {

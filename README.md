@@ -1258,13 +1258,8 @@ dcg scan includes specialized extractors for each file format, understanding whi
 | **package.json** | `package.json` | `scripts` object values |
 | **Terraform** | `*.tf` | `provisioner` blocks (`local-exec`, `remote-exec`) |
 | **Docker Compose** | `docker-compose.yml`, `docker-compose.yaml`, `compose.yml`, `compose.yaml` | `command:`, `entrypoint:`, `healthcheck.test:` fields |
-<<<<<<< ours
-| **PowerShell Scripts** | `*.ps1`, `*.psm1`, `*.psd1` | Non-comment executable command lines |
-| **Batch Scripts** | `*.bat`, `*.cmd` | Non-comment executable command lines |
-=======
 | **PowerShell** | `*.ps1`, `*.psm1`, `*.psd1` | Executable statements with line and block comments excluded |
 | **Batch Scripts** | `*.cmd`, `*.bat` | Executable command lines with comments excluded |
->>>>>>> theirs
 
 **Context-Aware Extraction**:
 
