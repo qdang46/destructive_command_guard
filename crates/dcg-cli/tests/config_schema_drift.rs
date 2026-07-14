@@ -17,7 +17,14 @@ use std::fs;
 use std::path::PathBuf;
 
 fn schema_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config.schema.json")
+    // Committed schema lives at the workspace/repo root (not crates/dcg-cli/),
+    // matching the docs and `dcg config schema --output config.schema.json`.
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("manifest dir has parent")
+        .parent()
+        .expect("crates dir has parent")
+        .join("config.schema.json")
 }
 
 #[test]

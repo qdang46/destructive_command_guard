@@ -727,44 +727,10 @@ fn test_audit_backtracking_requirements() {
                 "gh-variable-list",
             ]),
         ),
-        (
-            // Kamal patterns deliberately use a leading negative lookbehind
-            // so embedded words such as `mykamal` cannot match, plus bounded
-            // flag-skipping groups between the CLI and subcommand.
-            "platform.kamal",
-            HashSet::from([
-                "kamal-audit",
-                "kamal-details",
-                "kamal-config",
-                "kamal-secrets",
-                "kamal-deploy",
-                "kamal-redeploy",
-                "kamal-setup",
-                "kamal-build",
-                "kamal-rollback",
-                "kamal-upgrade",
-                "kamal-registry",
-                "kamal-lock",
-                "kamal-server-bootstrap",
-                "kamal-init",
-                "kamal-docs",
-                "kamal-help",
-                "kamal-version",
-                "kamal-app-safe",
-                "kamal-accessory-safe",
-                "kamal-proxy-safe",
-                "kamal-remove",
-                "kamal-accessory-remove",
-                "kamal-app-remove",
-                "kamal-app-stop",
-                "kamal-proxy-remove",
-                "kamal-proxy-reboot",
-                "kamal-proxy-stop",
-                "kamal-accessory-reboot",
-                "kamal-accessory-stop",
-                "kamal-prune",
-            ]),
-        ),
+        // platform.kamal: this fork's kamal pack uses linear `\b`-anchored
+        // patterns (`kamal(?:\s+--?\S+...)*\s+…`) without negative lookbehind.
+        // Upstream's `(?<![\w-])kamal\b…` form is intentionally not ported, so
+        // kamal is absent from the backtracking allowlist here.
         (
             // Modal patterns are command-token anchored with a negative
             // lookbehind. Two safe patterns additionally use negative
