@@ -1,9 +1,7 @@
 #[cfg(test)]
 #[allow(clippy::uninlined_format_args)]
 mod tests {
-    use dcg_cli::heredoc::{
-        is_non_executing_heredoc_command, mask_non_executing_heredocs,
-    };
+    use dcg_cli::heredoc::{is_non_executing_heredoc_command, mask_non_executing_heredocs};
     use dcg_cli::{Config, evaluator::evaluate_detailed};
 
     #[test]
