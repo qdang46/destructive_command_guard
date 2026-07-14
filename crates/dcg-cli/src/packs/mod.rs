@@ -3376,7 +3376,7 @@ mod tests {
         // The real destructive command must still be surfaced as its own segment
         // so the evaluator can block it — the guard must not be silenced.
         assert!(
-            segments.iter().any(|s| *s == "rm -rf / --no-preserve-root"),
+            segments.contains(&"rm -rf / --no-preserve-root"),
             "destructive segment must survive the unclosed substitutions: {segments:?}"
         );
     }
@@ -3394,7 +3394,7 @@ mod tests {
                 "opener {opener:?} must not blow up"
             );
             assert!(
-                segments.iter().any(|s| *s == "git reset --hard"),
+                segments.contains(&"git reset --hard"),
                 "destructive segment must survive opener {opener:?}: {segments:?}"
             );
         }
