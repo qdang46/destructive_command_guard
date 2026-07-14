@@ -2255,6 +2255,7 @@ While dcg provides comprehensive protection across many tools and platforms, som
 - **Committed but unpushed work**: The hook doesn't prevent loss of local-only commits
 - **Bugs in allowed commands**: A `git commit` that accidentally includes wrong files
 - **Commands in scripts**: If an agent runs `./deploy.sh`, we don't inspect what's inside the script
+- **Stdin/pipe/redirection data-flow into REPL binaries** ([#191](https://github.com/Dicklesworthstone/destructive_command_guard/issues/191)): dcg evaluates the *command line*, and heredocs / here-strings (`redis-cli <<< FLUSHALL`) / inline-code flags (`bash -c`, `python -c`). It does **not** yet trace a dangerous payload that reaches a stdin-driven REPL tool (`redis-cli`, `psql`, `mysql`, `mongosh`, `sqlite3`, …) indirectly — via a pipe from another producer (`echo FLUSHALL | redis-cli`), input redirection (`redis-cli < file`), or command substitution used as an argument (`redis-cli $(echo FLUSHALL)`). The direct forms (`redis-cli FLUSHALL`) and here-strings are still blocked. Extending context classification to follow this data flow is tracked for a focused fix; until then, treat stdin-fed REPL invocations as unguarded.
 
 ### Threat Model
 
