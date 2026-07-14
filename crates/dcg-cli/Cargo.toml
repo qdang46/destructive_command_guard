@@ -86,7 +86,7 @@ ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
 # Update checking dependencies
-self_update = { version = "0.44", default-features = false, features = ["reqwest", "rustls", "archive-tar", "archive-zip", "compression-flate2"] }
+self_update = { version = "1.0.0-rc.4", default-features = false, features = ["reqwest", "rustls", "github"] }
 semver = "1.0"  # Semantic version comparison for update checks
 
 # TUI/CLI visual polish dependencies (advk epic)
@@ -97,8 +97,15 @@ inquire = "0.9"
 rand = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }
 tru = "0.2.2"
 
+<<<<<<< ours
 # rich_rust for premium terminal output (rich_rust epic)
-rich_rust = { version = "0.2.2", features = ["full"], optional = true }
+rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
+=======
+# rich_rust for premium terminal output (rich_rust epic). Keep only the
+# Markdown renderer used by dcg; the syntax feature pulls in an obsolete parser
+# stack and the regex renderer below already has a purpose-built highlighter.
+rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
+>>>>>>> theirs
 
 [build-dependencies]
 vergen-gix = { version = "10.0.0", features = ["build", "cargo", "rustc"] }
