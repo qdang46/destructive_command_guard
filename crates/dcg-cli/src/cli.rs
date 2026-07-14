@@ -2616,6 +2616,7 @@ fn evaluate_batch_line(
     };
 
     // Evaluate the command
+    let project_path = std::env::current_dir().ok();
     let eval_result = evaluate_command_with_pack_order_deadline_at_path(
         &command,
         enabled_keywords,
@@ -2625,8 +2626,8 @@ fn evaluate_batch_line(
         allowlists,
         heredoc_settings,
         None,
-        None,
-        None, // No deadline for batch mode
+        project_path.as_deref(), // scope path-aware allowlist entries (#186)
+        None,                    // No deadline for batch mode
     );
 
     match eval_result.decision {
@@ -2907,6 +2908,13 @@ fn list_packs_rich(pack_list: &[PackInfo], verbose: bool, expand: bool, max_patt
     crate::output::pack_list_tree_with_options(&tree_items, options)
         .with_theme(&crate::output::auto_theme())
         .render();
+
+    // Render the legend/config hint as a separate footer beneath the tree so it
+    // does not appear as a fake pack category inside the hierarchy (#187).
+    println!();
+    for line in crate::output::pack_legend_lines() {
+        println!("{line}");
+    }
 }
 
 fn markdown_single_line_for_cli(text: &str) -> String {
@@ -4074,6 +4082,7 @@ fn test_command(
     };
 
     // Use shared evaluator for consistent behavior with hook mode
+    let project_path = std::env::current_dir().ok();
     let start = Instant::now();
     let mut result = evaluate_command_with_pack_order_deadline_at_path(
         command,
@@ -4083,9 +4092,9 @@ fn test_command(
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
-        None, // deadline
+        None,                    // allow_once_audit
+        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+        None,                    // deadline
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -4605,6 +4614,7 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
     };
 
     // Evaluate the command
+    let project_path = std::env::current_dir().ok();
     let result = evaluate_command_with_pack_order_deadline_at_path(
         command,
         &enabled_keywords,
@@ -4613,9 +4623,9 @@ fn classify_command(config: &Config, command: &str, format: ClassifyFormat, no_c
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
-        None, // deadline
+        None,                    // allow_once_audit
+        project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
+        None,                    // deadline
     );
 
     // Map EvaluationResult to classification

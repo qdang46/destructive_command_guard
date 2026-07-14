@@ -21,13 +21,19 @@ Enable or disable packs in config files:
 enabled = [
   "database.postgresql",
   "containers.docker",
-  "kubernetes", # enables all kubernetes sub-packs
+  "kubernetes", # category ID — enables all kubernetes.* sub-packs
 ]
 
 disabled = [
-
+  # "database.redis",  # optional: keep a category enabled but drop one sub-pack
 ]
 ```
+
+Category IDs in `enabled` / `disabled` (and in agent-profile `extra_packs` /
+`disabled_packs`) expand to every matching sub-pack. Use IDs listed by
+`dcg packs` or in `docs/packs/README.md`. Names such as `"paranoid"` are
+[graduation modes](graduated-response.md), not packs — enable the real
+`strict_git` pack for stricter git rules.
 
 ### Environment Overrides
 

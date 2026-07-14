@@ -2674,13 +2674,35 @@ fn collect_command_segments<'a>(
                 i = close + 2;
                 continue;
             }
+            // Arithmetic `$((...))` did not close: fall through and re-interpret
+            // the same bytes as a command substitution containing a subshell
+            // (`$( (subshell) ... )`). This is a different *parse*, not a
+            // byte-by-byte rescan, so it stays linear.
         }
 
         if !in_single && b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                collect_command_segments(cmd, i + 2, close, recursion_depth + 1, true, segments);
-                i = close + 1;
-                continue;
+            match find_matching_command_substitution(cmd, i + 2, end) {
+                Some(close) => {
+                    collect_command_segments(
+                        cmd,
+                        i + 2,
+                        close,
+                        recursion_depth + 1,
+                        true,
+                        segments,
+                    );
+                    i = close + 1;
+                    continue;
+                }
+                None => {
+                    // Unclosed `$(`: everything through `end` is its (incomplete)
+                    // body. Recurse once to keep scanning inner commands, then
+                    // stop — advancing a single byte and rescanning here is
+                    // exponential in the `$(` nesting depth (#189).
+                    collect_command_segments(cmd, i + 2, end, recursion_depth + 1, true, segments);
+                    i = end;
+                    continue;
+                }
             }
         }
 
@@ -2690,10 +2712,26 @@ fn collect_command_segments<'a>(
             && i + 1 < end
             && bytes[i + 1] == b'('
         {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                collect_command_segments(cmd, i + 2, close, recursion_depth + 1, true, segments);
-                i = close + 1;
-                continue;
+            match find_matching_command_substitution(cmd, i + 2, end) {
+                Some(close) => {
+                    collect_command_segments(
+                        cmd,
+                        i + 2,
+                        close,
+                        recursion_depth + 1,
+                        true,
+                        segments,
+                    );
+                    i = close + 1;
+                    continue;
+                }
+                None => {
+                    // Unclosed process substitution `<(`/`>(`: same bounded
+                    // handling as an unclosed `$(` above (#189).
+                    collect_command_segments(cmd, i + 2, end, recursion_depth + 1, true, segments);
+                    i = end;
+                    continue;
+                }
             }
         }
 
@@ -2784,32 +2822,45 @@ fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Op
             continue;
         }
 
+        // For every nested opener below, a sub-scanner that returns `None` means
+        // the nested construct runs unterminated through `end`. The *enclosing*
+        // substitution therefore cannot close either, so we propagate `None`
+        // immediately. Falling through and advancing a single byte would rescan
+        // the same suffix once per opener, which is exponential in the nesting
+        // depth (#189). Propagating is also output-equivalent: the old code only
+        // ever reached its final `None` after that rescan found no closer anyway.
         if b == b'`' {
-            if let Some(close) = find_matching_backtick(cmd, i + 1, end) {
-                i = close + 1;
-                continue;
-            }
+            // `?` propagates the unterminated result (see the block comment above).
+            let close = find_matching_backtick(cmd, i + 1, end)?;
+            i = close + 1;
+            continue;
         }
 
         if b == b'$' && i + 2 < end && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
-            if let Some(close) = find_matching_arithmetic_expansion(cmd, i + 3, end) {
-                i = close + 2;
-                continue;
-            }
+            // Arithmetic `$((...))`. On failure we MUST NOT also fall through to
+            // the `$(` command-substitution branch below: that scans the same
+            // tail a second time, and combined with the arithmetic scan it is
+            // exponential in the `$((` nesting depth (#189). An unterminated
+            // `$((` means this enclosing substitution is itself unclosed, so
+            // propagate the `None` via `?`. (A `$((cmd); …)` command-
+            // substitution-with-subshell is rare and still safe:
+            // `split_command_segments` recurses into the body on `None`, so
+            // destructive commands are not missed.)
+            let close = find_matching_arithmetic_expansion(cmd, i + 3, end)?;
+            i = close + 2;
+            continue;
         }
 
         if b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                i = close + 1;
-                continue;
-            }
+            let close = find_matching_command_substitution(cmd, i + 2, end)?;
+            i = close + 1;
+            continue;
         }
 
         if !in_double && matches!(b, b'<' | b'>') && i + 1 < end && bytes[i + 1] == b'(' {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                i = close + 1;
-                continue;
-            }
+            let close = find_matching_command_substitution(cmd, i + 2, end)?;
+            i = close + 1;
+            continue;
         }
 
         if b == b')' && !in_double {
@@ -2851,18 +2902,19 @@ fn find_matching_arithmetic_expansion(cmd: &str, start: usize, end: usize) -> Op
             continue;
         }
 
+        // As in `find_matching_command_substitution`, an unterminated nested
+        // construct means this arithmetic expansion cannot close either; propagate
+        // the `None` via `?` rather than rescanning byte-by-byte (exponential — #189).
         if b == b'`' {
-            if let Some(close) = find_matching_backtick(cmd, i + 1, end) {
-                i = close + 1;
-                continue;
-            }
+            let close = find_matching_backtick(cmd, i + 1, end)?;
+            i = close + 1;
+            continue;
         }
 
         if b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
-            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
-                i = close + 1;
-                continue;
-            }
+            let close = find_matching_command_substitution(cmd, i + 2, end)?;
+            i = close + 1;
+            continue;
         }
 
         match b {
@@ -3299,6 +3351,72 @@ mod tests {
         assert_eq!(
             split_command_segments("echo $((rm -rf /))"),
             vec!["echo $((rm -rf /))"]
+        );
+    }
+
+    #[test]
+    fn split_command_segments_bounds_nested_unclosed_substitutions() {
+        // Regression for #189: a destructive command followed by many nested,
+        // *unterminated* `$(` sequences drove `find_matching_command_substitution`
+        // into 2^N re-scans, hanging the hook long past its 200ms budget and
+        // tripping agents' fail-open. The scanner must now stay linear.
+        //
+        // Under the pre-fix code this input took ~2^200 steps (effectively
+        // forever); a generous wall-clock bound turns a regression into a hard
+        // failure instead of an infinite hang.
+        let payload = format!("rm -rf / --no-preserve-root ; {}", "$(".repeat(200));
+        let start = std::time::Instant::now();
+        let segments = split_command_segments(&payload);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "nested-$() splitting must be linear, took {elapsed:?}"
+        );
+        // The real destructive command must still be surfaced as its own segment
+        // so the evaluator can block it — the guard must not be silenced.
+        assert!(
+            segments.iter().any(|s| *s == "rm -rf / --no-preserve-root"),
+            "destructive segment must survive the unclosed substitutions: {segments:?}"
+        );
+    }
+
+    #[test]
+    fn split_command_segments_bounds_nested_unclosed_process_substitutions() {
+        // Same class of bug via `<(`/`>(` and mixed openers, which also recurse
+        // through `find_matching_command_substitution` (#189).
+        for opener in ["$(", "<(", ">(", "$(( "] {
+            let payload = format!("git reset --hard ; {}", opener.repeat(200));
+            let start = std::time::Instant::now();
+            let segments = split_command_segments(&payload);
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(2),
+                "opener {opener:?} must not blow up"
+            );
+            assert!(
+                segments.iter().any(|s| *s == "git reset --hard"),
+                "destructive segment must survive opener {opener:?}: {segments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_matching_substitution_is_output_equivalent_on_unclosed_input() {
+        // The linearization must not change *results* on well-formed input:
+        // balanced substitutions still resolve to the same closing paren.
+        let cmd = "echo $(a $(b) c) tail";
+        let start = cmd.find("$(").unwrap() + 2;
+        let close = find_matching_command_substitution(cmd, start, cmd.len());
+        // The outer `$( ... )` closes at the ')' right before " tail".
+        assert_eq!(close, Some(cmd.find(") tail").unwrap()));
+
+        // A genuinely unterminated nested `$(` yields None (unchanged from the
+        // pre-fix behavior, which also returned None — just after 2^N work).
+        let unclosed = "echo $(a $(b c";
+        let start = unclosed.find("$(").unwrap() + 2;
+        assert_eq!(
+            find_matching_command_substitution(unclosed, start, unclosed.len()),
+            None
         );
     }
 

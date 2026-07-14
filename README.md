@@ -113,9 +113,16 @@ disabled_packs = ["kubernetes"]
 # Restrict unknown agents — extra rules, no allowlist bypass
 [agents.unknown]
 trust_level = "low"
-extra_packs = ["paranoid"]
+extra_packs = ["strict_git", "database"]  # real pack / category IDs (see `dcg packs`)
 disabled_allowlist = true
 ```
+
+> `extra_packs`/`disabled_packs` take the same pack and category IDs as
+> `[packs] enabled`/`disabled` — a **category ID** like `"database"` expands to
+> every `database.*` sub-pack. Use IDs listed by `dcg packs` or in
+> `docs/packs/README.md`; `"paranoid"` is a
+> [graduation mode](docs/graduated-response.md), not a pack, so enable the real
+> `strict_git` pack for stricter git rules.
 
 See [docs/agents.md](docs/agents.md) for full documentation on supported agents,
 trust levels, and configuration options.
@@ -168,6 +175,14 @@ If dcg is blocking something you genuinely need to run:
 ## Modular Pack System
 
 dcg uses a modular "pack" system to organize destructive command patterns by category. Packs can be enabled or disabled in the configuration file.
+
+**Category IDs expand to their sub-packs.** Listing a bare category in `enabled`
+turns on every pack under it: `enabled = ["database"]` activates
+`database.postgresql`, `database.mysql`, and the rest of that category. You can
+still drop a single sub-pack with `disabled = ["database.redis"]`. The same
+expansion applies to agent-profile `extra_packs` / `disabled_packs`. Always use
+real pack or category IDs from `dcg packs` / `docs/packs/README.md` — a name like
+`"paranoid"` is a [graduation mode](docs/graduated-response.md), not a pack.
 
 - Full pack ID index: `docs/packs/README.md`
 - Canonical descriptions + pattern counts: `dcg packs --verbose`

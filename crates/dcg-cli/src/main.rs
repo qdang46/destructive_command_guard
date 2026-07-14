@@ -704,8 +704,8 @@ fn main() {
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
-        None, // allow_once_audit
-        None, // project_path
+        None,                // allow_once_audit
+        cwd_path.as_deref(), // project_path: scopes path-aware allowlist entries (#186)
         Some(&deadline),
     );
 
