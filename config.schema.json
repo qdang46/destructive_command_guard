@@ -411,6 +411,13 @@
           "additionalProperties": {
             "$ref": "#/$defs/PolicyMode"
           }
+        },
+        "tools": {
+          "description": "Per-tool mode overrides.\nKey is the tool kind (e.g., \"bash\", \"edit\", \"write\", \"read\", \"network\").\nValue is the mode to use for all rules triggered by that tool kind.\nTakes precedence over pack-level and rule-level overrides for the matching tool.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/PolicyMode"
+          }
         }
       }
     },
