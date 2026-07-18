@@ -1,4 +1,5 @@
 name: bench
+# - Full heredoc pipeline: < 20ms (panic threshold)
 
 # Benchmark enforcement for performance regressions
 #

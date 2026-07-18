@@ -1286,3 +1286,12 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 ## Note on Built-in TODO Functionality
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
+
+## Performance Budget (Hook)
+
+- Quick reject: < 50us panic
+- Fast path: < 500us panic
+- Pattern match: < 1ms panic
+- Heredoc extract: < 2ms panic
+- Full heredoc pipeline: < 20ms panic
+- Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)

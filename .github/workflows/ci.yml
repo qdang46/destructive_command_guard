@@ -1,4 +1,7 @@
 name: ci
+# - Full heredoc pipeline: 20ms panic
+# - Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)
+# Full heredoc pipeline benchmark exceeds 20ms budget
 
 on:
   pull_request:

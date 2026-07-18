@@ -3806,6 +3806,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
+        // The shell expands redirect targets at runtime. A variable, command
+        // substitution, or backslash-obfuscated suffix can therefore resolve
+        // outside an apparent temp path before O_TRUNC opens the file.
+        destructive_pattern!(
+            "redirect-truncate-dynamic-path",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:[^|;&\s]*[\\$`]|~[A-Za-z_][^|;&\s]*|(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))/[^|;&\s]*['"?*\[][^|;&\s]*|[%!][^|;&\s]*|\^(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))[^|;&\s]+)"#,
+            "shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval.",
+            High,
+            "The redirect target is expanded by the shell at runtime, so dcg cannot prove where it points before the file is opened with O_TRUNC.\n\n             Safer alternatives:\n             - Resolve and inspect the target path first.\n             - Use a literal `/tmp/<subdir>/scratch` path for disposable output.\n             - Use append (`>>`) when preserving existing content is acceptable.",
+            REDIRECT_TRUNCATE_SUGGESTIONS
+        ),
     ];
 
     // Apply Tier-A explicit effect tags. Untagged rules keep their pack-level
