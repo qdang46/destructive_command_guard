@@ -154,11 +154,6 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "kubectl-logs",
             r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s|$)"
         ),
-        // dry-run is safe
-        safe_pattern!(
-            "kubectl-dry-run",
-            r"kubectl\b.*--dry-run(?:=(?:client|server))?(?:\s|$)"
-        ),
         // diff is safe (shows what would change)
         safe_pattern!(
             "kubectl-diff",
@@ -190,6 +185,104 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             r"kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s|$)"
         ),
     ]
+}
+
+/// Return true only when kubectl's final effective `--dry-run` value is
+/// provably non-executing. Regex matching is insufficient here because pflag
+/// accepts repeated flags, separated values, quoting, and `--` termination.
+pub(crate) fn dry_run_is_effectively_safe(command: &str) -> bool {
+    let segments = crate::packs::split_command_segments(command);
+    if segments.len() > 1 {
+        let mut kubectl_segments = segments
+            .into_iter()
+            .filter(|segment| kubectl_executable_index(segment).is_some());
+        let Some(segment) = kubectl_segments.next() else {
+            return false;
+        };
+        return kubectl_segments.next().is_none() && dry_run_is_effectively_safe(segment);
+    }
+    if kubectl_command_contains_dynamic_shell_syntax(command) {
+        return false;
+    }
+    let Ok(tokens) = shell_words::split(command) else {
+        return false;
+    };
+    let Some(kubectl_index) = kubectl_executable_index_from_tokens(&tokens) else {
+        return false;
+    };
+
+    let mut effective = None;
+    let mut index = kubectl_index + 1;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if token == "--" {
+            break;
+        }
+        if let Some(value) = token.strip_prefix("--dry-run=") {
+            effective = Some(value.to_ascii_lowercase());
+            index += 1;
+            continue;
+        }
+        if token == "--dry-run" {
+            let separated = tokens.get(index + 1).map(String::as_str);
+            if separated.is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "client" | "server" | "none" | "false" | "true"
+                )
+            }) {
+                effective = separated.map(str::to_ascii_lowercase);
+                index += 2;
+            } else {
+                effective = Some("bare".to_string());
+                index += 1;
+            }
+            continue;
+        }
+        index += 1;
+    }
+
+    effective.is_some_and(|value| matches!(value.as_str(), "bare" | "client" | "server" | "true"))
+}
+
+fn kubectl_executable_index(command: &str) -> Option<usize> {
+    let tokens = shell_words::split(command).ok()?;
+    kubectl_executable_index_from_tokens(&tokens)
+}
+
+fn kubectl_executable_index_from_tokens(tokens: &[String]) -> Option<usize> {
+    tokens.iter().position(|token| {
+        token
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("kubectl"))
+    })
+}
+
+fn kubectl_command_contains_dynamic_shell_syntax(command: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    for byte in command.bytes() {
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+        if in_single {
+            continue;
+        }
+        if byte == b'\\'
+            || byte == b'$'
+            || byte == b'`'
+            || (!in_double && matches!(byte, b'*' | b'?' | b'[' | b'{' | b'~' | b';' | b'|' | b'&'))
+        {
+            return true;
+        }
+    }
+    in_single || in_double
 }
 
 #[allow(clippy::too_many_lines)]
@@ -305,7 +398,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete deployment/statefulset/daemonset
         destructive_pattern!(
             "delete-workload",
-            r"kubectl\b.*?\bdelete\s+(?:deployment|statefulset|daemonset|replicaset)\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$))",
+            r"kubectl\b.*?\bdelete\s+(?:deployment|statefulset|daemonset|replicaset)\b",
             "kubectl delete deployment/statefulset/daemonset removes the workload. Use --dry-run first.",
             High,
             "Deleting a workload terminates all its pods:\n\n\
@@ -322,7 +415,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete pvc (persistent volume claim)
         destructive_pattern!(
             "delete-pvc",
-            r"kubectl\b.*?\bdelete\s+(?:pvc|persistentvolumeclaim)\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$))",
+            r"kubectl\b.*?\bdelete\s+(?:pvc|persistentvolumeclaim)\b",
             "kubectl delete pvc may permanently delete data if ReclaimPolicy is Delete.",
             Critical,
             "Deleting a PVC can cause permanent data loss depending on the PV's reclaimPolicy:\n\n\
@@ -340,7 +433,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // delete pv (persistent volume)
         destructive_pattern!(
             "delete-pv",
-            r"kubectl\b.*?\bdelete\s+(?:pv|persistentvolume)\b(?!.*--dry-run(?:=(?:client|server))?(?:\s|$))",
+            r"kubectl\b.*?\bdelete\s+(?:pv|persistentvolume)\b",
             "kubectl delete pv may permanently delete the underlying storage.",
             Critical,
             "Deleting a PersistentVolume can permanently destroy the underlying storage:\n\n\
@@ -409,6 +502,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Try server-side apply for safer updates:\n  \
              kubectl apply --server-side -f <file>",
             APPLY_FORCE_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "delete-from-stdin",
+            r#"kubectl\b.*?\bdelete\b.*?(?:-f(?:=|\s+)?|--filename(?:=|\s+))["']?(?:[^,"'\s]+,)*-(?:,[^,"'\s]+)*["']?(?=\s|$)"#,
+            "kubectl delete -f - deletes every resource described by stdin without a reviewable manifest path.",
+            High,
+            "Materialize the manifest, inspect it with kubectl diff, and run kubectl delete --dry-run=client before deleting the resources."
         ),
         // delete -f with directory (batch deletion)
         destructive_pattern!(
@@ -584,6 +684,41 @@ mod tests {
             "force",
         );
         assert_blocks(&pack, "kubectl apply -f deploy.yaml --force", "force");
+        assert_blocks(&pack, "cat manifest.yaml | kubectl delete -f -", "stdin");
+        assert_blocks(&pack, "kubectl --context prod delete --filename=-", "stdin");
+        assert_blocks(&pack, "kubectl delete --filename '-'", "stdin");
+        assert_blocks(&pack, "kubectl delete -f \"-\"", "stdin");
+        assert_blocks(&pack, "kubectl delete -f-", "stdin");
+        assert_blocks(&pack, "kubectl delete -f=-", "stdin");
+        assert_blocks(&pack, "kubectl delete --filename=-,other.yaml", "stdin");
+        assert_blocks(&pack, "kubectl delete -f other.yaml,-", "stdin");
+        assert_blocks(&pack, "kubectl delete -f - --dry-run=none", "stdin");
+        assert_blocks(&pack, "kubectl delete -f - --dry-run false", "stdin");
+        assert_blocks(
+            &pack,
+            "kubectl delete -f - --dry-run=client --dry-run=none",
+            "stdin",
+        );
+        assert_blocks(
+            &pack,
+            "kubectl delete -f - --dry-run=client --dry-run false",
+            "stdin",
+        );
+        assert_blocks(
+            &pack,
+            "kubectl delete -f - --dry-run=client '--dry-run=none'",
+            "stdin",
+        );
+        assert_blocks(
+            &pack,
+            r"kubectl delete -f - --dry-run=client \--dry-run=none",
+            "stdin",
+        );
+        assert_blocks(
+            &pack,
+            "kubectl delete -f - --dry-run=$DRY_RUN_MODE",
+            "stdin",
+        );
         assert_blocks(&pack, "kubectl delete -f ./manifests/", "directories");
     }
 
@@ -638,6 +773,18 @@ mod tests {
         );
         assert_allows(&pack, "kubectl delete deployment web --dry-run=server");
         assert_allows(&pack, "kubectl delete deployment web --dry-run");
+        assert_allows(&pack, "kubectl delete deployment web --dry-run -o yaml");
+        assert_allows(&pack, "kubectl delete deployment web --dry-run client");
+        assert_allows(&pack, "kubectl delete -f '-' --dry-run=\"client\"");
+        assert_allows(
+            &pack,
+            "generate-manifest | kubectl delete -f - --dry-run=client",
+        );
+        assert_allows(&pack, "kubectl delete -f - --dry-run=none --dry-run=client");
+        assert_allows(
+            &pack,
+            "kubectl delete -f - --dry-run=client -- --dry-run=none",
+        );
     }
 
     #[test]

@@ -73,6 +73,16 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        // Evaluated explicitly by the indirect-input data-flow pass. The regex
+        // is intentionally unsatisfiable so ordinary command matching cannot
+        // manufacture this finding.
+        destructive_pattern!(
+            "stdin-unverified",
+            r"(?!)",
+            "redis-cli receives indirect input that dcg cannot statically verify.",
+            High,
+            "Materialize and review the exact Redis commands before piping or redirecting them into the client."
+        ),
         // FLUSHALL - deletes all keys in all databases
         destructive_pattern!(
             "flushall",

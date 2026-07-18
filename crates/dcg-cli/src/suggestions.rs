@@ -428,6 +428,24 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
 
 /// Register suggestions for core.filesystem pack rules.
 fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
+    m.insert(
+        "core.filesystem:sed-exec-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Render and inspect the exact shell command before passing it to GNU sed's `e` command or `s///e` flag",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use a non-executing sed substitution and run any reviewed shell command as a separate step",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Replace `&` and backreferences in an executable replacement with a literal, bounded command when execution is truly required",
+            ),
+        ],
+    );
+
     // Shared suggestions for all recursive force-delete variants
     let rm_rf_suggestions = vec![
         Suggestion::new(
@@ -521,6 +539,7 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         "core.filesystem:mv-sensitive-source-root-home",
         rm_rf_suggestions.clone(),
     );
+    m.insert("core.filesystem:mv-dynamic-path", rm_rf_suggestions.clone());
     // sensitive-source propagation into temp followed by forced deletion:
     // same broad data-loss shape as the mv cross-segment bypass.
     m.insert(
@@ -539,6 +558,10 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     // Reuse rm_rf suggestion set (single-file destruction shape).
     m.insert(
         "core.filesystem:redirect-truncate-root-home",
+        rm_rf_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:redirect-truncate-dynamic-path",
         rm_rf_suggestions,
     );
 }
@@ -1606,6 +1629,7 @@ mod tests {
         // Verify expected core.filesystem rules have suggestions
         // These must match actual pattern names from src/packs/core/filesystem.rs
         let expected_rules = [
+            "core.filesystem:sed-exec-unverified",
             "core.filesystem:rm-rf-root-home",
             "core.filesystem:rm-r-f-separate-root-home",
             "core.filesystem:rm-recursive-force-root-home",
@@ -1625,10 +1649,12 @@ mod tests {
             "core.filesystem:dd-overwrite-root-home",
             "core.filesystem:dd-overwrite-general",
             "core.filesystem:mv-sensitive-source-root-home",
+            "core.filesystem:mv-dynamic-path",
             "core.filesystem:cp-sensitive-then-delete",
             "core.filesystem:ln-symlink-sensitive-then-delete",
             "core.filesystem:rsync-sensitive-then-delete",
             "core.filesystem:redirect-truncate-root-home",
+            "core.filesystem:redirect-truncate-dynamic-path",
         ];
 
         for rule in expected_rules {

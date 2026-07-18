@@ -54,6 +54,13 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        destructive_pattern!(
+            "stdin-unverified",
+            r"(?!)",
+            "sqlite3 receives indirect input that dcg cannot statically verify.",
+            High,
+            "Materialize and review the exact SQL before piping or redirecting it into sqlite3."
+        ),
         // DROP TABLE
         destructive_pattern!(
             "drop-table",

@@ -73,6 +73,13 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        destructive_pattern!(
+            "stdin-unverified",
+            r"(?!)",
+            "mongosh receives indirect input that dcg cannot statically verify.",
+            High,
+            "Materialize and review the exact JavaScript before piping or redirecting it into mongosh."
+        ),
         // dropDatabase
         destructive_pattern!(
             "drop-database",

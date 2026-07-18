@@ -156,6 +156,13 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 #[allow(clippy::too_many_lines)]
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        destructive_pattern!(
+            "stdin-unverified",
+            r"(?!)",
+            "psql receives indirect input that dcg cannot statically verify.",
+            High,
+            "Materialize and review the exact SQL before piping or redirecting it into psql."
+        ),
         // DROP DATABASE
         destructive_pattern!(
             "drop-database",

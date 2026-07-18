@@ -886,6 +886,15 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::both("rg", "-e", "--regexp"),
         SafeFlagEntry::both("ag", "-e", "--pattern"), // Silver Searcher
         SafeFlagEntry::both("ack", "-e", "--pattern"), // ack search tool
+        // Sed expression values are considered for narrow, syntax-aware
+        // masking below. Executing (`e`, `s///e`) programs are handled first
+        // by the evaluator's semantic pass; file-writing (`s///w`) programs
+        // remain visible to ordinary pack matching.
+        SafeFlagEntry::both("sed", "-e", "--expression"),
+        // GNU sed's `-l`/`--line-length` consumes the next argument. Without
+        // modelling that arity, the numeric value is mistaken for the
+        // positional program and the real substitution remains unmasked.
+        SafeFlagEntry::both("sed", "-l", "--line-length"),
         // GitHub CLI - titles and bodies are documentation
         SafeFlagEntry::both("gh", "-t", "--title"),
         SafeFlagEntry::both("gh", "-b", "--body"),
@@ -922,8 +931,8 @@ static SAFE_COMMANDS_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
     let commands: &[&str] = &[
         // all_args_data commands
         "echo", "printf", // Commands from flag_data_pairs
-        "git", "bd", "grep", "rg", "ag", "ack", "gh", "curl", "jq", "docker", "kubectl", "xargs",
-        "cargo", "npm",
+        "git", "bd", "grep", "rg", "ag", "ack", "sed", "gh", "curl", "jq", "docker", "kubectl",
+        "xargs", "cargo", "npm",
         // Special built-in: `command -v/-V` queries mask their arguments
         "command",
     ];
@@ -1281,11 +1290,12 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
                 }
             } else {
                 pending_safe_flag = None;
-                if !token.has_inline_code {
+                if !token.has_inline_code && flag_data_value_is_inert(cmd, pending.flag, token_text)
+                {
                     mask_ranges.push(token.byte_range.clone());
-                    if is_search_pattern_flag(cmd, pending.flag) {
-                        search_pattern_masked = true;
-                    }
+                }
+                if is_search_pattern_flag(cmd, pending.flag) {
+                    search_pattern_masked = true;
                 }
                 continue;
             }
@@ -1294,7 +1304,10 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         // Handle --flag=value (and similar) forms.
         if let Some((flag, value_range)) = split_flag_assignment(token_text, token.byte_range.start)
         {
-            if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag) && !token.has_inline_code {
+            if SAFE_STRING_REGISTRY.is_flag_data(cmd, flag)
+                && !token.has_inline_code
+                && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
+            {
                 // Mask only the value portion (after '='). Keep the flag prefix for readability.
                 mask_ranges.push(value_range);
 
@@ -1313,7 +1326,9 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         if let Some((flag, value_range)) =
             split_short_flag_attached_value(cmd, token_text, token.byte_range.start)
         {
-            if !token.has_inline_code {
+            if !token.has_inline_code
+                && flag_data_value_is_inert(cmd, flag, &command[value_range.clone()])
+            {
                 mask_ranges.push(value_range);
                 if is_search_pattern_flag(cmd, flag) {
                     search_pattern_masked = true;
@@ -1355,8 +1370,13 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
                 continue;
             }
 
-            if !search_pattern_masked && !token.has_inline_code {
-                mask_ranges.push(token.byte_range.clone());
+            if !search_pattern_masked {
+                if !token.has_inline_code
+                    && (search_cmd.rsplit('/').next().unwrap_or(search_cmd) != "sed"
+                        || sed_script_is_maskable(token_text))
+                {
+                    mask_ranges.push(token.byte_range.clone());
+                }
                 search_pattern_masked = true;
             }
         }
@@ -1678,7 +1698,7 @@ fn is_env_assignment(token: &str) -> bool {
 #[must_use]
 fn is_search_command(cmd: &str) -> bool {
     let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
-    matches!(base_name, "rg" | "grep" | "ag" | "ack")
+    matches!(base_name, "rg" | "grep" | "ag" | "ack" | "sed")
 }
 
 #[inline]
@@ -1690,8 +1710,86 @@ fn is_search_pattern_flag(cmd: &str, flag: &str) -> bool {
         "grep" => matches!(flag, "-e" | "--regexp"),
         "ag" => matches!(flag, "-e" | "--pattern"),
         "ack" => matches!(flag, "-e" | "--pattern"),
+        "sed" => matches!(flag, "-e" | "--expression"),
         _ => false,
     }
+}
+
+#[must_use]
+fn flag_data_value_is_inert(cmd: &str, flag: &str, value: &str) -> bool {
+    let base_name = cmd.rsplit('/').next().unwrap_or(cmd);
+    if base_name == "sed" && matches!(flag, "-e" | "--expression") {
+        return sed_script_is_maskable(value);
+    }
+    true
+}
+
+/// Return true only for a sed program that is either inert or is evaluated by
+/// the dedicated semantic execution pass in `evaluator`.
+///
+/// The semantic pass recursively evaluates direct `e` and `s///e` shell
+/// payloads before ordinary pack matching, so masking those programs here
+/// prevents their already-reviewed data arguments from being scanned a second
+/// time as raw shell. File-writing `w`/`W` programs stay visible.
+#[must_use]
+fn sed_script_is_maskable(value: &str) -> bool {
+    let script = strip_matching_quotes(value.trim());
+    let bytes = script.as_bytes();
+
+    // GNU sed's direct `e` command consumes the rest of its source line as a
+    // shell command (and does not require whitespace after `e`). The evaluator
+    // handles static and dynamic payloads separately before this mask is used.
+    if bytes.first() == Some(&b'e') {
+        return true;
+    }
+
+    if bytes.len() < 4 || bytes[0] != b's' {
+        return false;
+    }
+    let delimiter = bytes[1];
+    if delimiter == b'\\' || delimiter == b'\n' || delimiter == b'\r' {
+        return false;
+    }
+
+    let Some(pattern_end) = find_unescaped_sed_delimiter(bytes, 2, delimiter) else {
+        return false;
+    };
+    let Some(replacement_end) = find_unescaped_sed_delimiter(bytes, pattern_end + 1, delimiter)
+    else {
+        return false;
+    };
+
+    bytes[replacement_end + 1..].iter().all(|byte| {
+        matches!(
+            byte,
+            b'0'..=b'9' | b'e' | b'g' | b'p' | b'i' | b'I' | b'm' | b'M'
+        )
+    })
+}
+
+fn strip_matching_quotes(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        if matches!(bytes[0], b'\'' | b'"') && bytes[value.len() - 1] == bytes[0] {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
+}
+
+fn find_unescaped_sed_delimiter(bytes: &[u8], start: usize, delimiter: u8) -> Option<usize> {
+    let mut index = start;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if bytes[index] == delimiter {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 #[must_use]
@@ -3329,6 +3427,75 @@ mod tests {
         assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("rg --fixed-strings -n"));
+    }
+
+    #[test]
+    fn sanitize_masks_sed_positional_script() {
+        let sanitized = sanitize_for_pattern_matching("echo a=b | sed -E 's/=.*/=<set>/'");
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains(">/"));
+        assert!(sanitized.as_ref().contains("sed -E"));
+    }
+
+    #[test]
+    fn sanitize_masks_sed_expression_flag_value() {
+        let sanitized = sanitize_for_pattern_matching("sed -e 's/rm -rf //' notes.txt");
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains("rm -rf"));
+        assert!(sanitized.as_ref().contains("notes.txt"));
+    }
+
+    #[test]
+    fn sanitize_accounts_for_sed_line_length_option_arity() {
+        let sanitized = sanitize_for_pattern_matching("echo a=b | sed -l 80 -E 's/=.*/=<set>/'");
+        assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+        assert!(!sanitized.as_ref().contains(">/"));
+        assert!(sanitized.as_ref().contains("sed -l"));
+        assert!(sanitized.as_ref().contains("-E"));
+    }
+
+    #[test]
+    fn sanitize_keeps_shell_code_inside_sed_script_visible() {
+        let sanitized = sanitize_for_pattern_matching(r#"sed "s/x/$(rm -rf /)/" file.txt"#);
+        assert!(sanitized.as_ref().contains("rm -rf"));
+    }
+
+    #[test]
+    fn sanitize_masks_sed_programs_handled_by_semantic_execution_pass() {
+        for command in [
+            "sed 'e rm -rf /' file.txt",
+            "sed -e 's|x|rm -rf /|e' file.txt",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+            assert!(!sanitized.as_ref().contains("rm -rf"));
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_file_writing_and_complex_sed_programs_visible() {
+        for command in [
+            "sed --expression='s|x|data|w /etc/passwd' file.txt",
+            "sed 'w /etc/passwd' file.txt",
+            "sed 's|x|safe|g; e rm -rf /' file.txt",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert_eq!(sanitized.as_ref(), command, "unsafe sed program was masked");
+        }
+    }
+
+    #[test]
+    fn sanitize_masks_only_nonexecuting_sed_substitutions() {
+        for command in [
+            "sed 's|rm -rf /|safe|g' file.txt",
+            "sed -e 's|>/|greater slash|p' file.txt",
+            "sed --expression='s|/etc/passwd|redacted|I' file.txt",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(command);
+            assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
+            assert!(!sanitized.as_ref().contains("rm -rf"));
+            assert!(!sanitized.as_ref().contains("/etc/passwd"));
+        }
     }
 
     #[test]

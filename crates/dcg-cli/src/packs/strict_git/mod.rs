@@ -44,8 +44,25 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Block ALL force pushes (including --force-with-lease)
         destructive_pattern!(
             "push-force-any",
-            r"git\b.*?\bpush\s+.*(?:--force|--force-with-lease|-f\b)",
+            r#"git\b.*?\bpush(?:[^\n;]*\s(?:--force(?:=\S*)?|--force-with-lease(?:=\S*)?|-f)(?=\s|$)|(?:\s+\S+)*\s+(?:\$?["']|\\)*\+\S+)"#,
             "Force push (even with --force-with-lease) can rewrite remote history. Disabled in strict mode."
+        ),
+        // `--mirror` force-updates every mirrored ref and deletes remote refs
+        // that are absent locally. It is at least as destructive as --force.
+        destructive_pattern!(
+            "push-mirror",
+            r"git\b.*?\bpush\b[^\n;]*(?:^|\s)--mirror(?:=\S*)?(?=\s|$)",
+            "git push --mirror force-updates and deletes remote refs. Disabled in strict mode."
+        ),
+        // A dynamically constructed push argument can render Git's leading
+        // `+refspec` force syntax only after the shell expands it. Strict mode
+        // cannot prove such a push is non-forcing, so fail closed instead of
+        // letting ANSI-C strings, printf substitutions, or env vars bypass the
+        // literal-plus rule above.
+        destructive_pattern!(
+            "push-dynamic-argument",
+            r"git\b.*?\bpush\b[^\n;]*(?:\\|\$|`|\*|\?|\{|\}|\[)",
+            "Force push risk: a shell-expanded or escaped git push argument cannot be verified as non-forcing. Use literal remote and refspec arguments in strict mode."
         ),
         // Block rebase (can rewrite history)
         destructive_pattern!(
@@ -123,13 +140,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `/` in `refs/heads/main` used to bypass the old `[\s:]` separator.
         destructive_pattern!(
             "push-master",
-            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?master(?:\s|$)",
+            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?\+?master(?:\s|$)",
             "Direct push to master is blocked. Use a feature branch and open a Pull Request."
         ),
         // Block push to main
         destructive_pattern!(
             "push-main",
-            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?main(?:\s|$)",
+            r"git\s+(?:\S+\s+)*push\s+(?:.*[\s:/])?\+?main(?:\s|$)",
             "Direct push to main is blocked. Use a feature branch and open a Pull Request."
         ),
     ]
@@ -280,5 +297,50 @@ mod tests {
             "git push origin refs/heads/master",
             "Direct push to master is blocked",
         );
+    }
+
+    #[test]
+    fn test_push_force_refspec_prefix() {
+        let pack = create_pack();
+
+        for command in [
+            "git push origin +main",
+            "git push origin +master",
+            "git push origin +HEAD:main",
+            "git push origin +HEAD:master",
+            "git push origin +refs/heads/main",
+            "git push origin +refs/heads/master",
+            "git push origin +feature",
+            "git -C /repo push origin +topic:topic",
+            "git push origin '+topic:topic'",
+            r"git push origin \+topic:topic",
+            "git push origin ''+topic:topic",
+            r#"git push origin "+"topic:topic"#,
+            "git push origin $'+topic:topic'",
+            r"git push origin $'\x2btopic:topic'",
+            r"git push origin $'\053topic:topic'",
+            r#"git push origin "$(printf '\x2btopic:topic')""#,
+            r"git push origin $(printf '\053topic:topic')",
+            r#"git push origin "$REFSPEC""#,
+            r"git push origin ${PREFIX}topic:topic",
+            "git push origin {+,}topic:topic",
+            "git push origin *topic:topic",
+            "git push origin [+-]topic:topic",
+        ] {
+            assert_blocks(&pack, command, "Force push");
+        }
+
+        assert_blocks(&pack, "git push --mirror origin", "--mirror");
+        assert_blocks(&pack, "git -C /repo push origin --mirror", "--mirror");
+
+        for command in [
+            "git push origin feature-main",
+            "git push origin main-fix",
+            "git push origin feature+main",
+            "git push origin +",
+            "git push origin topic:topic --push-option=--force",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 }

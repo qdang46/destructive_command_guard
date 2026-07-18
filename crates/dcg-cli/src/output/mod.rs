@@ -230,12 +230,12 @@ fn env_flag_os_value_enabled(value: &std::ffi::OsStr) -> bool {
 /// Returns whether a DCG-owned environment flag value is enabled.
 ///
 /// These semantics intentionally match the CLI's documented boolean env
-/// parsing: empty string, `0`, `false`, `no`, and `off` are disabled; every
-/// other UTF-8 value is enabled.
+/// parsing: empty string, `0`, `false`, `no`, `n`, and `off` are disabled;
+/// every other UTF-8 value is enabled.
 pub fn env_flag_value_enabled(value: &str) -> bool {
     !matches!(
         value.trim().to_lowercase().as_str(),
-        "" | "0" | "false" | "no" | "off"
+        "" | "0" | "false" | "no" | "n" | "off"
     )
 }
 
@@ -243,7 +243,7 @@ pub fn env_flag_value_enabled(value: &str) -> bool {
 ///
 /// Explicit `--robot` always wins. The `DCG_ROBOT` environment variable follows
 /// the same boolean parsing as other output flags, so `DCG_ROBOT=0`,
-/// `DCG_ROBOT=false`, `DCG_ROBOT=no`, and `DCG_ROBOT=off` are treated as
+/// `DCG_ROBOT=false`, `DCG_ROBOT=no`, `DCG_ROBOT=n`, and `DCG_ROBOT=off` are treated as
 /// disabled rather than merely-present.
 #[must_use]
 pub fn robot_mode_enabled(explicit_robot_flag: bool) -> bool {
@@ -378,7 +378,7 @@ mod tests {
             assert!(env_flag_value_enabled(value), "{value:?} should be enabled");
         }
 
-        for value in ["", "0", "false", "no", "off", " FALSE "] {
+        for value in ["", "0", "false", "no", "n", "N", "off", " FALSE ", " n "] {
             assert!(
                 !env_flag_value_enabled(value),
                 "{value:?} should be disabled"

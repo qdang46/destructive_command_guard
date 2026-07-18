@@ -571,6 +571,11 @@ impl Pack {
     /// Falls back to individual pattern checks for backtracking patterns.
     #[must_use]
     pub fn matches_safe(&self, cmd: &str) -> bool {
+        if self.id == "kubernetes.kubectl"
+            && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
+        {
+            return true;
+        }
         // Fast path: use RegexSet if available
         if let Some(ref set) = self.safe_regex_set {
             if set.is_match(cmd) {
@@ -598,6 +603,14 @@ impl Pack {
         cmd: &str,
         deadline: Option<&crate::perf::Deadline>,
     ) -> bool {
+        if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
+            return false;
+        }
+        if self.id == "kubernetes.kubectl"
+            && crate::packs::kubernetes::kubectl::dry_run_is_effectively_safe(cmd)
+        {
+            return true;
+        }
         if let Some(ref set) = self.safe_regex_set {
             if set.is_match(cmd) {
                 return true;

@@ -1198,7 +1198,7 @@ fn print_help() {
         "(core.filesystem pack)".bright_black()
     );
     eprintln!(
-        "      {} rm -rf outside of /tmp, /var/tmp, $TMPDIR",
+        "      {} rm -rf outside literal /tmp and /var/tmp subtrees",
         "•".red()
     );
     eprintln!();

@@ -1461,8 +1461,7 @@ pub fn resolve_path_for_matching(
 pub fn load_default_allowlists() -> LayeredAllowlist {
     let project = std::env::current_dir()
         .ok()
-        .and_then(|cwd| find_repo_root(&cwd))
-        .map(|root| root.join(".dcg").join("allowlist.toml"));
+        .map(|cwd| project_allowlist_path(&cwd));
 
     // Check XDG-style path first (~/.config/dcg/), then platform-native
     let user = dirs::home_dir()
@@ -1487,18 +1486,32 @@ pub fn load_default_allowlists() -> LayeredAllowlist {
     LayeredAllowlist::load_from_paths(project, user, system)
 }
 
-fn find_repo_root(start: &Path) -> Option<PathBuf> {
-    let mut current = start.to_path_buf();
-
-    loop {
-        if current.join(".git").exists() {
-            return Some(current);
-        }
-
-        if !current.pop() {
-            return None;
-        }
+/// Resolve the project allowlist that governs `start`.
+///
+/// Git repositories are rooted at their repository root. Outside Git, the
+/// nearest ancestor that already contains `.dcg/allowlist.toml` governs the
+/// directory tree; if no such file exists, explicit `--project` writes begin a
+/// new project scope at `start`.
+pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
+    if let Some(root) =
+        crate::config::find_repo_root(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
+    {
+        return root.join(".dcg").join("allowlist.toml");
     }
+
+    let mut current = Some(start);
+    for _ in 0..=crate::config::REPO_ROOT_SEARCH_MAX_HOPS {
+        let Some(dir) = current else {
+            break;
+        };
+        let candidate = dir.join(".dcg").join("allowlist.toml");
+        if candidate.is_file() {
+            return candidate;
+        }
+        current = dir.parent();
+    }
+
+    start.join(".dcg").join("allowlist.toml")
 }
 
 fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
@@ -1779,6 +1792,40 @@ fn get_timestamp_string(tbl: &toml::value::Table, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_allowlist_path_falls_back_to_cwd_outside_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            project_allowlist_path(tmp.path()),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    #[test]
+    fn project_allowlist_path_uses_nearest_non_git_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root_allowlist = tmp.path().join(".dcg").join("allowlist.toml");
+        std::fs::create_dir_all(root_allowlist.parent().unwrap()).unwrap();
+        std::fs::write(&root_allowlist, "version = 1\n").unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(project_allowlist_path(&nested), root_allowlist);
+    }
+
+    #[test]
+    fn project_allowlist_path_prefers_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            project_allowlist_path(&nested),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
 
     // ----- command_prefix tail-injection regression tests -----
 

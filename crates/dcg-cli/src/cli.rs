@@ -11892,13 +11892,7 @@ fn diagnose_allowlists() -> AllowlistDiagnostics {
         // Count as found if path exists
         let path = match loaded.layer {
             AllowlistLayer::Agent => continue,
-            AllowlistLayer::Project => {
-                if let Some(repo_root) = find_repo_root_from_cwd() {
-                    repo_root.join(".dcg").join("allowlist.toml")
-                } else {
-                    continue;
-                }
-            }
+            AllowlistLayer::Project => allowlist_path_for_layer(AllowlistLayer::Project),
             AllowlistLayer::User => config_dir().join("allowlist.toml"),
             AllowlistLayer::System => continue,
         };
@@ -11993,11 +11987,10 @@ fn find_repo_root_from_cwd() -> Option<std::path::PathBuf> {
 fn allowlist_path_for_layer(layer: AllowlistLayer) -> std::path::PathBuf {
     match layer {
         AllowlistLayer::Agent => std::path::PathBuf::from("<agent-profile>"),
-        AllowlistLayer::Project => {
-            let repo_root = find_repo_root_from_cwd()
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            repo_root.join(".dcg").join("allowlist.toml")
-        }
+        AllowlistLayer::Project => std::env::current_dir().map_or_else(
+            |_| std::path::PathBuf::from(".dcg").join("allowlist.toml"),
+            |cwd| crate::allowlist::project_allowlist_path(&cwd),
+        ),
         AllowlistLayer::User => config_dir().join("allowlist.toml"),
         AllowlistLayer::System => crate::config::system_config_dir().join("allowlist.toml"),
     }
@@ -13800,7 +13793,7 @@ fn handle_suggest_allowlist_undo(minutes: u32) -> Result<(), Box<dyn std::error:
     let layers_to_check = [
         (
             AllowlistLayer::Project,
-            find_repo_root_from_cwd().map(|r| r.join(".dcg").join("allowlist.toml")),
+            Some(allowlist_path_for_layer(AllowlistLayer::Project)),
         ),
         (
             AllowlistLayer::User,

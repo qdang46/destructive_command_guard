@@ -10,9 +10,9 @@
 //!     `Clear-RecycleBin` (purges the Recycle Bin so deletes become unrecoverable).
 //!
 //! Whitelist-first: PowerShell `-WhatIf` previews on cmdlets that actually honor
-//! it and deletes scoped to temp dirs (`%TEMP%`/`$env:TEMP`/…) are allowed. A
-//! broader Windows safe-pattern set is added by the `windows.safe` work
-//! (`win-pack-safe-whitelist`).
+//! it are allowed. Recursive temp cleanup is intentionally reviewed: ambient
+//! temp variables are caller-controlled, and a regex cannot prove that every
+//! target in a multi-target delete remains inside one literal temp directory.
 //!
 //! Every pattern carries an inline `(?i)` flag (Windows is case-insensitive) and
 //! a stable rule id (e.g. `windows.filesystem:del-recursive`). See
@@ -112,12 +112,6 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!(
             "whatif-preview",
             r"(?i)^\s*(?:(?:remove-item|ri|clear-content|clc|clear-recyclebin)\b[^|&;\r\n]*\s-whatif\b|rm\b(?=[^|&;\r\n]*\s-recurse\b)(?=[^|&;\r\n]*\s-force\b)[^|&;\r\n]*\s-whatif\b)[^|&;\r\n]*$"
-        ),
-        // Deletes scoped to a temp directory are routine cleanup. Matches the
-        // common Windows temp references when a delete verb is present.
-        safe_pattern!(
-            "del-temp",
-            r"(?i)^\s*(?:del|erase|rd|rmdir|remove-item|ri|rm)\b[^|&;\r\n]*(?:%temp%|%tmp%|\$env:te?mp\b|\$env:localappdata\\+temp\b|\\appdata\\+local\\+temp\\|\\windows\\+temp\\|\[system\.io\.path\]::gettemppath)[^|&;\r\n]*$"
         ),
         // Read-only / preview cmd help on these verbs.
         safe_pattern!(
@@ -328,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_safe_and_temp_and_whatif() {
+    fn allows_whatif_help_and_nonrecursive_commands() {
         let pack = create_pack();
         let allowed = [
             // -WhatIf previews
@@ -336,15 +330,6 @@ mod tests {
             "rm -Recurse -Force C:\\src -WhatIf",
             "Clear-Content C:\\app\\server.log -WhatIf",
             "Clear-RecycleBin -WhatIf",
-            // temp-scoped cleanup (all the common Windows temp references)
-            "del /s /q %TEMP%\\build",
-            "rd /s /q %TMP%\\cache",
-            "Remove-Item -Recurse -Force $env:TEMP\\build",
-            "Remove-Item -Recurse -Force $env:TMP\\x",
-            "Remove-Item -Recurse -Force $env:LOCALAPPDATA\\Temp\\dcg",
-            "rd /s /q C:\\Users\\me\\AppData\\Local\\Temp\\proj",
-            "rd /s /q C:\\Windows\\Temp\\stale",
-            "Remove-Item -Recurse -Force ([System.IO.Path]::GetTempPath() + 'x')",
             // help / read-only
             "del /?",
             "rd /?",
@@ -362,5 +347,25 @@ mod tests {
         // is matched at the raw-pack level here by design; the evaluator's
         // context classification is what prevents that false positive in
         // hook/e2e mode (covered by win-pack-tests-e2e), not the pack itself.
+    }
+
+    #[test]
+    fn recursive_temp_deletes_are_reviewed_and_cannot_shadow_other_targets() {
+        let pack = create_pack();
+        for command in [
+            "del /s /q %TEMP%\\build",
+            "rd /s /q %TMP%\\cache",
+            "Remove-Item -Recurse -Force $env:TEMP\\build",
+            "Remove-Item -Recurse -Force $env:LOCALAPPDATA\\Temp\\dcg",
+            "rd /s /q C:\\Windows\\Temp\\stale",
+            "Remove-Item -Recurse -Force ([System.IO.Path]::GetTempPath() + 'x')",
+            "Remove-Item -Recurse -Force C:\\Windows\\Temp\\x C:\\Windows\\System32",
+            "del /s /q C:\\Windows\\Temp\\x C:\\Windows\\System32",
+        ] {
+            assert!(
+                pack.check(command).is_some(),
+                "recursive temp cleanup must require review: {command}"
+            );
+        }
     }
 }
