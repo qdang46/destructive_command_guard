@@ -9,7 +9,12 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DCG="${PROJECT_DIR}/target/release/dcg"
 FIXTURES_DIR="${PROJECT_DIR}/crates/dcg-cli/tests/fixtures/scan"
 EXPECTED="${FIXTURES_DIR}/expected_output.json"
-ACTUAL="/tmp/dcg_scan_regression_actual.json"
+
+if [ -n "${DCG_SCAN_REGRESSION_ACTUAL:-}" ]; then
+    ACTUAL="$DCG_SCAN_REGRESSION_ACTUAL"
+else
+    ACTUAL="$(mktemp "${TMPDIR:-/tmp}/dcg_scan_regression_actual.XXXXXX")"
+fi
 
 # Check prerequisites
 if [ ! -f "$DCG" ]; then
@@ -30,60 +35,71 @@ echo "Fixtures: $FIXTURES_DIR"
 # Run scan and capture output (stderr goes to /dev/null to avoid corrupting JSON)
 "$DCG" scan --paths "$FIXTURES_DIR" --format json --top 0 > "$ACTUAL" 2>/dev/null || true
 
-# Compare key fields (ignore timestamps and elapsed_ms which vary)
-echo ""
-echo "Comparing outputs..."
-
-# Extract and compare findings count
-EXPECTED_FINDINGS=$(python3 -c "import json; print(json.load(open('$EXPECTED'))['summary']['findings_total'])")
-ACTUAL_FINDINGS=$(python3 -c "import json; print(json.load(open('$ACTUAL'))['summary']['findings_total'])")
-
-if [ "$EXPECTED_FINDINGS" != "$ACTUAL_FINDINGS" ]; then
-    echo "FAIL: Findings count mismatch"
-    echo "  Expected: $EXPECTED_FINDINGS"
-    echo "  Actual: $ACTUAL_FINDINGS"
-    exit 1
-fi
-
-# Compare files scanned
-EXPECTED_FILES=$(python3 -c "import json; print(json.load(open('$EXPECTED'))['summary']['files_scanned'])")
-ACTUAL_FILES=$(python3 -c "import json; print(json.load(open('$ACTUAL'))['summary']['files_scanned'])")
-
-if [ "$EXPECTED_FILES" != "$ACTUAL_FILES" ]; then
-    echo "FAIL: Files scanned mismatch"
-    echo "  Expected: $EXPECTED_FILES"
-    echo "  Actual: $ACTUAL_FILES"
-    exit 1
-fi
-
-# Compare rule IDs (semantic check)
-EXPECTED_RULES=$(python3 -c "
+# Compare the complete deterministic scan contract. The scanner receives an
+# absolute fixture path, while the checked-in golden uses repository-relative
+# paths, so normalize only that prefix. Timing remains intentionally excluded.
+if ! python3 - "$EXPECTED" "$ACTUAL" <<'PY'
+import difflib
 import json
-findings = json.load(open('$EXPECTED'))['findings']
-rules = sorted([f.get('rule_id', '') for f in findings])
-print('\n'.join(rules))
-")
+import sys
 
-ACTUAL_RULES=$(python3 -c "
-import json
-findings = json.load(open('$ACTUAL'))['findings']
-rules = sorted([f.get('rule_id', '') for f in findings])
-print('\n'.join(rules))
-")
 
-if [ "$EXPECTED_RULES" != "$ACTUAL_RULES" ]; then
-    echo "FAIL: Rule IDs mismatch"
+def normalize_path(value):
+    normalized = value.replace("\\", "/")
+    marker = "/tests/fixtures/scan/"
+    if marker in normalized:
+        return "tests/fixtures/scan/" + normalized.split(marker, 1)[1]
+    return normalized
+
+
+def normalize(payload):
+    summary = dict(payload["summary"])
+    summary.pop("elapsed_ms", None)
+    if "skipped" in summary:
+        summary["skipped"] = [
+            {**entry, "path": normalize_path(entry["path"])}
+            for entry in summary["skipped"]
+        ]
+    findings = [
+        {**finding, "file": normalize_path(finding["file"])}
+        for finding in payload["findings"]
+    ]
+    return {
+        "schema_version": payload["schema_version"],
+        "summary": summary,
+        "findings": findings,
+    }
+
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    expected = normalize(json.load(handle))
+with open(sys.argv[2], encoding="utf-8") as handle:
+    actual = normalize(json.load(handle))
+
+if expected != actual:
+    expected_lines = json.dumps(expected, indent=2, sort_keys=True).splitlines()
+    actual_lines = json.dumps(actual, indent=2, sort_keys=True).splitlines()
+    print("FAIL: scan output differs from golden", file=sys.stderr)
+    print(
+        "\n".join(
+            difflib.unified_diff(
+                expected_lines,
+                actual_lines,
+                fromfile="expected",
+                tofile="actual",
+                lineterm="",
+            )
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+then
     echo ""
-    echo "Expected rules:"
-    echo "$EXPECTED_RULES"
-    echo ""
-    echo "Actual rules:"
-    echo "$ACTUAL_RULES"
-    exit 1
+    echo "PASS: Scan regression test passed"
+    ACTUAL_FILES=$(python3 -c "import json; print(json.load(open('$ACTUAL'))['summary']['files_scanned'])")
+    ACTUAL_FINDINGS=$(python3 -c "import json; print(json.load(open('$ACTUAL'))['summary']['findings_total'])")
+    echo "  Files scanned: $ACTUAL_FILES"
+    echo "  Findings: $ACTUAL_FINDINGS"
+    echo "  Complete normalized golden matches"
 fi
-
-echo ""
-echo "PASS: Scan regression test passed"
-echo "  Files scanned: $ACTUAL_FILES"
-echo "  Findings: $ACTUAL_FINDINGS"
-echo "  All rule IDs match"

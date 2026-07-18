@@ -26,6 +26,7 @@ KEEP_TEMPDIRS=false
 FILTER=""
 TIMEOUT_SEC=120
 RUN_SELF_TEST=true
+HOOK_TRUST_HANDSHAKE_PASSED=false
 
 TESTS_TOTAL=0
 TESTS_PASSED=0
@@ -36,6 +37,7 @@ CURRENT_TEST_START=0
 
 declare -a TEMP_DIRS=()
 REAL_HOME="$HOME"
+REAL_CODEX_HOME="${CODEX_HOME:-${REAL_HOME}/.codex}"
 
 usage() {
     cat <<'USAGE'
@@ -460,8 +462,8 @@ HOOKEOF
 
     # Copy auth and config from real codex dir so API calls work in the test home.
     for cfg_file in auth.json config.toml; do
-        if [[ -f "${REAL_HOME}/.codex/${cfg_file}" && ! -e "${hooks_dir}/${cfg_file}" ]]; then
-            cp "${REAL_HOME}/.codex/${cfg_file}" "${hooks_dir}/${cfg_file}"
+        if [[ -f "${REAL_CODEX_HOME}/${cfg_file}" && ! -e "${hooks_dir}/${cfg_file}" ]]; then
+            cp "${REAL_CODEX_HOME}/${cfg_file}" "${hooks_dir}/${cfg_file}"
         fi
     done
 
@@ -607,20 +609,29 @@ run_codex_exec() {
     shift 6
     local -a extra_env=("$@")
 
+    # Every scenario creates a fresh, hermetic HOME/CODEX_HOME and writes
+    # exactly one vetted PreToolUse hook that invokes the already-validated
+    # DCG binary. Setting CODEX_HOME explicitly prevents an ambient override
+    # from making the handshake validate some unrelated user hook config.
+    # Codex cannot persist interactive trust for these one-shot hook paths, so
+    # explicitly bypass hook *trust* for this automation run. This does not
+    # bypass hook decisions: DCG still receives and may deny every shell call.
     local argv_json
     argv_json=$(json_array \
         "$CODEX_BINARY" "exec" "--dangerously-bypass-approvals-and-sandbox" \
-        "--ephemeral" "-s" "danger-full-access" "--cd" "$repo")
+        "--dangerously-bypass-hook-trust" "--ephemeral" \
+        "-s" "danger-full-access" "--cd" "$repo")
     trace_event "codex_invoke" "$test_name" \
-        "\"argv\":${argv_json},\"cwd\":\"$(json_escape "$repo")\",\"home\":\"$(json_escape "$test_home")\""
+        "\"argv\":${argv_json},\"cwd\":\"$(json_escape "$repo")\",\"home\":\"$(json_escape "$test_home")\",\"codex_home\":\"$(json_escape "${test_home}/.codex")\""
 
     local start_ms end_ms exit_code
     start_ms=$(timestamp_ms)
     set +e
-    env "${extra_env[@]}" HOME="$test_home" \
+    env "${extra_env[@]}" HOME="$test_home" CODEX_HOME="${test_home}/.codex" \
         timeout "${TIMEOUT_SEC}s" \
         "$CODEX_BINARY" exec --dangerously-bypass-approvals-and-sandbox \
-            --ephemeral -s danger-full-access --cd "$repo" \
+            --dangerously-bypass-hook-trust --ephemeral \
+            -s danger-full-access --cd "$repo" \
             < "$prompt_file" > "$stdout_file" 2> "$stderr_file"
     exit_code=$?
     set -e
@@ -637,7 +648,9 @@ run_codex_allow_test() {
     local repo="$3"
     local expected_output="${4:-}"
 
-    test_matches_filter "$test_name" || return 0
+    if [[ "$test_name" != "smoke_codex_git_status_allowed" ]]; then
+        test_matches_filter "$test_name" || return 0
+    fi
     log_start "$test_name"
 
     local root test_home stdout_file stderr_file pre_state post_state pre_manifest post_manifest timings_file exit_code
@@ -669,13 +682,13 @@ run_codex_allow_test() {
         emit_result "FAIL" "$test_name" "safe Codex run exited ${exit_code}"
         return 0
     fi
-    if ! grep -q "hook: PreToolUse Completed" <<< "$combined"; then
+    if ! grep -q "hook: PreToolUse Completed" "$stderr_file"; then
         save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "Codex did not report PreToolUse Completed"
         return 0
     fi
-    if grep -q "hook: PreToolUse Blocked" "$stdout_file" "$stderr_file"; then
+    if grep -q "hook: PreToolUse Blocked" "$stderr_file"; then
         save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "safe Codex run was blocked"
@@ -705,6 +718,9 @@ run_codex_allow_test() {
     trace_event "assert" "$test_name" "\"name\":\"stderr_quiet\",\"passed\":true"
     if [[ -n "$expected_output" ]]; then
         trace_event "assert" "$test_name" "\"name\":\"expected_output_observed\",\"passed\":true"
+    fi
+    if [[ "$test_name" == "smoke_codex_git_status_allowed" ]]; then
+        HOOK_TRUST_HANDSHAKE_PASSED=true
     fi
     emit_result "PASS" "$test_name"
 }
@@ -740,21 +756,21 @@ run_codex_block_test() {
     write_manifest "$repo" "$post_manifest"
     printf '{"exit_code":%s,"timeout_sec":%s}\n' "$exit_code" "$TIMEOUT_SEC" > "$timings_file"
 
-    local combined
-    combined="$(cat "$stdout_file" "$stderr_file")"
-    if ! grep -q "hook: PreToolUse Blocked" <<< "$combined"; then
+    local stderr_text
+    stderr_text="$(cat "$stderr_file")"
+    if ! grep -q "hook: PreToolUse Blocked" <<< "$stderr_text"; then
         save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "Codex did not report PreToolUse Blocked"
         return 0
     fi
-    if [[ -n "$expected_rule" && "$combined" != *"$expected_rule"* ]]; then
+    if [[ -n "$expected_rule" && "$stderr_text" != *"$expected_rule"* ]]; then
         save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "missing expected rule substring: $expected_rule"
         return 0
     fi
-    if [[ -n "$expected_command" && "$combined" != *"$expected_command"* ]]; then
+    if [[ -n "$expected_command" && "$stderr_text" != *"$expected_command"* ]]; then
         save_failure_artifacts "$test_name" "$repo" "$prompt_file" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "missing expected command substring: $expected_command"
@@ -804,21 +820,19 @@ run_codex_bypass_test() {
     write_manifest "$repo" "$post_manifest"
     printf '{"exit_code":%s,"timeout_sec":%s,"env":["DCG_BYPASS=1"]}\n' "$exit_code" "$TIMEOUT_SEC" > "$timings_file"
 
-    local combined
-    combined="$(cat "$stdout_file" "$stderr_file")"
     if [[ "$exit_code" -ne 0 ]]; then
         save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "bypass Codex run exited ${exit_code}"
         return 0
     fi
-    if ! grep -q "hook: PreToolUse Completed" <<< "$combined"; then
+    if ! grep -q "hook: PreToolUse Completed" "$stderr_file"; then
         save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "Codex did not report PreToolUse Completed under DCG_BYPASS=1"
         return 0
     fi
-    if grep -q "hook: PreToolUse Blocked" "$stdout_file" "$stderr_file"; then
+    if grep -q "hook: PreToolUse Blocked" "$stderr_file"; then
         save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "DCG_BYPASS=1 Codex run was blocked"
@@ -985,10 +999,9 @@ run_codex_block_reason_test() {
 
         save_block_reason_attempt "$test_name" "$attempt" "$stdout_file" "$stderr_file"
 
-        local model_response stderr_text combined
+        local model_response stderr_text
         model_response="$(cat "$stdout_file")"
         stderr_text="$(cat "$stderr_file")"
-        combined="${model_response} ${stderr_text}"
 
         trace_event "block_reason_attempt" "$test_name" \
             "\"attempt\":${attempt},\"exit_code\":${exit_code},\"model_response\":\"$(json_escape "$model_response")\""
@@ -1107,15 +1120,15 @@ run_heredoc_block_scenario() {
     write_manifest "$repo" "$post_manifest"
     printf '{"exit_code":%s,"timeout_sec":%s}\n' "$exit_code" "$TIMEOUT_SEC" > "$timings_file"
 
-    local combined
-    combined="$(cat "$stdout_file" "$stderr_file")"
-    if ! grep -q "hook: PreToolUse Blocked" <<< "$combined"; then
+    local stderr_text
+    stderr_text="$(cat "$stderr_file")"
+    if ! grep -q "hook: PreToolUse Blocked" <<< "$stderr_text"; then
         save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "Codex did not report PreToolUse Blocked"
         return 0
     fi
-    if [[ -n "$expected_rule" && "$combined" != *"$expected_rule"* ]]; then
+    if [[ -n "$expected_rule" && "$stderr_text" != *"$expected_rule"* ]]; then
         save_failure_artifacts "$test_name" "$repo" "$prompt" "$stdout_file" "$stderr_file" \
             "$pre_state" "$post_state" "$pre_manifest" "$post_manifest" "$timings_file"
         emit_result "FAIL" "$test_name" "missing expected rule substring: $expected_rule"
@@ -1191,10 +1204,9 @@ run_multi_turn_session_test() {
     write_manifest "$repo" "$post_manifest"
     printf '{"exit_code":%s,"timeout_sec":%s}\n' "$exit_code" "$TIMEOUT_SEC" > "$timings_file"
 
-    local model_response stderr_text combined
+    local model_response stderr_text
     model_response="$(cat "$stdout_file")"
     stderr_text="$(cat "$stderr_file")"
-    combined="${model_response} ${stderr_text}"
 
     local has_blocked has_completed_after
     has_blocked=false
@@ -1263,6 +1275,21 @@ run_tests() {
     prompt="${root}/smoke_prompt.txt"
     write_smoke_prompt "$prompt"
     run_codex_allow_test "smoke_codex_git_status_allowed" "$prompt" "$repo"
+
+    # Fail closed before presenting Codex with any destructive prompt. A future
+    # trust-model or CLI regression must turn this suite red without allowing
+    # the remaining fixture commands to execute unhooked.
+    if ! $HOOK_TRUST_HANDSHAKE_PASSED; then
+        local reason="Codex hook-trust handshake failed; destructive scenarios were not started"
+        trace_event "suite_abort" "smoke_codex_git_status_allowed" \
+            "\"reason\":\"$(json_escape "$reason")\""
+        if $JSON_OUTPUT; then
+            printf '{"type":"fatal","reason":"%s"}\n' "$(json_escape "$reason")"
+        else
+            echo -e "${RED}${BOLD}FATAL:${NC} ${reason}"
+        fi
+        return 0
+    fi
 
     # P3.3: Safe commands flow through Codex without false-positive dcg output.
     run_safe_scenario "allow_git_status" "git status" "file.txt"
