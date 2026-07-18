@@ -20,12 +20,13 @@ mod tests {
     }
 
     #[test]
-    fn test_heredoc_backslash_delimiter_bypass() {
+    fn test_backslash_quoted_data_sink_heredoc_is_inert() {
         let (config, keywords, compiled, allowlists) = get_eval_components();
 
-        // This uses backslash escaping for the delimiter, which is valid in bash
-        // and behaves like a quoted delimiter (no expansion).
-        // If the heredoc extractor regex doesn't support this, it will be missed.
+        // Backslash-quoting the delimiter suppresses shell expansion. Since the
+        // receiver is the real `cat` data sink, the body is inert data and must
+        // not become a false positive merely because it contains destructive
+        // command text.
         let cmd = r"
 cat <<\EOF
 rm -rf /
@@ -33,8 +34,23 @@ EOF
 ";
         let result = evaluate_command(cmd, &config, &keywords, &compiled, &allowlists);
         assert!(
+            !result.is_denied(),
+            "quoted data-sink heredoc should remain inert: {cmd}"
+        );
+
+        // The same delimiter syntax must never hide an executing heredoc. A
+        // visible shell function can replace `cat` and execute the body, so
+        // data-sink masking must fail closed in this form.
+        let executing = r"
+cat() { bash -s; }
+cat <<\EOF
+rm -rf /
+EOF
+";
+        let result = evaluate_command(executing, &config, &keywords, &compiled, &allowlists);
+        assert!(
             result.is_denied(),
-            "Should block heredoc with backslash-escaped delimiter: {cmd}"
+            "backslash-quoted heredoc executed by a shell function must be blocked: {executing}"
         );
     }
 

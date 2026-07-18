@@ -23,16 +23,37 @@ fn stderr_text(output: &Output) -> String {
 
 /// Run dcg with an isolated HOME/XDG config to avoid machine-specific allowlists.
 fn run_dcg_isolated(args: &[&str], cwd: Option<&Path>) -> Output {
+    run_dcg_isolated_with_env(args, cwd, &[])
+}
+
+fn run_dcg_isolated_with_env(
+    args: &[&str],
+    cwd: Option<&Path>,
+    extra_env: &[(&str, &Path)],
+) -> Output {
     let home = tempfile::tempdir().expect("temp home");
-    let xdg = home.path().join("xdg");
+    run_dcg_with_home(args, cwd, home.path(), extra_env)
+}
+
+fn run_dcg_with_home(
+    args: &[&str],
+    cwd: Option<&Path>,
+    home: &Path,
+    extra_env: &[(&str, &Path)],
+) -> Output {
+    let xdg = home.join("xdg");
     std::fs::create_dir_all(&xdg).expect("create xdg config dir");
 
     let mut cmd = Command::new(dcg_binary());
     cmd.args(args)
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+        .env("HOME", home)
+        .env("USERPROFILE", home)
         .env("XDG_CONFIG_HOME", &xdg)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "");
+
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
 
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -76,6 +97,43 @@ fn test_basic_allowed_command_exits_zero() {
 }
 
 #[test]
+fn test_printf_data_after_shell_reserved_words_is_allowed() {
+    for command in [
+        r"if true; then printf '%-50s -> %s\n' a b; fi; mv x y",
+        r"while false; do printf '%-50s -> %s\n' a b; done; mv x y",
+    ] {
+        let output = run_dcg_isolated(&["test", "--format", "json", command], None);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "quoted printf data must not be parsed as a redirect\ncommand: {command}\nstdout: {}\nstderr: {}",
+            stdout_text(&output),
+            stderr_text(&output)
+        );
+        assert_eq!(parse_json(&output)["decision"], "allow");
+    }
+}
+
+#[test]
+fn test_real_dynamic_redirect_after_shell_reserved_word_is_blocked() {
+    let command = r#"if true; then printf '%s' x > "$SOMEDIR/x"; fi"#;
+    let output = run_dcg_isolated(&["test", "--format", "json", command], None);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a real dynamic redirect must remain visible after masking printf data\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "core.filesystem");
+    assert_eq!(json["pattern_name"], "redirect-truncate-dynamic-path");
+}
+
+#[test]
 fn test_stdout_stderr_redirect_truncate_is_blocked() {
     let output = run_dcg_isolated(&["test", "--format", "json", ": >&/etc/passwd"], None);
 
@@ -94,7 +152,7 @@ fn test_stdout_stderr_redirect_truncate_is_blocked() {
 }
 
 #[test]
-fn test_allowlist_match_allows_blocked_command() {
+fn test_untrusted_project_allowlist_cannot_allow_blocked_command() {
     let repo = tempfile::tempdir().expect("temp repo");
     std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
     std::fs::create_dir_all(repo.path().join(".dcg")).expect("create .dcg dir");
@@ -115,13 +173,263 @@ reason = "test fixture allowlist entry"
 
     assert_eq!(
         output.status.code(),
+        Some(1),
+        "auto-discovered project allowlist must be inactive\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+}
+
+#[test]
+fn test_explicitly_trusted_project_policy_activates_project_allowlist() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(repo.path().join(".dcg")).expect("create .dcg dir");
+    let project_config = repo.path().join(".dcg.toml");
+    std::fs::write(&project_config, "").expect("write reviewed project config");
+    std::fs::write(
+        repo.path().join(".dcg").join("allowlist.toml"),
+        r#"
+[[allow]]
+exact_command = "git reset --hard"
+reason = "explicitly trusted project fixture"
+"#,
+    )
+    .expect("write allowlist");
+
+    let output = run_dcg_isolated_with_env(
+        &["test", "--format", "json", "git reset --hard"],
+        Some(repo.path()),
+        &[("DCG_CONFIG", project_config.as_path())],
+    );
+
+    assert_eq!(
+        output.status.code(),
         Some(0),
-        "allowlist match should allow command\nstderr: {}",
+        "explicit project-policy trust should activate its allowlist\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
         stderr_text(&output)
     );
 
     let json = parse_json(&output);
     assert_eq!(json["decision"], "allow");
+}
+
+#[test]
+fn test_missing_project_config_cannot_activate_sibling_allowlist() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(repo.path().join(".dcg")).expect("create .dcg dir");
+    let missing_project_config = repo.path().join(".dcg.toml");
+    std::fs::write(
+        repo.path().join(".dcg").join("allowlist.toml"),
+        r#"
+[[allow]]
+exact_command = "git reset --hard"
+reason = "must remain inactive without a regular config file"
+"#,
+    )
+    .expect("write allowlist");
+
+    let output = run_dcg_isolated_with_env(
+        &["test", "--format", "json", "git reset --hard"],
+        Some(repo.path()),
+        &[("DCG_CONFIG", missing_project_config.as_path())],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a missing selected config is not a trust signal\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+    assert_eq!(parse_json(&output)["decision"], "deny");
+}
+
+#[test]
+fn test_project_allowlist_inspection_marks_untrusted_file_inactive() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(repo.path().join(".dcg")).expect("create .dcg dir");
+    std::fs::write(
+        repo.path().join(".dcg").join("allowlist.toml"),
+        r#"
+[[allow]]
+exact_command = "git reset --hard"
+reason = "inactive inspection fixture"
+"#,
+    )
+    .expect("write allowlist");
+
+    let effective = run_dcg_isolated(
+        &["allowlist", "list", "--format", "json"],
+        Some(repo.path()),
+    );
+    assert!(
+        effective.status.success(),
+        "stderr: {}",
+        stderr_text(&effective)
+    );
+    assert_eq!(
+        parse_json(&effective),
+        serde_json::json!([]),
+        "default list must expose effective layers only"
+    );
+
+    let raw_project = run_dcg_isolated(
+        &["allowlist", "list", "--project", "--format", "json"],
+        Some(repo.path()),
+    );
+    assert!(
+        raw_project.status.success(),
+        "stderr: {}",
+        stderr_text(&raw_project)
+    );
+    let entries = parse_json(&raw_project);
+    assert_eq!(entries.as_array().map(Vec::len), Some(1));
+    assert_eq!(entries[0]["layer"], "project");
+    assert_eq!(entries[0]["effective"], false);
+    assert_eq!(entries[0]["status"], "inactive_untrusted_project");
+
+    let validation = run_dcg_isolated(&["allowlist", "validate", "--project"], Some(repo.path()));
+    assert!(
+        validation.status.success(),
+        "stderr: {}",
+        stderr_text(&validation)
+    );
+    assert!(stdout_text(&validation).contains("INACTIVE:"));
+}
+
+#[test]
+fn test_allowlist_add_defaults_to_user_and_untrusted_project_write_is_refused() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    let home = tempfile::tempdir().expect("temp home");
+    std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
+
+    let default_add = run_dcg_with_home(
+        &[
+            "allowlist",
+            "add",
+            "core.git:reset-hard",
+            "--reason",
+            "user-owned fixture",
+        ],
+        Some(repo.path()),
+        home.path(),
+        &[],
+    );
+    assert!(
+        default_add.status.success(),
+        "stdout: {}\nstderr: {}",
+        stdout_text(&default_add),
+        stderr_text(&default_add)
+    );
+    let user_allowlist = home.path().join("xdg/dcg/allowlist.toml");
+    assert!(user_allowlist.is_file());
+    assert!(
+        std::fs::read_to_string(&user_allowlist)
+            .expect("read user allowlist")
+            .contains("core.git:reset-hard")
+    );
+    assert!(!repo.path().join(".dcg/allowlist.toml").exists());
+
+    let applied = run_dcg_with_home(
+        &["test", "--format", "json", "git reset --hard"],
+        Some(repo.path()),
+        home.path(),
+        &[],
+    );
+    assert!(
+        applied.status.success(),
+        "new user allowlist entry must be active\nstdout: {}\nstderr: {}",
+        stdout_text(&applied),
+        stderr_text(&applied)
+    );
+    assert_eq!(parse_json(&applied)["allowlist"]["layer"], "user");
+
+    let refused = run_dcg_with_home(
+        &[
+            "allowlist",
+            "add",
+            "core.git:reset-hard",
+            "--reason",
+            "must not enter repository policy",
+            "--project",
+        ],
+        Some(repo.path()),
+        home.path(),
+        &[],
+    );
+    assert!(!refused.status.success());
+    let refusal = format!("{}{}", stdout_text(&refused), stderr_text(&refused));
+    assert!(refusal.contains("Project allowlists are inactive"));
+    assert!(refusal.contains("--path"));
+    assert!(refusal.contains("/**"));
+    assert!(!repo.path().join(".dcg/allowlist.toml").exists());
+}
+
+#[test]
+fn test_prune_never_rewrites_inactive_project_allowlist() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
+    std::fs::create_dir_all(repo.path().join(".dcg")).expect("create .dcg dir");
+    let project_allowlist = repo.path().join(".dcg/allowlist.toml");
+    let original = r#"
+[[allow]]
+exact_command = "git reset --hard"
+reason = "expired inactive fixture"
+expires_at = "2000-01-01T00:00:00Z"
+"#;
+    std::fs::write(&project_allowlist, original).expect("write allowlist");
+
+    let default_prune = run_dcg_isolated(&["allowlist", "prune"], Some(repo.path()));
+    assert!(
+        default_prune.status.success(),
+        "stderr: {}",
+        stderr_text(&default_prune)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&project_allowlist).expect("read unchanged project allowlist"),
+        original
+    );
+
+    let refused = run_dcg_isolated(&["allowlist", "prune", "--project"], Some(repo.path()));
+    assert!(!refused.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&project_allowlist).expect("read refused project allowlist"),
+        original
+    );
+
+    let dry_run = run_dcg_isolated(
+        &[
+            "allowlist",
+            "prune",
+            "--project",
+            "--dry-run",
+            "--format",
+            "json",
+        ],
+        Some(repo.path()),
+    );
+    assert!(
+        dry_run.status.success(),
+        "stderr: {}",
+        stderr_text(&dry_run)
+    );
+    let report = parse_json(&dry_run);
+    assert_eq!(
+        report["project_policy_status"],
+        "inactive_untrusted_project"
+    );
+    assert_eq!(report["pruned"], 1);
+    assert_eq!(
+        std::fs::read_to_string(&project_allowlist).expect("read dry-run project allowlist"),
+        original
+    );
 }
 
 #[test]
@@ -221,7 +529,7 @@ block = [
 }
 
 #[test]
-fn test_project_config_discovery_is_applied_without_config_flag() {
+fn test_untrusted_project_config_cannot_allow_blocked_command() {
     let repo = tempfile::tempdir().expect("temp repo");
     std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
     std::fs::write(
@@ -240,13 +548,45 @@ allow = ["git reset --hard"]
 
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "project config should allow command\nstderr: {}",
+        Some(1),
+        "auto-discovered project config must not grant trust\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
         stderr_text(&output)
     );
 
     let json = parse_json(&output);
-    assert_eq!(json["decision"], "allow");
+    assert_eq!(json["decision"], "deny");
+}
+
+#[test]
+fn test_untrusted_project_config_can_enable_builtin_protection() {
+    let repo = tempfile::tempdir().expect("temp repo");
+    std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
+    std::fs::write(
+        repo.path().join(".dcg.toml"),
+        r#"
+[packs]
+enabled = ["database.postgresql"]
+"#,
+    )
+    .expect("write project config");
+
+    let output = run_dcg_isolated(
+        &["test", "--format", "json", "dropdb project-policy-probe"],
+        Some(repo.path()),
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "auto-discovered project config should retain built-in pack hardening\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "database.postgresql");
 }
 
 #[test]

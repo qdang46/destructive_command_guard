@@ -2,11 +2,17 @@
 //!
 //! Supports layered configuration from multiple sources:
 //! 1. Environment variables (highest priority)
-//! 2. Project config (.dcg.toml in repo root)
+//! 2. Explicit config (`DCG_CONFIG`)
 //! 3. User config ($XDG_CONFIG_HOME/dcg/config.toml, ~/.config/dcg/config.toml, or
 //!    platform-native config dir)
 //! 4. System config (/etc/dcg/config.toml)
 //! 5. Compiled defaults (lowest priority)
+//!
+//! A repository's automatically discovered `.dcg.toml` is an untrusted policy
+//! contribution, not a normal precedence layer. It may add protection, but it
+//! cannot add allow rules, disable packs, select custom code/data paths, or
+//! otherwise weaken settings chosen by a trusted source. Users who deliberately
+//! trust the entire file can opt in explicitly with `DCG_CONFIG=.dcg.toml`.
 
 use crate::interactive::{InteractiveConfig, VerificationMethod};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
@@ -14,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -26,55 +32,47 @@ use std::str::FromStr;
 /// data above this cap is rejected.
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
-/// Trust class for a config-file source. Controls symlink handling.
+/// Trust class for a config-file source. Controls symlink handling and, for an
+/// automatically discovered project config, which settings may take effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigSource {
-    /// User/project layer (or any caller-controlled path). Symlinks are
-    /// followed normally; the only enforcement is the size cap.
+    /// User-selected layer (user config or an explicit `DCG_CONFIG` path).
+    /// Symlinks are followed normally; the read helper enforces only the size
+    /// cap. Selecting an explicit path is itself the trust decision.
     Untrusted,
-    /// System-wide config layer (`/etc/dcg/config.toml`). Refuses to load
-    /// when the path is a symlink to a target the current user can write
-    /// to — that combination would let a non-root user influence the
-    /// privileged config layer by planting a symlink.
+    /// Automatically discovered repository `.dcg.toml`. On Unix, the leaf
+    /// must be a direct regular file: symlinks, FIFOs, devices, and
+    /// descriptor-backed pseudo-files are rejected before any bytes are read.
+    /// Other platforms fail closed until native handle/reparse validation is
+    /// available.
+    AutoProject,
+    /// System-wide config layer (`/etc/dcg/config.toml`). Unix accepts only a
+    /// direct root-owned regular file with no group/world write access beneath
+    /// a direct, equally trusted directory chain. Other platforms fail closed
+    /// until native ACL and reparse-point validation is available.
     System,
 }
 
-/// Read a config file with a size cap and (for system layer) a symlink
-/// safety check. Returns `None` and logs a warning on any failure.
+/// Read a config file with a size cap and source-specific path policy.
+///
+/// Restricted Unix sources are opened with `O_NOFOLLOW | O_NONBLOCK |
+/// O_CLOEXEC`, validated through the opened descriptor, and then read through
+/// that same descriptor. This ordering prevents a path swap from redirecting
+/// the subsequent read and prevents a FIFO from wedging the hook before its
+/// file type can be rejected.
 pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Option<String> {
-    if source == ConfigSource::System {
-        // Symlink defense: refuse to follow if the link target is in a
-        // user-writable location. We use `symlink_metadata` so the call
-        // does not traverse the link itself.
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                if symlink_target_is_user_writable(path) {
-                    eprintln!(
-                        "Warning: refusing to load system config '{}' — symlink to user-writable target",
-                        path.display()
-                    );
-                    return None;
-                }
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to stat config file '{}': {}",
-                    path.display(),
-                    e
-                );
-                return None;
-            }
-        }
+    #[cfg(not(unix))]
+    if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+        warn_and_ignore_non_unix_restricted_config(path, source);
+        return None;
     }
 
-    let mut file = match fs::File::open(path) {
+    let mut file = match open_config_file_for_source(path, source) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
             eprintln!(
-                "Warning: Failed to read config file '{}': {}",
+                "Warning: refusing to load config file '{}': {}",
                 path.display(),
                 e
             );
@@ -109,34 +107,281 @@ pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Opt
     Some(buf)
 }
 
-fn symlink_target_is_user_writable(path: &Path) -> bool {
-    // Resolve the link target and check if its parent directory is owned
-    // by a non-root user / writable by non-root. The conservative answer
-    // ("yes, user-writable") on any error keeps the safety check biased
-    // toward refusing to load.
-    let Ok(target) = fs::canonicalize(path) else {
-        return true;
+/// Render a TOML error from an automatically discovered repository config
+/// without reflecting any attacker-controlled source bytes.
+///
+/// `toml::de::Error`'s normal `Display` output embeds a source excerpt. That is
+/// useful for a config path the user selected, but unsafe for repository-owned
+/// `.dcg.toml`: the excerpt can contain terminal control sequences or an
+/// arbitrarily long line. Only a bounded numeric location is reported here.
+pub(crate) fn safe_auto_project_toml_error(input: &str, error: &toml::de::Error) -> String {
+    let Some(span) = error.span() else {
+        return "Invalid TOML in automatic project config (location unavailable)".to_string();
     };
+
+    let offset = span.start.min(input.len());
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for byte in input.as_bytes().iter().take(offset) {
+        if *byte == b'\n' {
+            line = line.saturating_add(1);
+            column = 1;
+        } else {
+            column = column.saturating_add(1);
+        }
+    }
+
+    format!("Invalid TOML in automatic project config at line {line}, column {column}")
+}
+
+fn open_config_file_for_source(path: &Path, source: ConfigSource) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
-        let parent = target.parent().unwrap_or(&target);
-        let Ok(meta) = fs::metadata(parent) else {
-            return true;
-        };
-        // Anything not owned by root (uid 0) is treated as user-writable.
-        // Group/world-writable directories are also user-writable even when
-        // owned by root.
-        meta.uid() != 0 || (meta.permissions().mode() & 0o022) != 0
+        if source != ConfigSource::Untrusted {
+            return open_restricted_unix_config_file(path, source);
+        }
     }
+
     #[cfg(not(unix))]
+    if source != ConfigSource::Untrusted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "restricted config source requires native handle and reparse-point validation",
+        ));
+    }
+
+    fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn open_restricted_unix_config_file(path: &Path, source: ConfigSource) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    debug_assert_ne!(source, ConfigSource::Untrusted);
+
+    if source == ConfigSource::System {
+        // Preserve the normal "missing optional config" behavior without
+        // opening the path. For an existing path, validate every lexical
+        // ancestor before traversal; the same chain is checked again after the
+        // descriptor/path identity check to close replacement races.
+        fs::symlink_metadata(path)?;
+        validate_unix_system_ancestor_chain(path).map_err(unix_config_trust_io_error)?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+
+    validate_opened_unix_config_file(path, &file, source).map_err(unix_config_trust_io_error)?;
+
+    if source == ConfigSource::System {
+        validate_unix_system_ancestor_chain(path).map_err(unix_config_trust_io_error)?;
+    }
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixConfigTrustError {
+    PathMustBeAbsoluteAndNormalized,
+    MetadataUnavailable,
+    Symlink,
+    NotRegularFile,
+    NotDirectory,
+    UntrustedOwnerOrMode,
+    PathIdentityChanged,
+}
+
+#[cfg(unix)]
+const fn unix_config_trust_error_message(error: UnixConfigTrustError) -> &'static str {
+    match error {
+        UnixConfigTrustError::PathMustBeAbsoluteAndNormalized => {
+            "system config path must be absolute and contain no '.' or '..' components"
+        }
+        UnixConfigTrustError::MetadataUnavailable => "unable to inspect config path safely",
+        UnixConfigTrustError::Symlink => "symlinks are not permitted for this config source",
+        UnixConfigTrustError::NotRegularFile => "config source is not a regular file",
+        UnixConfigTrustError::NotDirectory => "system config ancestor is not a directory",
+        UnixConfigTrustError::UntrustedOwnerOrMode => {
+            "system config path is not root-owned or is group/world writable"
+        }
+        UnixConfigTrustError::PathIdentityChanged => {
+            "config path changed while it was being validated"
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_config_trust_io_error(error: UnixConfigTrustError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        unix_config_trust_error_message(error),
+    )
+}
+
+#[cfg(unix)]
+fn validate_opened_unix_config_file(
+    path: &Path,
+    file: &fs::File,
+    source: ConfigSource,
+) -> Result<(), UnixConfigTrustError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+    if !opened_metadata.is_file() {
+        return Err(UnixConfigTrustError::NotRegularFile);
+    }
+    if source == ConfigSource::System
+        && unix_owner_or_mode_is_user_writable(opened_metadata.uid(), opened_metadata.mode())
     {
-        // No portable way to express "user-writable" cross-platform.
-        // On non-unix the symlink-into-system-config attack does not
-        // apply the same way; default to allowing the load.
-        let _ = target;
-        false
+        return Err(UnixConfigTrustError::UntrustedOwnerOrMode);
+    }
+
+    // `symlink_metadata` describes the leaf itself. Combined with O_NOFOLLOW,
+    // this rejects a symlink both before and after open. Comparing dev/inode
+    // binds the current path to the already-open descriptor, so a concurrent
+    // rename cannot redirect the bytes read below.
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(UnixConfigTrustError::Symlink);
+    }
+    if !path_metadata.is_file() {
+        return Err(UnixConfigTrustError::NotRegularFile);
+    }
+    if !unix_metadata_refers_to_same_file(&opened_metadata, &path_metadata) {
+        return Err(UnixConfigTrustError::PathIdentityChanged);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_system_ancestor_chain(path: &Path) -> Result<(), UnixConfigTrustError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized);
+    }
+
+    let parent = path
+        .parent()
+        .ok_or(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized)?;
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+        if metadata.file_type().is_symlink() {
+            return Err(UnixConfigTrustError::Symlink);
+        }
+        if !metadata.is_dir() {
+            return Err(UnixConfigTrustError::NotDirectory);
+        }
+        if unix_owner_or_mode_is_user_writable(metadata.uid(), metadata.mode()) {
+            return Err(UnixConfigTrustError::UntrustedOwnerOrMode);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_metadata_refers_to_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(unix)]
+const fn unix_owner_or_mode_is_user_writable(uid: u32, mode: u32) -> bool {
+    // A non-root owner can restore owner-write permission with chmod even when
+    // the current mode is read-only, so ownership alone makes the object
+    // untrusted. Group/world write bits are rejected regardless of membership;
+    // this is intentionally a conservative privileged-config policy.
+    uid != 0 || (mode & 0o022) != 0
+}
+
+#[cfg(not(unix))]
+fn warn_and_ignore_non_unix_restricted_config(path: &Path, source: ConfigSource) {
+    let source_name = match source {
+        ConfigSource::AutoProject => "automatic project",
+        ConfigSource::System => "system",
+        ConfigSource::Untrusted => return,
+    };
+
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            eprintln!(
+                "Warning: ignoring {source_name} config '{}' — native ACL and reparse-point validation is unavailable",
+                path.display()
+            );
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: ignoring {source_name} config '{}' — unable to inspect path safely: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+}
+
+/// Classify a failed bounded read using the same platform/source semantics as
+/// [`read_config_file_bounded`]. The read helper has already emitted the
+/// detailed warning; this bounded, source-safe summary is retained for config
+/// and doctor output.
+fn failed_config_read_outcome(
+    path: &Path,
+    source: ConfigSource,
+) -> (ConfigFileStatus, Option<String>) {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (ConfigFileStatus::Missing, None),
+        Err(error) => (
+            ConfigFileStatus::Rejected,
+            Some(format!("unable to inspect path safely: {error}")),
+        ),
+        Ok(_) => {
+            #[cfg(not(unix))]
+            if matches!(source, ConfigSource::AutoProject | ConfigSource::System) {
+                return (
+                    ConfigFileStatus::IgnoredUnsupported,
+                    Some(
+                        "native ACL, reparse-point, and file-identity validation is unavailable"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            let detail = match source {
+                ConfigSource::AutoProject => {
+                    "automatic project config failed direct-regular-file validation"
+                }
+                ConfigSource::System => {
+                    "system config failed privileged path, ownership, mode, or regular-file validation"
+                }
+                ConfigSource::Untrusted => {
+                    "config could not be read safely or exceeded the configured size cap"
+                }
+            };
+            (ConfigFileStatus::Rejected, Some(detail.to_string()))
+        }
+    }
+}
+
+fn record_config_outcome(
+    target: &mut Option<Vec<ConfigSourceOutcome>>,
+    outcome: Option<ConfigSourceOutcome>,
+) {
+    if let (Some(target), Some(outcome)) = (target.as_mut(), outcome) {
+        target.push(outcome);
     }
 }
 
@@ -216,6 +461,117 @@ pub struct Config {
     pub projects: std::collections::HashMap<String, ProjectConfig>,
 }
 
+/// Identity of a file-backed configuration layer.
+///
+/// This is intentionally separate from [`ConfigSource`]: `ConfigSource`
+/// controls how a path is opened, while this enum describes the layer users
+/// see in `dcg config` and `dcg doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileLayer {
+    System,
+    User,
+    AutomaticProject,
+    Explicit,
+}
+
+impl ConfigFileLayer {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::AutomaticProject => "automatic project",
+            Self::Explicit => "DCG_CONFIG",
+        }
+    }
+}
+
+/// Whether a file layer has full config authority or the automatic-project
+/// enforcement-only subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileAuthority {
+    Full,
+    EnforcementOnly,
+}
+
+impl ConfigFileAuthority {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::EnforcementOnly => "enforcement-only",
+        }
+    }
+}
+
+/// Result of considering one file path during configuration loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileStatus {
+    Loaded,
+    Missing,
+    Skipped,
+    #[cfg_attr(unix, allow(dead_code))]
+    IgnoredUnsupported,
+    Rejected,
+    Invalid,
+}
+
+impl ConfigFileStatus {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Missing => "missing",
+            Self::Skipped => "skipped",
+            Self::IgnoredUnsupported => "ignored-unsupported",
+            Self::Rejected => "rejected",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Auditable outcome for a single config-file candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ConfigSourceOutcome {
+    pub(crate) layer: ConfigFileLayer,
+    pub(crate) authority: ConfigFileAuthority,
+    pub(crate) status: ConfigFileStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+impl ConfigSourceOutcome {
+    fn new(
+        layer: ConfigFileLayer,
+        authority: ConfigFileAuthority,
+        status: ConfigFileStatus,
+        path: Option<PathBuf>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            layer,
+            authority,
+            status,
+            path,
+            detail,
+        }
+    }
+}
+
+/// Effective configuration plus the exact file-source outcomes that produced
+/// it. Keeping these together prevents diagnostics from guessing based on
+/// `Path::exists()` after the security-aware loader has made its decision.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigLoadReport {
+    pub(crate) config: Config,
+    pub(crate) sources: Vec<ConfigSourceOutcome>,
+}
+
 /// Canonical published location of dcg's committed JSON Schema. Editors point
 /// their `config.toml` here (or at a local copy) to get autocomplete/validation.
 pub const CONFIG_SCHEMA_ID: &str = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json";
@@ -272,8 +628,9 @@ pub fn config_json_schema_string() -> String {
 // The public `Config` structs use `#[serde(default)]` to provide ergonomic
 // defaults when loading a *single* config file.
 //
-// For layered config precedence (system → user → project → env), we must also
-// preserve whether a field was present in TOML. Otherwise we lose information
+// For layered config precedence (system → user → restricted project policy →
+// explicit config → env), we must also preserve whether a field was present in
+// TOML. Otherwise we lose information
 // about "explicitly set to default" vs "not set at all", which breaks the
 // "higher precedence wins" mental model (e.g. you could not set
 // `general.verbose=false` if a lower layer set it to true).
@@ -299,6 +656,117 @@ struct ConfigLayer {
     agents: Option<AgentsConfig>,
     response: Option<ResponseConfigLayer>,
     projects: Option<std::collections::HashMap<String, ProjectConfig>>,
+}
+
+impl ConfigLayer {
+    /// Reduce an automatically discovered repository config to settings that
+    /// can only add enforcement.
+    ///
+    /// Repository contents are attacker-controlled at the point dcg first
+    /// evaluates a command in a newly cloned checkout. Treating `.dcg.toml` as
+    /// a normal high-priority layer would let the repository disable the guard
+    /// that is meant to protect the user from that repository. Keep this
+    /// allowlist deliberately small and explicit: new config fields are denied
+    /// by default until their monotonic safety has been reviewed.
+    fn into_restricted_project_policy(self) -> Self {
+        let Self {
+            general,
+            packs,
+            policy,
+            heredoc,
+            ..
+        } = self;
+
+        let general = general.and_then(|general| {
+            (general.fail_closed == Some(true)).then(|| GeneralConfigLayer {
+                fail_closed: Some(true),
+                ..GeneralConfigLayer::default()
+            })
+        });
+
+        let packs = packs.and_then(|packs| {
+            // External packs require a custom path, which an untrusted
+            // repository may not supply. Keep only known built-in pack IDs or
+            // their registry categories so arbitrary strings cannot inflate
+            // the effective configuration or masquerade as enforcement.
+            let known_pack_ids = crate::packs::REGISTRY
+                .all_pack_ids()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let known_categories = crate::packs::REGISTRY
+                .all_categories()
+                .into_iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            let enabled = packs
+                .enabled
+                .into_iter()
+                .filter(|candidate| {
+                    known_pack_ids.contains(candidate.as_str())
+                        || known_categories.contains(candidate.as_str())
+                })
+                .collect::<Vec<_>>();
+
+            (!enabled.is_empty()).then(|| PacksConfig {
+                enabled,
+                // An untrusted repository may not turn protections off or
+                // point dcg at repository-controlled external pack data.
+                disabled: Vec::new(),
+                custom_paths: Vec::new(),
+            })
+        });
+
+        let policy = policy.and_then(|policy| {
+            let default_mode =
+                (policy.default_mode == Some(PolicyMode::Deny)).then_some(PolicyMode::Deny);
+            let packs = policy
+                .packs
+                .into_iter()
+                .filter(|(_, mode)| *mode == PolicyMode::Deny)
+                .collect::<std::collections::HashMap<_, _>>();
+            let rules = policy
+                .rules
+                .into_iter()
+                .filter(|(_, mode)| *mode == PolicyMode::Deny)
+                .collect::<std::collections::HashMap<_, _>>();
+
+            (default_mode.is_some() || !packs.is_empty() || !rules.is_empty()).then_some({
+                PolicyConfig {
+                    default_mode,
+                    observe_until: None,
+                    packs,
+                    rules,
+                }
+            })
+        });
+
+        let heredoc = heredoc.and_then(|heredoc| {
+            let enabled = (heredoc.enabled == Some(true)).then_some(true);
+            let fallback_on_parse_error =
+                (heredoc.fallback_on_parse_error == Some(false)).then_some(false);
+            let fallback_on_timeout = (heredoc.fallback_on_timeout == Some(false)).then_some(false);
+
+            (enabled.is_some()
+                || fallback_on_parse_error.is_some()
+                || fallback_on_timeout.is_some())
+            .then(|| HeredocConfig {
+                enabled,
+                fallback_on_parse_error,
+                fallback_on_timeout,
+                // Limits and language filters can reduce analysis coverage;
+                // a content allowlist is an explicit trust grant.
+                ..HeredocConfig::default()
+            })
+        });
+
+        Self {
+            general,
+            packs,
+            policy,
+            heredoc,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -397,8 +865,11 @@ struct GitAwarenessConfigLayer {
 
 /// The system-wide (machine-level) dcg configuration directory.
 ///
-/// On Unix this is `/etc/dcg`. Native Windows has no `/etc`, so the system
-/// layer lives under `%ProgramData%\dcg` (resolved from the `ProgramData`
+/// On Linux and other Unix platforms this is `/etc/dcg`. macOS exposes `/etc`
+/// through a symlink, while privileged config rejects every symlinked ancestor,
+/// so macOS uses the equivalent direct path `/private/etc/dcg`. Native Windows
+/// has no `/etc`, so the nominal system layer lives under `%ProgramData%\dcg`
+/// (resolved from the `ProgramData`
 /// environment variable, falling back to `C:\ProgramData`) — the conventional
 /// location for machine-wide application configuration. The `dirs` crate does
 /// not expose `ProgramData`, hence the manual resolution. This is the single
@@ -411,7 +882,11 @@ pub(crate) fn system_config_dir() -> PathBuf {
             .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
             .join("dcg")
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/private/etc/dcg")
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         PathBuf::from("/etc/dcg")
     }
@@ -471,6 +946,36 @@ pub(crate) fn find_repo_root(start_dir: &Path, max_hops: usize) -> Option<PathBu
         }
     }
     None
+}
+
+/// Return whether the user explicitly selected this repository's `.dcg.toml`
+/// through [`ENV_CONFIG_PATH`].
+///
+/// Automatic discovery is never a trust signal: the repository controls both
+/// `.dcg.toml` and `.dcg/allowlist.toml`. Selecting the root config through an
+/// environment variable is an out-of-repository action and therefore the
+/// narrow opt-in used by the runtime before activating the sibling project
+/// allowlist.
+pub(crate) fn explicitly_trusts_project_policy(start_dir: &Path) -> bool {
+    let Some(repo_root) = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS) else {
+        return false;
+    };
+    let Ok(value) = env::var(ENV_CONFIG_PATH) else {
+        return false;
+    };
+    let Some(selected) = resolve_config_path_value(&value, Some(start_dir)) else {
+        return false;
+    };
+    let expected = repo_root.join(PROJECT_CONFIG_NAME);
+
+    // Resolve symlinks and `.`/`..` components. A missing path, directory, or
+    // failed canonicalization is not evidence of trust and must not activate a
+    // sibling repository allowlist.
+    let (Ok(selected), Ok(expected)) = (fs::canonicalize(selected), fs::canonicalize(expected))
+    else {
+        return false;
+    };
+    selected == expected && fs::metadata(expected).is_ok_and(|metadata| metadata.is_file())
 }
 
 /// Heredoc and inline-script scanning configuration.
@@ -1202,7 +1707,8 @@ pub struct GeneralConfig {
     pub max_hook_input_bytes: Option<usize>,
 
     /// Maximum bytes for command string after extraction from JSON.
-    /// Commands exceeding this limit are allowed (fail-open) with a warning.
+    /// Commands exceeding this limit produce an explicit indeterminate result;
+    /// review-capable protocols ask and other protocols block.
     /// Default: 65536 (64 KiB).
     pub max_command_bytes: Option<usize>,
 
@@ -3088,26 +3594,92 @@ impl Config {
     /// Priority (highest to lowest):
     /// 1. Environment variables (settings overrides)
     /// 2. Explicit config file (`DCG_CONFIG=/path/to/config.toml`)
-    /// 3. Project config (`.dcg.toml` in repo root)
-    /// 4. User config (`$XDG_CONFIG_HOME/dcg/config.toml`, `~/.config/dcg/config.toml`,
+    /// 3. User config (`$XDG_CONFIG_HOME/dcg/config.toml`, `~/.config/dcg/config.toml`,
     ///    or platform-native config dir)
-    /// 5. System config (`/etc/dcg/config.toml`)
-    /// 6. Compiled defaults
+    /// 4. System config (`/etc/dcg/config.toml`)
+    /// 5. Compiled defaults
+    ///
+    /// An automatically discovered project `.dcg.toml` is not a trusted
+    /// precedence layer. Its monotonic enforcement-only subset is applied
+    /// after user/system files; settings that could weaken or redirect policy
+    /// are discarded. Set `DCG_CONFIG=.dcg.toml` to make a project file an
+    /// explicit, fully trusted config source for that invocation.
     #[must_use]
     pub fn load() -> Self {
+        // Hook mode is latency-sensitive. The shared loader keeps tracing
+        // disabled here so ordinary evaluations do not allocate diagnostic
+        // vectors/paths/details that only `config` and `doctor` consume.
+        Self::load_internal(false).0
+    }
+
+    /// Load the effective configuration and retain an auditable account of
+    /// every file source the loader considered.
+    ///
+    /// Diagnostics must consume this report rather than re-deriving source
+    /// state with `Path::exists()`: a path can exist yet be rejected by the
+    /// Unix trust policy, intentionally ignored on a non-Unix platform, or
+    /// skipped because a valid `DCG_CONFIG` replaces the default user file.
+    #[must_use]
+    pub(crate) fn load_with_report() -> ConfigLoadReport {
+        let (config, sources) = Self::load_internal(true);
+        ConfigLoadReport {
+            config,
+            sources: sources.expect("source tracing requested"),
+        }
+    }
+
+    fn load_internal(capture_sources: bool) -> (Self, Option<Vec<ConfigSourceOutcome>>) {
         // Start with truly empty defaults - packs must be explicitly enabled.
         // generate_default() is for sample configs shown to users, not runtime defaults.
         let mut config = Self::default();
+        let mut sources = capture_sources.then(Vec::new);
         let cwd = env::current_dir().ok();
 
         // Optional explicit config path override (highest-priority file config).
-        let explicit_layer = env::var(ENV_CONFIG_PATH)
-            .ok()
-            .and_then(|value| resolve_config_path_value(&value, cwd.as_deref()))
-            .and_then(|path| Self::load_layer_from_file(&path));
+        // It is parsed first only so a valid explicit file can suppress the
+        // default user path; its outcome is appended last to preserve the
+        // actual low-to-high precedence order exposed to diagnostics.
+        let (explicit_layer, explicit_outcome) = match env::var(ENV_CONFIG_PATH) {
+            Ok(value) => match resolve_config_path_value(&value, cwd.as_deref()) {
+                Some(path) => {
+                    let (layer, outcome) = Self::load_layer_from_file_with_outcome(
+                        &path,
+                        ConfigSource::Untrusted,
+                        ConfigFileLayer::Explicit,
+                        ConfigFileAuthority::Full,
+                        capture_sources,
+                    );
+                    (layer, outcome)
+                }
+                None => (
+                    None,
+                    capture_sources.then(|| {
+                        ConfigSourceOutcome::new(
+                            ConfigFileLayer::Explicit,
+                            ConfigFileAuthority::Full,
+                            ConfigFileStatus::Rejected,
+                            None,
+                            Some("DCG_CONFIG is set but empty".to_string()),
+                        )
+                    }),
+                ),
+            },
+            Err(_) => (None, None),
+        };
+        let explicit_project_policy = explicit_layer.is_some()
+            && cwd.as_deref().is_some_and(explicitly_trusts_project_policy);
 
         // Load system config (lowest priority of file configs)
-        if let Some(system_config) = Self::load_system_config_layer() {
+        let system_path = system_config_dir().join(CONFIG_FILE_NAME);
+        let (system_config, system_outcome) = Self::load_layer_from_file_with_outcome(
+            &system_path,
+            ConfigSource::System,
+            ConfigFileLayer::System,
+            ConfigFileAuthority::Full,
+            capture_sources,
+        );
+        record_config_outcome(&mut sources, system_outcome);
+        if let Some(system_config) = system_config {
             config.merge_layer(system_config);
         }
 
@@ -3116,45 +3688,185 @@ impl Config {
         // If an explicit config file is present and valid, we treat it as the
         // user-level config and skip loading the default user config path to
         // reduce layering confusion.
-        if explicit_layer.is_none() {
-            if let Some(user_config) = Self::load_user_config_layer() {
+        if explicit_layer.is_some() {
+            if let Some(sources) = sources.as_mut() {
+                let user_path = Self::user_config_candidates()
+                    .into_iter()
+                    .find(|path| fs::symlink_metadata(path).is_ok());
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::User,
+                    ConfigFileAuthority::Full,
+                    ConfigFileStatus::Skipped,
+                    user_path,
+                    Some("a valid DCG_CONFIG replaces the default user config".to_string()),
+                ));
+            }
+        } else {
+            let user_config = Self::load_user_config_layer_with_outcomes(&mut sources);
+            if let Some(user_config) = user_config {
                 config.merge_layer(user_config);
             }
         }
 
-        // Load project config (if in a git repo)
-        if let Some(project_config) = Self::load_project_config_layer_from(cwd.as_deref()) {
-            config.merge_layer(project_config);
+        let project_path = cwd
+            .as_deref()
+            .and_then(|start_dir| find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS))
+            .map(|repo_root| repo_root.join(PROJECT_CONFIG_NAME));
+        if explicit_project_policy {
+            if let Some(sources) = sources.as_mut() {
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::AutomaticProject,
+                    ConfigFileAuthority::EnforcementOnly,
+                    ConfigFileStatus::Skipped,
+                    project_path,
+                    Some(
+                        "the same repository config was selected explicitly; duplicate automatic merge suppressed"
+                            .to_string(),
+                    ),
+                ));
+            }
+        } else if let Some(project_path) = project_path {
+            let (project_layer, project_outcome) = Self::load_layer_from_file_with_outcome(
+                &project_path,
+                ConfigSource::AutoProject,
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                capture_sources,
+            );
+            record_config_outcome(&mut sources, project_outcome);
+            if let Some(project_layer) = project_layer {
+                config.merge_layer(project_layer.into_restricted_project_policy());
+            }
+        } else if let Some(sources) = sources.as_mut() {
+            sources.push(ConfigSourceOutcome::new(
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                ConfigFileStatus::Missing,
+                None,
+                Some("current directory is not inside a Git repository".to_string()),
+            ));
         }
 
-        // Apply explicit config last among file configs (if present and valid).
+        // Explicit config is the highest-priority file layer.
         if let Some(explicit_layer) = explicit_layer {
             config.merge_layer(explicit_layer);
         }
+        record_config_outcome(&mut sources, explicit_outcome);
 
         // Apply environment variable overrides (highest priority)
         config.apply_env_overrides();
 
-        config
+        (config, sources)
     }
 
-    /// Load a configuration *layer* from a specific file.
+    /// Merge the automatic repository hardening subset and the explicit file.
     ///
-    /// Layers preserve field presence (via `Option<T>`) so higher-precedence
-    /// configs can explicitly set values back to defaults.
-    #[must_use]
-    fn load_layer_from_file(path: &Path) -> Option<ConfigLayer> {
-        let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
+    /// The project loader is lazy so selecting the repository's own
+    /// `.dcg.toml` explicitly neither reparses nor reapplies the same file.
+    /// This matters for additive fields such as `packs.enabled`.
+    #[cfg(test)]
+    fn merge_project_and_explicit_layers<F>(
+        &mut self,
+        explicit_layer: Option<ConfigLayer>,
+        explicit_project_policy: bool,
+        project_layer: F,
+    ) where
+        F: FnOnce() -> Option<ConfigLayer>,
+    {
+        if !explicit_project_policy {
+            if let Some(project_layer) = project_layer() {
+                self.merge_layer(project_layer);
+            }
+        }
+
+        // Explicit config is the highest-priority file layer.
+        if let Some(explicit_layer) = explicit_layer {
+            self.merge_layer(explicit_layer);
+        }
+    }
+
+    #[cfg(test)]
+    fn load_layer_from_file_with_source(path: &Path, source: ConfigSource) -> Option<ConfigLayer> {
+        Self::load_layer_from_file_with_outcome(
+            path,
+            source,
+            match source {
+                ConfigSource::AutoProject => ConfigFileLayer::AutomaticProject,
+                ConfigSource::System => ConfigFileLayer::System,
+                ConfigSource::Untrusted => ConfigFileLayer::Explicit,
+            },
+            if source == ConfigSource::AutoProject {
+                ConfigFileAuthority::EnforcementOnly
+            } else {
+                ConfigFileAuthority::Full
+            },
+            false,
+        )
+        .0
+    }
+
+    fn load_layer_from_file_with_outcome(
+        path: &Path,
+        source: ConfigSource,
+        layer: ConfigFileLayer,
+        authority: ConfigFileAuthority,
+        capture_outcome: bool,
+    ) -> (Option<ConfigLayer>, Option<ConfigSourceOutcome>) {
+        let Some(content) = read_config_file_bounded(path, source) else {
+            let outcome = capture_outcome.then(|| {
+                let (status, detail) = failed_config_read_outcome(path, source);
+                ConfigSourceOutcome::new(layer, authority, status, Some(path.to_path_buf()), detail)
+            });
+            return (None, outcome);
+        };
 
         match toml::from_str(&content) {
-            Ok(layer) => Some(layer),
+            Ok(parsed) => (
+                Some(parsed),
+                capture_outcome.then(|| {
+                    ConfigSourceOutcome::new(
+                        layer,
+                        authority,
+                        ConfigFileStatus::Loaded,
+                        Some(path.to_path_buf()),
+                        None,
+                    )
+                }),
+            ),
+            Err(e) if source == ConfigSource::AutoProject => {
+                let detail = safe_auto_project_toml_error(&content, &e);
+                eprintln!("Warning: {}; ignoring it", detail);
+                (
+                    None,
+                    capture_outcome.then(|| {
+                        ConfigSourceOutcome::new(
+                            layer,
+                            authority,
+                            ConfigFileStatus::Invalid,
+                            Some(path.to_path_buf()),
+                            Some(detail),
+                        )
+                    }),
+                )
+            }
             Err(e) => {
                 eprintln!(
                     "Warning: Failed to parse config file '{}': {}",
                     path.display(),
                     e
                 );
-                None
+                (
+                    None,
+                    capture_outcome.then(|| {
+                        ConfigSourceOutcome::new(
+                            layer,
+                            authority,
+                            ConfigFileStatus::Invalid,
+                            Some(path.to_path_buf()),
+                            Some(format!("Invalid TOML: {e}")),
+                        )
+                    }),
+                )
             }
         }
     }
@@ -3162,77 +3874,81 @@ impl Config {
     /// Load configuration from a specific file.
     #[must_use]
     pub fn load_from_file(path: &Path) -> Option<Self> {
-        let content = fs::read_to_string(path).ok()?;
+        let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
         toml::from_str(&content).ok()
     }
 
-    /// Load system-wide configuration.
-    ///
-    /// The system config path is treated as a privileged config source: it sits
-    /// in `ConfigSource::System`, which means `read_config_file_bounded` refuses
-    /// to follow symlinks pointing at user-writable targets (a non-root user
-    /// could otherwise influence system-layer config by symlinking it into their
-    /// home directory).
-    fn load_system_config_layer() -> Option<ConfigLayer> {
-        let path = system_config_dir().join(CONFIG_FILE_NAME);
-        let content = read_config_file_bounded(&path, ConfigSource::System)?;
-        match toml::from_str(&content) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to parse system config file '{}': {}",
-                    path.display(),
-                    e
-                );
-                None
+    fn user_config_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        let mut push_unique = |path: PathBuf| {
+            if !candidates.contains(&path) {
+                candidates.push(path);
             }
-        }
-    }
+        };
 
-    /// Load user configuration.
-    ///
-    /// Checks XDG_CONFIG_HOME, XDG-style (`~/.config/dcg/`), and platform-native paths.
-    /// This ensures users can use `~/.config/dcg/config.toml` on all platforms,
-    /// including macOS where `dirs::config_dir()` returns `~/Library/Application Support`.
-    fn load_user_config_layer() -> Option<ConfigLayer> {
-        // First try XDG_CONFIG_HOME (if set)
         if let Ok(xdg_home) = env::var("XDG_CONFIG_HOME") {
             if let Some(xdg_home) = resolve_config_path_value(&xdg_home, None) {
-                let xdg_path = xdg_home.join("dcg").join(CONFIG_FILE_NAME);
-                if xdg_path.exists() {
-                    if let Some(layer) = Self::load_layer_from_file(&xdg_path) {
-                        return Some(layer);
-                    }
-                }
+                push_unique(xdg_home.join("dcg").join(CONFIG_FILE_NAME));
             }
         }
 
-        // Next try XDG-style path (~/.config/dcg/config.toml)
-        // This is what users expect and works consistently across platforms
         if let Some(home) = dirs::home_dir() {
-            let xdg_path = home.join(".config").join("dcg").join(CONFIG_FILE_NAME);
-            if xdg_path.exists() {
-                if let Some(layer) = Self::load_layer_from_file(&xdg_path) {
-                    return Some(layer);
-                }
-            }
+            push_unique(home.join(".config").join("dcg").join(CONFIG_FILE_NAME));
         }
 
-        // Fall back to platform-native path (e.g., ~/Library/Application Support/dcg/ on macOS)
-        let config_dir = dirs::config_dir()?;
-        let path = config_dir.join("dcg").join(CONFIG_FILE_NAME);
-        Self::load_layer_from_file(&path)
+        if let Some(config_dir) = dirs::config_dir() {
+            push_unique(config_dir.join("dcg").join(CONFIG_FILE_NAME));
+        }
+
+        candidates
     }
 
-    /// Load project-level configuration (`.dcg.toml` in repo root).
+    /// Load the first valid user configuration candidate and record every
+    /// candidate actually attempted before it.
+    fn load_user_config_layer_with_outcomes(
+        sources: &mut Option<Vec<ConfigSourceOutcome>>,
+    ) -> Option<ConfigLayer> {
+        let candidates = Self::user_config_candidates();
+        if candidates.is_empty() {
+            if let Some(sources) = sources.as_mut() {
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::User,
+                    ConfigFileAuthority::Full,
+                    ConfigFileStatus::Missing,
+                    None,
+                    Some("no user configuration directory is available".to_string()),
+                ));
+            }
+            return None;
+        }
+
+        for path in candidates {
+            let capture_outcome = sources.is_some();
+            let (layer, outcome) = Self::load_layer_from_file_with_outcome(
+                &path,
+                ConfigSource::Untrusted,
+                ConfigFileLayer::User,
+                ConfigFileAuthority::Full,
+                capture_outcome,
+            );
+            record_config_outcome(sources, outcome);
+            if layer.is_some() {
+                return layer;
+            }
+        }
+
+        None
+    }
+
+    /// Load the enforcement-only subset of project-level configuration
+    /// (`.dcg.toml` in repo root).
+    #[cfg(test)]
     fn load_project_config_layer_from(start_dir: Option<&Path>) -> Option<ConfigLayer> {
         let start_dir = start_dir?;
         let repo_root = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS)?;
         let config_path = repo_root.join(PROJECT_CONFIG_NAME);
-        if !config_path.exists() {
-            return None;
-        }
-        Self::load_layer_from_file(&config_path)
+        Self::load_layer_from_file_with_source(&config_path, ConfigSource::AutoProject)
+            .map(ConfigLayer::into_restricted_project_policy)
     }
 
     /// Merge another config layer into this one (other takes priority when set).
@@ -4154,6 +4870,7 @@ verbose = false
 #   database.mongodb      - MongoDB destructive commands
 #   database.redis        - Redis FLUSH commands
 #   database.sqlite       - SQLite destructive commands
+#   database.snowflake    - Snowflake CLI SQL and account operations
 #   containers.docker     - Docker destructive commands
 #   containers.compose    - Docker Compose destructive commands
 #   containers.podman     - Podman destructive commands
@@ -4532,9 +5249,13 @@ mod tests {
     #[test]
     fn system_config_dir_is_platform_correct() {
         let dir = system_config_dir();
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         {
             assert_eq!(dir, PathBuf::from("/etc/dcg"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(dir, PathBuf::from("/private/etc/dcg"));
         }
         #[cfg(windows)]
         {
@@ -4625,6 +5346,174 @@ mod tests {
         assert_eq!(config.general.color, "auto");
         assert!(config.packs.enabled.is_empty());
         assert!(!config.allowlist.auto_prune_expired);
+    }
+
+    #[test]
+    fn untrusted_project_policy_retains_only_monotonic_protections() {
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[general]
+fail_closed = true
+max_command_bytes = 1
+self_heal_hook = false
+
+[output]
+explanations_enabled = false
+
+[packs]
+enabled = ["database.postgresql", "attacker.external"]
+disabled = ["core", "system.disk"]
+custom_paths = [".dcg/packs/attacker.yaml"]
+
+[policy]
+default_mode = "deny"
+observe_until = "2099-01-01"
+
+[policy.packs]
+"database.postgresql" = "deny"
+"core.git" = "warn"
+
+[policy.rules]
+"core.git:reset-hard" = "log"
+"database.postgresql:drop-database" = "deny"
+
+[overrides]
+allow = ["git reset --hard"]
+allowlist = ["rm -rf /"]
+block = [
+  { pattern = "^echo project-policy-probe$", reason = "project hardening probe" },
+]
+
+[heredoc]
+enabled = true
+timeout_ms = 1
+max_body_bytes = 1
+languages = ["bash"]
+fallback_on_parse_error = false
+fallback_on_timeout = true
+
+[agents.default]
+disabled_packs = ["core.git"]
+extra_packs = ["cloud.aws"]
+additional_allowlist = ["git reset --hard"]
+disabled_allowlist = false
+
+[response]
+enabled = true
+mode = "warning_only"
+"#,
+        )
+        .expect("parse project config layer");
+
+        let restricted = layer.into_restricted_project_policy();
+
+        let general = restricted.general.expect("fail-closed retained");
+        assert_eq!(general.fail_closed, Some(true));
+        assert_eq!(general.max_command_bytes, None);
+        assert_eq!(general.self_heal_hook, None);
+        assert!(restricted.output.is_none());
+
+        let packs = restricted.packs.expect("pack enable retained");
+        assert_eq!(packs.enabled, ["database.postgresql"]);
+        assert!(packs.disabled.is_empty());
+        assert!(packs.custom_paths.is_empty());
+
+        let policy = restricted.policy.expect("deny policy retained");
+        assert_eq!(policy.default_mode, Some(PolicyMode::Deny));
+        assert_eq!(
+            policy.packs.get("database.postgresql"),
+            Some(&PolicyMode::Deny)
+        );
+        assert!(!policy.packs.contains_key("core.git"));
+        assert_eq!(
+            policy.rules.get("database.postgresql:drop-database"),
+            Some(&PolicyMode::Deny)
+        );
+        assert!(!policy.rules.contains_key("core.git:reset-hard"));
+        assert!(policy.observe_until.is_none());
+
+        // Even block-only overrides are repository-controlled regex programs;
+        // automatic discovery drops them to avoid backtracking/compile DoS.
+        assert!(restricted.overrides.is_none());
+
+        let heredoc = restricted.heredoc.expect("heredoc hardening retained");
+        assert_eq!(heredoc.enabled, Some(true));
+        assert_eq!(heredoc.fallback_on_parse_error, Some(false));
+        assert_eq!(heredoc.fallback_on_timeout, None);
+        assert_eq!(heredoc.timeout_ms, None);
+        assert_eq!(heredoc.max_body_bytes, None);
+        assert_eq!(heredoc.languages, None);
+        assert!(heredoc.allowlist.is_none());
+
+        assert!(restricted.agents.is_none());
+        assert!(restricted.response.is_none());
+        assert!(restricted.projects.is_none());
+    }
+
+    #[test]
+    fn untrusted_project_policy_drops_layer_when_it_only_weakens_protection() {
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[general]
+fail_closed = false
+max_hook_input_bytes = 1
+max_command_bytes = 1
+
+[packs]
+disabled = ["core", "system.disk"]
+custom_paths = [".dcg/packs/attacker.yaml"]
+
+[policy]
+default_mode = "log"
+
+[overrides]
+allow = ["rm -rf /"]
+allowlist = ["git reset --hard"]
+
+[heredoc]
+enabled = false
+timeout_ms = 0
+languages = ["bash"]
+fallback_on_parse_error = true
+fallback_on_timeout = true
+"#,
+        )
+        .expect("parse project config layer");
+
+        let restricted = layer.into_restricted_project_policy();
+        assert!(restricted.general.is_none());
+        assert!(restricted.packs.is_none());
+        assert!(restricted.policy.is_none());
+        assert!(restricted.overrides.is_none());
+        assert!(restricted.heredoc.is_none());
+    }
+
+    #[test]
+    fn explicitly_selected_project_config_is_not_loaded_or_merged_twice() {
+        let explicit: ConfigLayer = toml::from_str(
+            r#"
+[packs]
+enabled = ["database.postgresql"]
+"#,
+        )
+        .expect("parse explicit project layer");
+        let duplicate: ConfigLayer = toml::from_str(
+            r#"
+[packs]
+enabled = ["database.postgresql"]
+"#,
+        )
+        .expect("parse automatic project layer");
+        let project_loader_called = std::cell::Cell::new(false);
+        let mut config = Config::default();
+
+        config.merge_project_and_explicit_layers(Some(explicit), true, || {
+            project_loader_called.set(true);
+            Some(duplicate)
+        });
+
+        assert!(!project_loader_called.get());
+        assert_eq!(config.packs.enabled, ["database.postgresql"]);
     }
 
     #[test]
@@ -8172,31 +9061,266 @@ low = "disabled"
         assert!(read.is_none());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn read_config_file_bounded_system_rejects_user_writable_symlink_target() {
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::TempDir;
-        let temp = TempDir::new().expect("tempdir");
-        let user_writable_dir = temp.path().join("user-writable");
-        std::fs::create_dir(&user_writable_dir).unwrap();
-        std::fs::set_permissions(&user_writable_dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-        // Real target in a user-writable directory.
-        let target = user_writable_dir.join("user_target.toml");
-        std::fs::write(&target, "key = \"injected\"").unwrap();
-        // Symlink at a location we'll claim is "system".
-        let symlink_path = temp.path().join("system_config.toml");
-        std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+    fn auto_project_parse_error_never_reflects_source_bytes() {
+        let secret_marker = "DO_NOT_REFLECT_THIS_REPOSITORY_TEXT";
+        let input = format!(
+            "[general]\nfail_closed = \u{1b}[31m{secret_marker}{}\n",
+            "x".repeat(16_384)
+        );
+        let error =
+            toml::from_str::<ConfigLayer>(&input).expect_err("fixture must be invalid TOML");
 
-        let read = read_config_file_bounded(&symlink_path, ConfigSource::System);
+        let rendered = safe_auto_project_toml_error(&input, &error);
+        assert!(rendered.starts_with("Invalid TOML in automatic project config"));
+        assert!(!rendered.contains(secret_marker));
+        assert!(!rendered.contains('\u{1b}'));
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(rendered.len() < 128);
+    }
+
+    #[test]
+    fn config_source_outcomes_are_lazy_and_authority_aware() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        let (untraced_layer, untraced_outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::Untrusted,
+            ConfigFileLayer::User,
+            ConfigFileAuthority::Full,
+            false,
+        );
+        assert!(untraced_layer.is_some());
         assert!(
-            read.is_none(),
-            "system layer must refuse symlinks pointing at user-writable targets"
+            untraced_outcome.is_none(),
+            "hot-path loading must not allocate a diagnostic outcome"
         );
 
-        // The same symlink loaded as Untrusted is permitted (size still capped).
-        let read = read_config_file_bounded(&symlink_path, ConfigSource::Untrusted);
-        assert_eq!(read.as_deref(), Some("key = \"injected\""));
+        let (traced_layer, traced_outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert!(traced_layer.is_some());
+        let traced_outcome = traced_outcome.expect("tracing requested");
+        assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+        assert_eq!(
+            traced_outcome.authority,
+            ConfigFileAuthority::EnforcementOnly
+        );
+        assert_eq!(traced_outcome.path.as_deref(), Some(path.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_leaf_policy_checks_owner_and_write_mode() {
+        // Root-owned, owner-writable files are trusted: only root can change
+        // their contents or mode.
+        assert!(!unix_owner_or_mode_is_user_writable(0, 0o100_644));
+
+        // These are the vulnerable cases that a parent-only check misses.
+        assert!(unix_owner_or_mode_is_user_writable(0, 0o100_664));
+        assert!(unix_owner_or_mode_is_user_writable(0, 0o100_646));
+
+        // A non-root owner can chmod a read-only file and then replace its
+        // contents, so current write bits alone are not enough.
+        assert!(unix_owner_or_mode_is_user_writable(1000, 0o100_444));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_opened_file_identity_binds_descriptor_to_current_path() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let first_path = temp.path().join("first.toml");
+        let second_path = temp.path().join("second.toml");
+        std::fs::write(&first_path, "key = 1").unwrap();
+        std::fs::write(&second_path, "key = 2").unwrap();
+
+        let first_file = std::fs::File::open(&first_path).unwrap();
+        let opened = first_file.metadata().unwrap();
+        let current = std::fs::symlink_metadata(&first_path).unwrap();
+        let other = std::fs::symlink_metadata(&second_path).unwrap();
+
+        assert!(unix_metadata_refers_to_same_file(&opened, &current));
+        assert!(!unix_metadata_refers_to_same_file(&opened, &other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_ancestor_policy_rejects_relative_writable_and_symlinked_paths() {
+        use tempfile::TempDir;
+
+        assert_eq!(
+            validate_unix_system_ancestor_chain(Path::new("relative/config.toml")),
+            Err(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized)
+        );
+
+        // Only the ancestor chain is inspected here, so a hypothetical direct
+        // leaf beneath the trusted Unix root has a valid chain.
+        assert_eq!(
+            validate_unix_system_ancestor_chain(Path::new("/config.toml")),
+            Ok(())
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        assert_eq!(
+            validate_unix_system_ancestor_chain(&temp.path().join("config.toml")),
+            Err(UnixConfigTrustError::UntrustedOwnerOrMode)
+        );
+
+        // The first examined directory resolves through the link to `/etc`,
+        // but the next lexical ancestor is the link itself. Using
+        // symlink_metadata rather than canonicalize must expose and reject it.
+        let linked_root = temp.path().join("linked-root");
+        std::os::unix::fs::symlink("/", &linked_root).unwrap();
+        assert_eq!(
+            validate_unix_system_ancestor_chain(&linked_root.join("etc/config.toml")),
+            Err(UnixConfigTrustError::Symlink)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_project_reads_direct_regular_file_but_rejects_symlink() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("target.toml");
+        let link = temp.path().join(".dcg.toml");
+        let payload = "[general]\nfail_closed = true\n";
+        std::fs::write(&target, payload).unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            read_config_file_bounded(&target, ConfigSource::AutoProject).as_deref(),
+            Some(payload)
+        );
+        assert!(read_config_file_bounded(&link, ConfigSource::AutoProject).is_none());
+        assert!(
+            Config::load_project_config_layer_from(Some(temp.path())).is_none(),
+            "automatic project discovery must use the no-symlink source policy"
+        );
+
+        // Explicit/user-selected config paths retain their documented symlink
+        // behavior; only automatic repository discovery is restricted.
+        assert_eq!(
+            read_config_file_bounded(&link, ConfigSource::Untrusted).as_deref(),
+            Some(payload)
+        );
+
+        let (_, outcome) = Config::load_layer_from_file_with_outcome(
+            &link,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::Rejected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_project_rejects_directory_and_fifo_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        assert!(read_config_file_bounded(temp.path(), ConfigSource::AutoProject).is_none());
+
+        let fifo = temp.path().join("config.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the test fixture");
+
+        let fifo_for_reader = fifo.clone();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = read_config_file_bounded(&fifo_for_reader, ConfigSource::AutoProject);
+            sender.send(result).unwrap();
+        });
+
+        let (timed_out, result) = match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => (false, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Unblock a regressed blocking open before failing, so the test
+                // suite never leaves a stuck reader thread behind.
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open FIFO writer to release blocked reader");
+                let result = receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("blocked FIFO reader must exit once paired");
+                drop(writer);
+                (true, result)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("FIFO reader disconnected without reporting a result")
+            }
+        };
+        reader.join().expect("FIFO reader thread");
+
+        assert!(
+            !timed_out,
+            "restricted config open must never block on a FIFO"
+        );
+        assert!(result.is_none(), "a FIFO must never be parsed as config");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_system_config_is_ignored_even_when_regular() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "key = \"value\"").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_auto_project_config_is_ignored_even_when_regular() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(".dcg.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::AutoProject).is_none());
+        let (_, outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::IgnoredUnsupported
+        );
+        assert!(
+            read_config_file_bounded(
+                &temp.path().join("missing.dcg.toml"),
+                ConfigSource::AutoProject
+            )
+            .is_none()
+        );
     }
 }

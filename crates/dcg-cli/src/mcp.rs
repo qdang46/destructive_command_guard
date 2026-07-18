@@ -64,6 +64,17 @@ struct ExplainPatternResponse {
     explanation: String,
 }
 
+fn mcp_decision_contract(
+    decision: EvaluationDecision,
+    mode: Option<crate::packs::DecisionMode>,
+) -> (bool, &'static str) {
+    match decision {
+        EvaluationDecision::Allow => (mode.is_none_or(|value| !value.blocks()), "allow"),
+        EvaluationDecision::Deny => (mode.is_some_and(|value| !value.blocks()), "deny"),
+        EvaluationDecision::Indeterminate => (false, "indeterminate"),
+    }
+}
+
 impl DcgMcpServer {
     #[must_use]
     pub fn new() -> Self {
@@ -192,16 +203,11 @@ impl DcgMcpServer {
         );
 
         let mode = result.effective_mode.map(|m| m.label().to_string());
-        let allowed = result
-            .effective_mode
-            .map_or(result.decision != EvaluationDecision::Deny, |m| !m.blocks());
+        let (allowed, decision) = mcp_decision_contract(result.decision, result.effective_mode);
 
         let mut response = CheckCommandResponse {
             allowed,
-            decision: match result.decision {
-                EvaluationDecision::Allow => "allow".to_string(),
-                EvaluationDecision::Deny => "deny".to_string(),
-            },
+            decision: decision.to_string(),
             mode,
             skipped_due_to_budget: result.skipped_due_to_budget,
             reason: None,
@@ -444,6 +450,21 @@ mod tests {
                 elapsed_ms: Some(0),
             },
             findings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn indeterminate_mcp_decision_is_never_reported_as_allowed() {
+        for mode in [
+            None,
+            Some(crate::packs::DecisionMode::Deny),
+            Some(crate::packs::DecisionMode::Warn),
+            Some(crate::packs::DecisionMode::Log),
+        ] {
+            assert_eq!(
+                mcp_decision_contract(EvaluationDecision::Indeterminate, mode),
+                (false, "indeterminate")
+            );
         }
     }
 

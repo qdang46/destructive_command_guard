@@ -5,7 +5,7 @@
 //! agent:
 //!   - cmd: `del`/`erase` with `/s` (recursive), `rd`/`rmdir` with `/s`,
 //!     `format <drive>:`.
-//!   - PowerShell: `Remove-Item -Recurse -Force` and its aliases
+//!   - PowerShell: `Remove-Item -Recurse` (with or without `-Force`) and its aliases
 //!     (`rm`/`del`/`rd`/`rmdir`/`ri`/`erase`), `Clear-Content` (empties a file),
 //!     `Clear-RecycleBin` (purges the Recycle Bin so deletes become unrecoverable).
 //!
@@ -18,8 +18,127 @@
 //! a stable rule id (e.g. `windows.filesystem:del-recursive`). See
 //! `super`-module docs for the keyword-casing convention.
 
+use crate::normalize::{
+    NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole, tokenize_for_shell_dialect,
+};
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use std::ops::Range;
+
+const MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES: usize = 64 * 1024;
+const MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS: usize = 128;
+const MAX_WINDOWS_FILESYSTEM_SEMANTIC_TOKENS: usize = 512;
+
+pub(crate) const WINDOWS_FILESYSTEM_UNVERIFIED_RULE: &str =
+    "windows-filesystem-semantic-unverified";
+const WINDOWS_FILESYSTEM_UNVERIFIED_REASON: &str = "The Windows filesystem command contains unresolved shell syntax in an executable or destructive option position.";
+
+/// Result of the bounded, caller-dialect-aware Windows filesystem pass.
+///
+/// `Unverified` is intentionally distinct from `NoMatch`: the former means a
+/// protected executable or destructive option can be produced only after
+/// runtime shell expansion, so the evaluator must fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsFilesystemSemanticDecision {
+    NoMatch,
+    Safe,
+    Destructive(&'static str),
+    Unverified,
+}
+
+#[derive(Debug, Default)]
+struct PowerShellCallOperatorAnalysis {
+    decision: Option<WindowsFilesystemSemanticDecision>,
+    inert_target_spans: Vec<Range<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsFilesystemWord {
+    decoded: String,
+    dynamic: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PossibleSwitch {
+    exact: bool,
+    possible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveItemParameter {
+    Recurse,
+    Force,
+    WhatIf,
+    Value,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellSwitchValue {
+    Enabled,
+    Disabled,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellValueLookahead {
+    Data,
+    NamedParameter,
+    Dynamic,
+    EndOfParameters,
+}
+
+// PowerShell accepts an unambiguous leading substring of a parameter name.
+// Keep the superset exposed by Remove-Item across the supported PowerShell
+// editions/providers so a prefix is never treated as unique merely because a
+// colliding dynamic parameter is absent on the host running dcg. In
+// particular, `-R` uniquely identifies Recurse, but `-F` is ambiguous between
+// Filter and Force (`-Fo` is the shortest unambiguous Force spelling).
+const REMOVE_ITEM_PARAMETER_NAMES: &[&str] = &[
+    "confirm",
+    "credential",
+    "debug",
+    "erroraction",
+    "errorvariable",
+    "exclude",
+    "filter",
+    "force",
+    "include",
+    "informationaction",
+    "informationvariable",
+    "literalpath",
+    "outbuffer",
+    "outvariable",
+    "path",
+    "pipelinevariable",
+    "progressaction",
+    "recurse",
+    "stream",
+    "usetransaction",
+    "verbose",
+    "warningaction",
+    "warningvariable",
+    "whatif",
+];
+
+const REMOVE_ITEM_PARAMETER_ALIASES: &[(&str, RemoveItemParameter)] = &[
+    ("cf", RemoveItemParameter::Other),
+    ("db", RemoveItemParameter::Other),
+    ("ea", RemoveItemParameter::Value),
+    ("ev", RemoveItemParameter::Value),
+    ("infa", RemoveItemParameter::Value),
+    ("iv", RemoveItemParameter::Value),
+    ("lp", RemoveItemParameter::Value),
+    ("ob", RemoveItemParameter::Value),
+    ("ov", RemoveItemParameter::Value),
+    ("proga", RemoveItemParameter::Value),
+    ("pspath", RemoveItemParameter::Value),
+    ("pv", RemoveItemParameter::Value),
+    ("vb", RemoveItemParameter::Other),
+    ("wa", RemoveItemParameter::Value),
+    ("wv", RemoveItemParameter::Value),
+    ("wi", RemoveItemParameter::WhatIf),
+];
 
 const DEL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
@@ -34,12 +153,12 @@ const DEL_SUGGESTIONS: &[PatternSuggestion] = &[
 
 const REMOVE_ITEM_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
-        "Remove-Item -Recurse -Force <path> -WhatIf",
+        "Remove-Item -Recurse <path> -WhatIf",
         "Re-run with -WhatIf first to preview exactly what would be deleted",
     ),
     PatternSuggestion::new(
         "Move-Item <path> $env:TEMP\\trash",
-        "Move to a temp/trash location instead of -Force deleting (Recycle Bin is bypassed by -Force)",
+        "Move to a temp/trash location instead of permanently deleting (Remove-Item bypasses the Recycle Bin)",
     ),
 ];
 
@@ -53,6 +172,1268 @@ const CLEAR_SUGGESTIONS: &[PatternSuggestion] = &[PatternSuggestion::new(
     "Read the file first; Clear-Content empties it in place with no undo",
 )];
 
+const CMD_PROTECTED_EXECUTABLES: &[&str] = &[
+    "del",
+    "del.exe",
+    "erase",
+    "erase.exe",
+    "rd",
+    "rd.exe",
+    "rmdir",
+    "rmdir.exe",
+    "format",
+    "format.com",
+    "format.exe",
+];
+
+const POWERSHELL_PROTECTED_EXECUTABLES: &[&str] = &[
+    "remove-item",
+    "rmdir",
+    "rd",
+    "ri",
+    "rm",
+    "del",
+    "erase",
+    "clear-content",
+    "clc",
+    "clear-recyclebin",
+];
+
+fn syntax_is_incomplete(raw: &str, dialect: ShellDialect) -> bool {
+    let mut chars = raw.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(character) = chars.next() {
+        match dialect {
+            ShellDialect::PowerShell => match character {
+                '`' if !single => {
+                    if chars.next().is_none() {
+                        return true;
+                    }
+                }
+                '\'' if !double => {
+                    if single && chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        single = !single;
+                    }
+                }
+                '"' if !single => double = !double,
+                _ => {}
+            },
+            ShellDialect::Cmd => match character {
+                '^' if !double => {
+                    if chars.next().is_none() {
+                        return true;
+                    }
+                }
+                '"' => double = !double,
+                _ => {}
+            },
+            ShellDialect::Posix | ShellDialect::Unknown => return false,
+        }
+    }
+    single || double
+}
+
+fn token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
+    let mut chars = raw.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    let mut at_word_start = true;
+    while let Some(character) = chars.next() {
+        match dialect {
+            ShellDialect::PowerShell => match character {
+                '`' if !single => {
+                    chars.next();
+                    at_word_start = false;
+                }
+                '\'' if !double => {
+                    if single && chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        single = !single;
+                    }
+                }
+                '"' if !single => double = !double,
+                '$' if !single => return true,
+                '@' if !single
+                    && !double
+                    && (at_word_start || matches!(chars.peek(), Some('(' | '{'))) =>
+                {
+                    return true;
+                }
+                _ => at_word_start = false,
+            },
+            ShellDialect::Cmd => match character {
+                '^' if !double => {
+                    chars.next();
+                    at_word_start = false;
+                }
+                '"' => double = !double,
+                // cmd.exe expands both percent variables and delayed `!VAR!`
+                // variables inside double quotes. Quotes protect whitespace;
+                // they do not make expansion inert.
+                '%' | '!' => return true,
+                _ => at_word_start = false,
+            },
+            ShellDialect::Posix | ShellDialect::Unknown => return false,
+        }
+    }
+    false
+}
+
+fn decode_syntax_word(
+    decoder: &mut ShellTokenDecoder,
+    raw: &str,
+    dialect: ShellDialect,
+) -> Option<WindowsFilesystemWord> {
+    let dynamic = token_has_active_expansion(raw, dialect) || syntax_is_incomplete(raw, dialect);
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .map(|decoded| WindowsFilesystemWord {
+            decoded: decoded.into_owned(),
+            dynamic,
+        })
+}
+
+fn dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
+    let mut fragments = vec![String::new()];
+    let characters: Vec<char> = decoded.chars().collect();
+    let mut index = 0usize;
+    let mut saw_dynamic = false;
+    while index < characters.len() {
+        let starts_dynamic = match dialect {
+            ShellDialect::PowerShell => matches!(characters[index], '$' | '@' | '`'),
+            ShellDialect::Cmd => matches!(characters[index], '%' | '!' | '^'),
+            ShellDialect::Posix | ShellDialect::Unknown => false,
+        };
+        if !starts_dynamic {
+            let Some(fragment) = fragments.last_mut() else {
+                // Conservatively represent an unconstrained dynamic word if a
+                // future refactor ever violates the seeded-fragment invariant.
+                return vec![String::new()];
+            };
+            fragment.push(characters[index]);
+            index += 1;
+            continue;
+        }
+
+        saw_dynamic = true;
+        fragments.push(String::new());
+        match (dialect, characters[index]) {
+            (ShellDialect::PowerShell, '$') => {
+                index += 1;
+                if matches!(characters.get(index), Some('{' | '(')) {
+                    let opener = characters[index];
+                    let closer = if opener == '{' { '}' } else { ')' };
+                    index += 1;
+                    let mut depth = 1usize;
+                    while index < characters.len() && depth > 0 {
+                        if characters[index] == opener {
+                            depth += 1;
+                        } else if characters[index] == closer {
+                            depth -= 1;
+                        }
+                        index += 1;
+                    }
+                } else {
+                    while index < characters.len()
+                        && (characters[index].is_ascii_alphanumeric()
+                            || matches!(characters[index], '_' | ':' | '?' | '*' | '#'))
+                    {
+                        index += 1;
+                    }
+                }
+            }
+            (ShellDialect::PowerShell, '@') => {
+                index += 1;
+                while index < characters.len()
+                    && (characters[index].is_ascii_alphanumeric()
+                        || matches!(characters[index], '_' | ':'))
+                {
+                    index += 1;
+                }
+            }
+            (ShellDialect::Cmd, delimiter @ ('%' | '!')) => {
+                index += 1;
+                if delimiter == '%' && characters.get(index).is_some_and(char::is_ascii_digit) {
+                    index += 1;
+                } else {
+                    while index < characters.len() && characters[index] != delimiter {
+                        index += 1;
+                    }
+                    index += usize::from(index < characters.len());
+                }
+            }
+            (ShellDialect::PowerShell, '`') | (ShellDialect::Cmd, '^') => {
+                index += 1;
+                index += usize::from(index < characters.len());
+            }
+            _ => index += 1,
+        }
+    }
+    if saw_dynamic {
+        fragments
+    } else {
+        vec![decoded.to_string()]
+    }
+}
+
+fn symbolic_word_may_equal(
+    word: &WindowsFilesystemWord,
+    dialect: ShellDialect,
+    candidate: &str,
+) -> bool {
+    if !word.dynamic {
+        return word.decoded.eq_ignore_ascii_case(candidate);
+    }
+    let decoded = word.decoded.to_ascii_lowercase();
+    let candidate = candidate.to_ascii_lowercase();
+    let fragments = dynamic_fragments(&decoded, dialect);
+    let Some(first) = fragments.first() else {
+        return true;
+    };
+    let Some(last) = fragments.last() else {
+        return true;
+    };
+    if !candidate.starts_with(first) || !candidate.ends_with(last) {
+        return false;
+    }
+    let mut offset = first.len();
+    for fragment in fragments
+        .iter()
+        .take(fragments.len().saturating_sub(1))
+        .skip(1)
+    {
+        let Some(relative) = candidate.get(offset..).and_then(|tail| tail.find(fragment)) else {
+            return false;
+        };
+        offset += relative + fragment.len();
+    }
+    offset <= candidate.len().saturating_sub(last.len())
+}
+
+fn executable_word(word: WindowsFilesystemWord, dialect: ShellDialect) -> WindowsFilesystemWord {
+    let decoded = if dialect == ShellDialect::Cmd {
+        word.decoded.trim_start_matches('@')
+    } else {
+        word.decoded.as_str()
+    };
+    let basename = decoded.rsplit(['/', '\\']).next().unwrap_or(decoded);
+    WindowsFilesystemWord {
+        decoded: basename.to_string(),
+        dynamic: word.dynamic,
+    }
+}
+
+fn possible_switch(
+    word: &WindowsFilesystemWord,
+    dialect: ShellDialect,
+    candidates: &[&str],
+) -> PossibleSwitch {
+    if !word.dynamic
+        && candidates
+            .iter()
+            .any(|candidate| word.decoded.eq_ignore_ascii_case(candidate))
+    {
+        return PossibleSwitch {
+            exact: true,
+            possible: true,
+        };
+    }
+    PossibleSwitch {
+        exact: false,
+        possible: word.dynamic
+            && candidates
+                .iter()
+                .any(|candidate| symbolic_word_may_equal(word, dialect, candidate)),
+    }
+}
+
+fn remove_item_parameter_kind(name: &str) -> RemoveItemParameter {
+    match name {
+        "recurse" => RemoveItemParameter::Recurse,
+        "force" => RemoveItemParameter::Force,
+        "whatif" => RemoveItemParameter::WhatIf,
+        "credential"
+        | "erroraction"
+        | "errorvariable"
+        | "exclude"
+        | "filter"
+        | "include"
+        | "informationaction"
+        | "informationvariable"
+        | "literalpath"
+        | "outbuffer"
+        | "outvariable"
+        | "path"
+        | "pipelinevariable"
+        | "progressaction"
+        | "stream"
+        | "warningaction"
+        | "warningvariable" => RemoveItemParameter::Value,
+        _ => RemoveItemParameter::Other,
+    }
+}
+
+fn resolve_remove_item_parameter(name: &str) -> Option<RemoveItemParameter> {
+    let name = name.to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    if let Some((_, parameter)) = REMOVE_ITEM_PARAMETER_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == name)
+    {
+        return Some(*parameter);
+    }
+    if REMOVE_ITEM_PARAMETER_NAMES.contains(&name.as_str()) {
+        return Some(remove_item_parameter_kind(&name));
+    }
+
+    let mut matches = REMOVE_ITEM_PARAMETER_NAMES
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.starts_with(&name));
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(remove_item_parameter_kind(first))
+}
+
+fn remove_item_parameter_name_is_recognized_or_ambiguous(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    !name.is_empty()
+        && (REMOVE_ITEM_PARAMETER_ALIASES
+            .iter()
+            .any(|(alias, _)| *alias == name)
+            || REMOVE_ITEM_PARAMETER_NAMES
+                .iter()
+                .any(|candidate| candidate.starts_with(&name)))
+}
+
+fn dynamic_parameter_may_resolve_to(
+    word: &WindowsFilesystemWord,
+    target: RemoveItemParameter,
+) -> bool {
+    for full_name in REMOVE_ITEM_PARAMETER_NAMES.iter().copied() {
+        if remove_item_parameter_kind(full_name) != target {
+            continue;
+        }
+        for prefix_len in 1..=full_name.len() {
+            let Some(prefix) = full_name.get(..prefix_len) else {
+                continue;
+            };
+            if resolve_remove_item_parameter(prefix) != Some(target) {
+                continue;
+            }
+            let candidate = format!("-{prefix}");
+            if symbolic_word_may_equal(word, ShellDialect::PowerShell, &candidate) {
+                return true;
+            }
+        }
+    }
+    REMOVE_ITEM_PARAMETER_ALIASES
+        .iter()
+        .filter(|(_, parameter)| *parameter == target)
+        .any(|(alias, _)| {
+            symbolic_word_may_equal(word, ShellDialect::PowerShell, &format!("-{alias}"))
+        })
+}
+
+fn powershell_parameter_colon(raw: &str) -> Option<usize> {
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '`' && !single {
+            escaped = true;
+            continue;
+        }
+        if character == '\'' && !double {
+            single = !single;
+            continue;
+        }
+        if character == '"' && !single {
+            double = !double;
+            continue;
+        }
+        if character == ':' && !single && !double {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Return the UTF-8 width of a character PowerShell accepts as the leading
+/// dash of a parameter token.
+///
+/// PowerShell deliberately treats the typographic en dash, em dash, and
+/// horizontal bar exactly like ASCII hyphen-minus during parameter binding.
+/// Other visually similar characters (notably U+2212 MINUS SIGN) remain
+/// ordinary argument data and must not be canonicalized.
+fn powershell_parameter_dash_width(raw: &str) -> Option<usize> {
+    raw.chars()
+        .next()
+        .filter(|character| matches!(character, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}'))
+        .map(char::len_utf8)
+}
+
+fn canonicalize_powershell_parameter_dash(word: &mut WindowsFilesystemWord) -> bool {
+    let Some(width) = powershell_parameter_dash_width(&word.decoded) else {
+        return false;
+    };
+    if width != 1 {
+        word.decoded.replace_range(..width, "-");
+    }
+    true
+}
+
+fn powershell_value_lookahead(raw: &str) -> PowerShellValueLookahead {
+    if powershell_wholly_quoted(raw) || powershell_parameter_dash_width(raw).is_none() {
+        return PowerShellValueLookahead::Data;
+    }
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let Some(mut parameter) = decode_syntax_word(&mut decoder, raw, ShellDialect::PowerShell)
+    else {
+        return PowerShellValueLookahead::Dynamic;
+    };
+    if parameter.dynamic {
+        return PowerShellValueLookahead::Dynamic;
+    }
+    if !canonicalize_powershell_parameter_dash(&mut parameter) {
+        return PowerShellValueLookahead::Data;
+    }
+    if parameter.decoded == "--" {
+        return PowerShellValueLookahead::EndOfParameters;
+    }
+    parameter
+        .decoded
+        .strip_prefix('-')
+        .filter(|name| remove_item_parameter_name_is_recognized_or_ambiguous(name))
+        .map_or(PowerShellValueLookahead::Data, |_| {
+            PowerShellValueLookahead::NamedParameter
+        })
+}
+
+fn powershell_switch_value(raw: Option<&str>) -> PowerShellSwitchValue {
+    let Some(raw) = raw else {
+        return PowerShellSwitchValue::Unresolved;
+    };
+    if raw.eq_ignore_ascii_case("$true") {
+        PowerShellSwitchValue::Enabled
+    } else if raw.eq_ignore_ascii_case("$false") || raw.eq_ignore_ascii_case("$null") {
+        PowerShellSwitchValue::Disabled
+    } else {
+        // Expressions, ordinary variables, quoted strings, and malformed
+        // values are runtime-dependent (or binding errors). None may justify
+        // an allow decision for a destructive switch.
+        PowerShellSwitchValue::Unresolved
+    }
+}
+
+fn record_powershell_switch(
+    switch: &mut PossibleSwitch,
+    value: PowerShellSwitchValue,
+    exact_parameter: bool,
+) -> bool {
+    match value {
+        PowerShellSwitchValue::Enabled => {
+            switch.exact |= exact_parameter;
+            switch.possible = true;
+            !exact_parameter
+        }
+        PowerShellSwitchValue::Disabled => false,
+        PowerShellSwitchValue::Unresolved => {
+            switch.possible = true;
+            true
+        }
+    }
+}
+
+fn cmd_drive_target(decoded: &str) -> bool {
+    let bytes = decoded.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'))
+}
+
+fn cmd_segment_semantic_decision(segment: &str) -> WindowsFilesystemSemanticDecision {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Cmd);
+    let word_count = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .count();
+    if word_count == 0 {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+
+    let mut raw_words = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(segment));
+    let Some(mut raw_executable) = raw_words.next() else {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(mut executable) = decode_syntax_word(&mut decoder, raw_executable, ShellDialect::Cmd)
+    else {
+        return WindowsFilesystemSemanticDecision::Unverified;
+    };
+    executable = executable_word(executable, ShellDialect::Cmd);
+    if !executable.dynamic && executable.decoded.eq_ignore_ascii_case("call") {
+        let Some(next) = raw_words.next() else {
+            return WindowsFilesystemSemanticDecision::NoMatch;
+        };
+        raw_executable = next;
+        let Some(decoded) = decode_syntax_word(&mut decoder, raw_executable, ShellDialect::Cmd)
+        else {
+            return WindowsFilesystemSemanticDecision::Unverified;
+        };
+        executable = executable_word(decoded, ShellDialect::Cmd);
+    }
+
+    let might_be_protected = CMD_PROTECTED_EXECUTABLES
+        .iter()
+        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
+    if !might_be_protected {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    if word_count > MAX_WINDOWS_FILESYSTEM_SEMANTIC_TOKENS {
+        return WindowsFilesystemSemanticDecision::Unverified;
+    }
+
+    let exact_del = !executable.dynamic
+        && matches!(
+            executable.decoded.to_ascii_lowercase().as_str(),
+            "del" | "del.exe" | "erase" | "erase.exe"
+        );
+    let exact_rd = !executable.dynamic
+        && matches!(
+            executable.decoded.to_ascii_lowercase().as_str(),
+            "rd" | "rd.exe" | "rmdir" | "rmdir.exe"
+        );
+    let exact_format = !executable.dynamic
+        && matches!(
+            executable.decoded.to_ascii_lowercase().as_str(),
+            "format" | "format.com" | "format.exe"
+        );
+
+    let mut recursive = PossibleSwitch::default();
+    let mut help = false;
+    let mut drive_target = PossibleSwitch::default();
+    for raw in raw_words {
+        let Some(decoded) = decode_syntax_word(&mut decoder, raw, ShellDialect::Cmd) else {
+            return WindowsFilesystemSemanticDecision::Unverified;
+        };
+        if decoded.decoded.starts_with('/') || decoded.dynamic {
+            let candidate = possible_switch(&decoded, ShellDialect::Cmd, &["/s"]);
+            recursive.exact |= candidate.exact;
+            recursive.possible |= candidate.possible;
+            help |= !decoded.dynamic && decoded.decoded == "/?";
+            // A runtime-expanded non-option word can become a drive designator
+            // (for example `%DRIVE%:`).  It is not safe to treat every dynamic
+            // word as an option merely because it could also expand to `/s`.
+            if decoded.dynamic && !decoded.decoded.starts_with('/') {
+                drive_target.possible = true;
+            }
+        } else {
+            // Deterministic Cmd quoting/carets are shell syntax even for a
+            // target.  Decode them before recognizing a quoted drive such as
+            // `"C:"`, while never reinterpreting runtime expansions as exact.
+            drive_target.exact |= cmd_drive_target(&decoded.decoded);
+            drive_target.possible |= drive_target.exact;
+        }
+    }
+
+    if help && !recursive.possible {
+        return WindowsFilesystemSemanticDecision::Safe;
+    }
+    if exact_del && recursive.exact {
+        return WindowsFilesystemSemanticDecision::Destructive("del-recursive");
+    }
+    if exact_rd && recursive.exact {
+        return WindowsFilesystemSemanticDecision::Destructive("rd-recursive");
+    }
+    if exact_format && drive_target.exact {
+        return WindowsFilesystemSemanticDecision::Destructive("format-drive");
+    }
+
+    let possible_del = ["del", "del.exe", "erase", "erase.exe"]
+        .iter()
+        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
+    let possible_rd = ["rd", "rd.exe", "rmdir", "rmdir.exe"]
+        .iter()
+        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
+    let possible_format = ["format", "format.com", "format.exe"]
+        .iter()
+        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::Cmd, candidate));
+    if executable.dynamic && (possible_del || possible_rd) && recursive.possible
+        || (exact_del || exact_rd) && recursive.possible && !recursive.exact
+        || possible_format && drive_target.possible && (executable.dynamic || !drive_target.exact)
+    {
+        return WindowsFilesystemSemanticDecision::Unverified;
+    }
+    WindowsFilesystemSemanticDecision::NoMatch
+}
+
+fn powershell_wholly_quoted(raw: &str) -> bool {
+    matches!(raw.as_bytes().first(), Some(b'\'' | b'"'))
+}
+
+fn powershell_segment_semantic_decision(
+    segment: &str,
+    quoted_executable_is_command: bool,
+) -> WindowsFilesystemSemanticDecision {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
+    let word_count = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .count();
+    if word_count == 0 {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    let raw_words: Vec<_> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(segment))
+        .collect();
+    let Some(raw_executable) = raw_words.first().copied() else {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    };
+    // A quoted string at the start of an ordinary PowerShell statement is
+    // data, not a command invocation. The call-operator pre-pass below sets
+    // `quoted_executable_is_command` only when a statement-leading `&` proves
+    // that the string occupies an executable role.
+    if !quoted_executable_is_command && powershell_wholly_quoted(raw_executable) {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let Some(decoded) = decode_syntax_word(&mut decoder, raw_executable, ShellDialect::PowerShell)
+    else {
+        return WindowsFilesystemSemanticDecision::Unverified;
+    };
+    let executable = executable_word(decoded, ShellDialect::PowerShell);
+    if !POWERSHELL_PROTECTED_EXECUTABLES
+        .iter()
+        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::PowerShell, candidate))
+    {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    if word_count > MAX_WINDOWS_FILESYSTEM_SEMANTIC_TOKENS {
+        return WindowsFilesystemSemanticDecision::Unverified;
+    }
+
+    let exact_name = (!executable.dynamic).then(|| executable.decoded.to_ascii_lowercase());
+    let is_remove_item = exact_name.as_deref().is_some_and(|name| {
+        matches!(
+            name,
+            "remove-item" | "rmdir" | "rd" | "ri" | "rm" | "del" | "erase"
+        )
+    });
+    let is_clear_content = exact_name
+        .as_deref()
+        .is_some_and(|name| matches!(name, "clear-content" | "clc"));
+    let is_clear_recycle_bin = exact_name.as_deref() == Some("clear-recyclebin");
+
+    let mut recurse = PossibleSwitch::default();
+    let mut force = PossibleSwitch::default();
+    let mut what_if = PossibleSwitch::default();
+    let mut unresolved_remove_binding = false;
+    let mut invalid_static_remove_parameter = false;
+    let mut splatted_options = false;
+    let mut stop_parsing = false;
+    let mut index = 1usize;
+    while index < raw_words.len() {
+        let raw = raw_words[index];
+        index += 1;
+        if stop_parsing {
+            continue;
+        }
+        let syntax_role = powershell_parameter_dash_width(raw).is_some()
+            || raw.starts_with('@')
+            || matches!(raw, "--%" | "'--%'" | "\"--%\"");
+        if !syntax_role {
+            continue;
+        }
+
+        if raw.starts_with('@') {
+            let Some(decoded) = decode_syntax_word(&mut decoder, raw, ShellDialect::PowerShell)
+            else {
+                stop_parsing = true;
+                continue;
+            };
+            if decoded.dynamic {
+                splatted_options = true;
+            }
+            continue;
+        }
+
+        let colon = powershell_parameter_colon(raw);
+        let (raw_parameter, raw_value) = if let Some(colon) = colon {
+            let parameter = raw.get(..colon).unwrap_or(raw);
+            let attached = raw.get(colon.saturating_add(1)..).unwrap_or_default();
+            if attached.is_empty() {
+                let value = raw_words.get(index).copied();
+                index += usize::from(value.is_some());
+                (parameter, value)
+            } else {
+                (parameter, Some(attached))
+            }
+        } else {
+            (raw, None)
+        };
+        let Some(mut parameter) =
+            decode_syntax_word(&mut decoder, raw_parameter, ShellDialect::PowerShell)
+        else {
+            stop_parsing = true;
+            continue;
+        };
+        if !canonicalize_powershell_parameter_dash(&mut parameter) {
+            continue;
+        }
+        if !parameter.dynamic && parameter.decoded == "--" {
+            // PowerShell treats `--` as the end-of-parameters marker for
+            // cmdlets. Every later dash-prefixed word is positional data: it
+            // cannot invalidate an earlier -Recurse, and a later `-WhatIf`
+            // does not enable preview mode.
+            stop_parsing = true;
+            continue;
+        }
+        let switch_value = if colon.is_some() {
+            powershell_switch_value(raw_value)
+        } else {
+            PowerShellSwitchValue::Enabled
+        };
+
+        let static_parameter = (!parameter.dynamic)
+            .then(|| parameter.decoded.strip_prefix('-'))
+            .flatten()
+            .and_then(resolve_remove_item_parameter);
+        if let Some(static_parameter) = static_parameter {
+            match static_parameter {
+                RemoveItemParameter::Recurse => {
+                    unresolved_remove_binding |=
+                        record_powershell_switch(&mut recurse, switch_value, true);
+                }
+                RemoveItemParameter::Force => {
+                    unresolved_remove_binding |=
+                        record_powershell_switch(&mut force, switch_value, true);
+                }
+                RemoveItemParameter::WhatIf => {
+                    unresolved_remove_binding |=
+                        record_powershell_switch(&mut what_if, switch_value, true);
+                }
+                RemoveItemParameter::Value => {
+                    if colon.is_some() {
+                        if raw_value.is_none() {
+                            invalid_static_remove_parameter = true;
+                        }
+                    } else {
+                        match raw_words
+                            .get(index)
+                            .copied()
+                            .map(powershell_value_lookahead)
+                        {
+                            Some(PowerShellValueLookahead::Data) => index += 1,
+                            Some(PowerShellValueLookahead::NamedParameter) | None => {
+                                // A recognized or ambiguous named parameter
+                                // starts a new binding; the current value-taking
+                                // parameter is therefore missing its argument.
+                                invalid_static_remove_parameter = true;
+                            }
+                            Some(PowerShellValueLookahead::Dynamic) => {
+                                // Runtime expansion can turn this token into a
+                                // value (allowing deletion) or a recognized
+                                // parameter (causing a binding error).
+                                unresolved_remove_binding = true;
+                                index += 1;
+                            }
+                            Some(PowerShellValueLookahead::EndOfParameters) => {
+                                index += 1;
+                                if raw_words.get(index).is_some() {
+                                    index += 1;
+                                    stop_parsing = true;
+                                } else {
+                                    invalid_static_remove_parameter = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                RemoveItemParameter::Other => {
+                    if colon.is_some() && switch_value == PowerShellSwitchValue::Unresolved {
+                        unresolved_remove_binding = true;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if parameter.dynamic {
+            if dynamic_parameter_may_resolve_to(&parameter, RemoveItemParameter::Recurse) {
+                unresolved_remove_binding |=
+                    record_powershell_switch(&mut recurse, switch_value, false);
+            }
+            if dynamic_parameter_may_resolve_to(&parameter, RemoveItemParameter::Force) {
+                unresolved_remove_binding |=
+                    record_powershell_switch(&mut force, switch_value, false);
+            }
+            if dynamic_parameter_may_resolve_to(&parameter, RemoveItemParameter::WhatIf) {
+                unresolved_remove_binding |=
+                    record_powershell_switch(&mut what_if, switch_value, false);
+            }
+        } else if is_remove_item
+            && parameter
+                .decoded
+                .strip_prefix('-')
+                .is_some_and(|name| name.chars().next().is_some_and(char::is_alphabetic))
+        {
+            // PowerShell binds every named parameter before invoking the
+            // cmdlet. A literal unknown or ambiguous spelling (notably `-F`,
+            // which collides between Filter and Force) therefore prevents
+            // Remove-Item from executing at all. Do not manufacture a
+            // destructive result from the otherwise valid `-Recurse` token.
+            invalid_static_remove_parameter = true;
+        }
+    }
+
+    if is_remove_item && invalid_static_remove_parameter {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    if (is_remove_item || is_clear_content || is_clear_recycle_bin) && what_if.exact {
+        return WindowsFilesystemSemanticDecision::Safe;
+    }
+    if is_clear_content {
+        return WindowsFilesystemSemanticDecision::Destructive("clear-content");
+    }
+    if is_clear_recycle_bin {
+        return WindowsFilesystemSemanticDecision::Destructive("clear-recyclebin");
+    }
+    if is_remove_item && recurse.possible && (unresolved_remove_binding || splatted_options) {
+        return WindowsFilesystemSemanticDecision::Unverified;
+    }
+    if is_remove_item && recurse.exact {
+        return WindowsFilesystemSemanticDecision::Destructive(if force.exact {
+            "remove-item-recurse-force"
+        } else {
+            "remove-item-recurse"
+        });
+    }
+    let possible_remove = ["remove-item", "rmdir", "rd", "ri", "rm", "del", "erase"]
+        .iter()
+        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::PowerShell, candidate));
+    let possible_clear = ["clear-content", "clc", "clear-recyclebin"]
+        .iter()
+        .any(|candidate| symbolic_word_may_equal(&executable, ShellDialect::PowerShell, candidate));
+    let recurse_possible = recurse.possible || splatted_options;
+    if executable.dynamic && possible_clear
+        || possible_remove
+            && recurse_possible
+            && (executable.dynamic || !recurse.exact || splatted_options)
+    {
+        return WindowsFilesystemSemanticDecision::Unverified;
+    }
+    WindowsFilesystemSemanticDecision::NoMatch
+}
+
+/// Evaluate PowerShell call-operator targets before the generic segment pass.
+///
+/// The dialect tokenizer represents bare `&` as a separator because it can be
+/// PowerShell's background operator.  At the beginning of a statement,
+/// however, `&` is the call operator and a quoted string becomes executable.
+/// Retaining that distinction is necessary for forms such as
+/// `& "Clear`-Content" file`, whose protected verb is otherwise inert data.
+fn powershell_static_call_postfix_preserves_executable(call: &str, tail: &str) -> bool {
+    let Some(target_len) = call.len().checked_sub(tail.len()) else {
+        return false;
+    };
+    let target = call.get(..target_len).unwrap_or_default().trim_end();
+    let Some(rest) = target
+        .trim_start()
+        .strip_prefix('&')
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+    let (array_expression, opening_parenthesis) = if rest.starts_with("@(") {
+        (true, 1usize)
+    } else if rest.starts_with("$(") {
+        (false, 1usize)
+    } else if rest.starts_with('(') {
+        (false, 0usize)
+    } else {
+        return false;
+    };
+
+    let mut depth = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut expression_end = None;
+    for (index, character) in rest.char_indices().skip(opening_parenthesis) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '`' && !single {
+            escaped = true;
+            continue;
+        }
+        if character == '\'' && !double {
+            single = !single;
+            continue;
+        }
+        if character == '"' && !single {
+            double = !double;
+            continue;
+        }
+        if single || double {
+            continue;
+        }
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                let Some(next_depth) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next_depth;
+                if depth == 0 {
+                    expression_end = Some(index + character.len_utf8());
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(expression_end) = expression_end else {
+        return false;
+    };
+    let postfix = rest.get(expression_end..).unwrap_or_default().trim();
+    if postfix.is_empty() {
+        return true;
+    }
+
+    // Only the identity selection from the single-element array expression is
+    // statically equivalent to the parser's decoded executable. Parenthesized
+    // strings index characters, and runtime/multiple indices can select a
+    // different value. Keep those forms fail-closed rather than reusing a
+    // literal that no longer necessarily occupies the executable role.
+    let Some(index) = postfix
+        .strip_prefix('[')
+        .and_then(|postfix| postfix.strip_suffix(']'))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    array_expression && index == "0"
+}
+
+fn powershell_call_operator_analysis(command: &str) -> PowerShellCallOperatorAnalysis {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    let mut saw_word_in_statement = false;
+    let mut saw_safe = false;
+    let mut saw_unverified = false;
+    let mut inert_target_spans = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            NormalizeTokenKind::Word => saw_word_in_statement = true,
+            NormalizeTokenKind::Separator => {
+                let is_call_operator = !saw_word_in_statement && token.text(command) == Some("&");
+                if is_call_operator {
+                    let call = command[token.byte_range.start..].trim_start();
+                    let expression_decision =
+                        crate::packs::core::git::powershell_static_call_executable(call).map(
+                            |(executable, tail)| {
+                                if !powershell_static_call_postfix_preserves_executable(call, tail)
+                                {
+                                    return WindowsFilesystemSemanticDecision::Unverified;
+                                }
+                                let Some(executable) = executable else {
+                                    return WindowsFilesystemSemanticDecision::Unverified;
+                                };
+                                let basename = executable
+                                    .rsplit(['/', '\\'])
+                                    .next()
+                                    .unwrap_or(&executable)
+                                    .to_ascii_lowercase();
+                                if !POWERSHELL_PROTECTED_EXECUTABLES
+                                    .iter()
+                                    .any(|candidate| basename == *candidate)
+                                {
+                                    let tail_start = command.len().saturating_sub(tail.len());
+                                    if token.byte_range.start < tail_start {
+                                        inert_target_spans.push(token.byte_range.start..tail_start);
+                                    }
+                                    return WindowsFilesystemSemanticDecision::NoMatch;
+                                }
+                                let first_tail = crate::packs::split_command_segments_in_dialect(
+                                    tail,
+                                    ShellDialect::PowerShell,
+                                )
+                                .into_iter()
+                                .next()
+                                .unwrap_or("");
+                                let reconstructed = format!("{basename} {first_tail}");
+                                powershell_segment_semantic_decision(&reconstructed, true)
+                            },
+                        );
+                    let tail_start = token.byte_range.end;
+                    let tail_end = tokens
+                        .iter()
+                        .skip(index + 1)
+                        .find(|next| next.kind == NormalizeTokenKind::Separator)
+                        .map_or(command.len(), |next| next.byte_range.start);
+                    let tail = command[tail_start..tail_end].trim();
+                    let decision = if let Some(decision) = expression_decision {
+                        decision
+                    } else if tail.is_empty() {
+                        // Parenthesized, indexed, and other expression targets
+                        // are split at their opening control token. Their
+                        // runtime executable cannot be proven harmless here.
+                        WindowsFilesystemSemanticDecision::Unverified
+                    } else {
+                        powershell_segment_semantic_decision(tail, true)
+                    };
+                    match decision {
+                        decision @ WindowsFilesystemSemanticDecision::Destructive(_) => {
+                            return PowerShellCallOperatorAnalysis {
+                                decision: Some(decision),
+                                inert_target_spans,
+                            };
+                        }
+                        WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+                        WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
+                        WindowsFilesystemSemanticDecision::NoMatch => {}
+                    }
+                }
+                saw_word_in_statement = false;
+            }
+        }
+    }
+
+    let decision = if saw_unverified {
+        Some(WindowsFilesystemSemanticDecision::Unverified)
+    } else if saw_safe {
+        Some(WindowsFilesystemSemanticDecision::Safe)
+    } else {
+        None
+    };
+    PowerShellCallOperatorAnalysis {
+        decision,
+        inert_target_spans,
+    }
+}
+
+fn powershell_static_call_is_non_filesystem_command(command: &str) -> bool {
+    let Some((Some(executable), tail)) =
+        crate::packs::core::git::powershell_static_call_executable(command)
+    else {
+        return false;
+    };
+    if !powershell_static_call_postfix_preserves_executable(command, tail) {
+        return false;
+    }
+    let basename = executable.rsplit(['/', '\\']).next().unwrap_or(&executable);
+    !POWERSHELL_PROTECTED_EXECUTABLES
+        .iter()
+        .any(|candidate| basename.eq_ignore_ascii_case(candidate))
+}
+
+/// Return whether a command contains a case-insensitive spelling of a
+/// PowerShell filesystem verb or alias as a shell-sized word.
+///
+/// PowerShell command resolution is case-insensitive, while the shared keyword
+/// index is intentionally case-sensitive. This bounded prefilter closes that
+/// mismatch without forcing the semantic parser for every PowerShell command;
+/// the role-aware parser still decides whether the word is executable or inert
+/// data.
+fn contains_powershell_protected_word_case_insensitive(command: &str) -> bool {
+    command
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        })
+        .any(|word| {
+            POWERSHELL_PROTECTED_EXECUTABLES
+                .iter()
+                .any(|candidate| word.eq_ignore_ascii_case(candidate))
+        })
+}
+
+/// Analyze native-Windows filesystem syntax with bounded, caller-proven shell
+/// decoding. The returned rule name is a member of this pack.
+#[must_use]
+pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
+    command: &str,
+    dialect: ShellDialect,
+) -> WindowsFilesystemSemanticDecision {
+    if dialect == ShellDialect::Posix {
+        return WindowsFilesystemSemanticDecision::NoMatch;
+    }
+    if dialect == ShellDialect::Unknown {
+        let decisions = [
+            windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell),
+            windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::Cmd),
+        ];
+        if let Some(decision) = decisions
+            .iter()
+            .copied()
+            .find(|decision| matches!(decision, WindowsFilesystemSemanticDecision::Destructive(_)))
+        {
+            return decision;
+        }
+        if decisions.contains(&WindowsFilesystemSemanticDecision::Unverified) {
+            return WindowsFilesystemSemanticDecision::Unverified;
+        }
+        return if decisions.contains(&WindowsFilesystemSemanticDecision::Safe) {
+            WindowsFilesystemSemanticDecision::Safe
+        } else {
+            WindowsFilesystemSemanticDecision::NoMatch
+        };
+    }
+
+    if command.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_BYTES {
+        // Do not allocate or tokenize an attacker-controlled oversized shell
+        // program.  Callers invoke this pass only for the enabled Windows pack;
+        // failing closed is the only sound bounded result.
+        return WindowsFilesystemSemanticDecision::Unverified;
+    }
+
+    let has_dialect_syntax = match dialect {
+        ShellDialect::PowerShell => {
+            command.contains(['`', '$', '@', '&', '\u{2013}', '\u{2014}', '\u{2015}'])
+        }
+        ShellDialect::Cmd => command.contains(['^', '%', '!']),
+        ShellDialect::Posix | ShellDialect::Unknown => false,
+    };
+    let lowercase_command = command.to_ascii_lowercase();
+    let has_literal_keyword = CMD_PROTECTED_EXECUTABLES
+        .iter()
+        .chain(POWERSHELL_PROTECTED_EXECUTABLES)
+        .any(|keyword| lowercase_command.contains(keyword));
+
+    let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
+    if segments.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS {
+        return if has_dialect_syntax || has_literal_keyword {
+            WindowsFilesystemSemanticDecision::Unverified
+        } else {
+            WindowsFilesystemSemanticDecision::NoMatch
+        };
+    }
+    let mut saw_safe = false;
+    let mut saw_unverified = false;
+    let call_analysis = if dialect == ShellDialect::PowerShell {
+        let analysis = powershell_call_operator_analysis(command);
+        if let Some(decision) = analysis.decision {
+            match decision {
+                decision @ WindowsFilesystemSemanticDecision::Destructive(_) => return decision,
+                WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+                WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
+                WindowsFilesystemSemanticDecision::NoMatch => {}
+            }
+        }
+        Some(analysis)
+    } else {
+        None
+    };
+    let mut segment_search_start = 0usize;
+    for segment in segments {
+        let segment_range = command
+            .get(segment_search_start..)
+            .and_then(|tail| tail.find(segment))
+            .map(|relative_start| {
+                let start = segment_search_start.saturating_add(relative_start);
+                start..start.saturating_add(segment.len())
+            });
+        if let Some(range) = &segment_range {
+            segment_search_start = range.end;
+        }
+        let is_inert_call_target_fragment = segment_range.as_ref().is_some_and(|segment_range| {
+            call_analysis.as_ref().is_some_and(|analysis| {
+                analysis.inert_target_spans.iter().any(|target_range| {
+                    target_range.start <= segment_range.start
+                        && segment_range.end <= target_range.end
+                })
+            })
+        });
+        let decision = match dialect {
+            ShellDialect::PowerShell if is_inert_call_target_fragment => {
+                // The call-operator pass proved that this fragment belongs to
+                // a bounded static non-filesystem executable. Preserve that
+                // role across the generic splitter without hiding subsequent
+                // statements or executable expressions in argument position.
+                WindowsFilesystemSemanticDecision::NoMatch
+            }
+            ShellDialect::PowerShell
+                if powershell_static_call_is_non_filesystem_command(segment) =>
+            {
+                // A bounded literal expression after PowerShell's call operator
+                // resolves to a known non-filesystem command. Its remaining
+                // arguments are data and must not be reinterpreted as a second
+                // executable by the generic segment pass.
+                WindowsFilesystemSemanticDecision::NoMatch
+            }
+            ShellDialect::PowerShell => powershell_segment_semantic_decision(segment, false),
+            ShellDialect::Cmd => cmd_segment_semantic_decision(segment),
+            ShellDialect::Posix | ShellDialect::Unknown => {
+                WindowsFilesystemSemanticDecision::NoMatch
+            }
+        };
+        match decision {
+            decision @ WindowsFilesystemSemanticDecision::Destructive(_) => return decision,
+            WindowsFilesystemSemanticDecision::Unverified => saw_unverified = true,
+            WindowsFilesystemSemanticDecision::Safe => saw_safe = true,
+            WindowsFilesystemSemanticDecision::NoMatch => {}
+        }
+    }
+    if saw_unverified {
+        WindowsFilesystemSemanticDecision::Unverified
+    } else if saw_safe {
+        WindowsFilesystemSemanticDecision::Safe
+    } else {
+        WindowsFilesystemSemanticDecision::NoMatch
+    }
+}
+
+/// Candidate-selection override for native-Windows filesystem commands whose
+/// protected executable or option is hidden by caller-proven shell syntax.
+#[must_use]
+pub(crate) fn windows_filesystem_semantic_scan_required(
+    command: &str,
+    dialect: ShellDialect,
+) -> bool {
+    let has_relevant_escape = match dialect {
+        // A statement-leading `&` can turn a quoted string or expression into
+        // an executable even when the protected spelling is assembled without
+        // a backtick or variable (for example `& ('Clear' + '-Content')`).
+        ShellDialect::PowerShell => {
+            command.contains(['`', '$', '@', '&', '\u{2013}', '\u{2014}', '\u{2015}'])
+        }
+        ShellDialect::Cmd => command.contains(['^', '%', '!']),
+        ShellDialect::Unknown => command.contains([
+            '`', '$', '@', '&', '^', '%', '!', '\u{2013}', '\u{2014}', '\u{2015}',
+        ]),
+        ShellDialect::Posix => false,
+    };
+    let has_case_insensitive_powershell_candidate =
+        matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown)
+            && contains_powershell_protected_word_case_insensitive(command);
+    (has_relevant_escape || has_case_insensitive_powershell_candidate)
+        && !matches!(
+            windows_filesystem_semantic_decision_in_dialect(command, dialect),
+            WindowsFilesystemSemanticDecision::NoMatch
+        )
+}
+
 /// Create the Windows core filesystem pack.
 #[must_use]
 pub fn create_pack() -> Pack {
@@ -62,7 +1443,8 @@ pub fn create_pack() -> Pack {
         name: "Windows Filesystem",
         description: "Protects against recursive/forced filesystem destruction on Windows: cmd \
                       `del /s`, `rd /s`, `format <drive>:`, and PowerShell `Remove-Item -Recurse \
-                      -Force` (and aliases), `Clear-Content`, and `Clear-RecycleBin`.",
+                      (with or without `-Force`; aliases included), `Clear-Content`, and \
+                      `Clear-RecycleBin`.",
         // Realistic casings for the case-sensitive keyword quick-reject (see
         // super-module docs). cmd verbs: lower + UPPER. PowerShell cmdlets:
         // PascalCase + lower. Aliases (rm/ri/clc) included so PS alias forms gate.
@@ -111,7 +1493,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // execute.
         safe_pattern!(
             "whatif-preview",
-            r"(?i)^\s*(?:(?:remove-item|ri|clear-content|clc|clear-recyclebin)\b[^|&;\r\n]*\s-whatif\b|rm\b(?=[^|&;\r\n]*\s-recurse\b)(?=[^|&;\r\n]*\s-force\b)[^|&;\r\n]*\s-whatif\b)[^|&;\r\n]*$"
+            r"(?i)^\s*(?:(?:remove-item|ri|clear-content|clc|clear-recyclebin)\b(?![^|&;\r\n]*\s--(?:\s|$))[^|&;\r\n]*\s-whatif\b|rm\b(?=[^|&;\r\n]*\s-recurse\b)(?![^|&;\r\n]*\s--(?:\s|$))[^|&;\r\n]*\s-whatif\b)[^|&;\r\n]*$"
         ),
         // Read-only / preview cmd help on these verbs.
         safe_pattern!(
@@ -123,6 +1505,19 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        // Evaluated explicitly by the bounded caller-dialect semantic pass.
+        // The regex is deliberately unsatisfiable: raw text matching must not
+        // manufacture a fail-closed finding without role-aware shell analysis.
+        DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(r"(?!)"),
+            reason: WINDOWS_FILESYSTEM_UNVERIFIED_REASON,
+            name: Some(WINDOWS_FILESYSTEM_UNVERIFIED_RULE),
+            severity: crate::packs::Severity::Critical,
+            explanation: Some(
+                "Review the fully expanded Windows command before allowing execution. Dynamic or malformed shell syntax in the executable or recursive/forced option roles can conceal an irreversible filesystem operation.",
+            ),
+            suggestions: DEL_SUGGESTIONS,
+        },
         // === cmd: recursive delete (del/erase /s) ===
         destructive_pattern!(
             "del-recursive",
@@ -159,12 +1554,29 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Remove-Item -Recurse -Force deletes a tree with no Recycle Bin and no prompt.",
             Critical,
             "`Remove-Item -Recurse -Force` (or an alias such as `rm`/`del`/`ri`) deletes a directory \
-             and everything under it. `-Force` removes hidden/read-only items and `-Recurse` \
-             descends the whole tree; together they bypass the Recycle Bin and any confirmation. \
+             and everything under it. `-Recurse` permanently descends and removes the whole tree; \
+             `-Force` additionally includes hidden/read-only items. Remove-Item does not use the \
+             Recycle Bin. \
              Pointed at a profile, repo, or drive root this is catastrophic and irreversible.\n\n\
              Safer alternatives:\n\
              - Re-run with -WhatIf to preview what would be removed\n\
-             - Drop -Force so protected items and confirmations still apply\n\
+             - Move-Item the target to a temp location instead of deleting",
+            REMOVE_ITEM_SUGGESTIONS
+        ),
+        // === PowerShell: Remove-Item -Recurse without -Force (+ aliases) ===
+        // Keep this after the force-specific pattern so raw matching preserves
+        // the established rule id for commands that include both switches.
+        destructive_pattern!(
+            "remove-item-recurse",
+            r"(?i)\b(?:remove-item|rmdir|rd|ri|rm|del|erase)\b(?=[^|&\r\n]*\s(?:-recurse|-r)\b)",
+            "Remove-Item -Recurse permanently deletes a tree with no Recycle Bin.",
+            Critical,
+            "`Remove-Item -Recurse` (or an alias such as `rm`/`del`/`ri`) permanently deletes a \
+             directory and everything under it. `-Force` is not required for recursive deletion; \
+             it only broadens removal to hidden/read-only items. Remove-Item bypasses the Recycle \
+             Bin, so a wrong path can destroy a profile, repository, or drive tree with no undo.\n\n\
+             Safer alternatives:\n\
+             - Re-run with -WhatIf to preview what would be removed\n\
              - Move-Item the target to a temp location instead of deleting",
             REMOVE_ITEM_SUGGESTIONS
         ),
@@ -269,6 +1681,20 @@ mod tests {
     }
 
     #[test]
+    fn blocks_powershell_recursive_deletes_without_force() {
+        let pack = create_pack();
+        for command in [
+            "Remove-Item -Recurse C:\\src",
+            "remove-item -r C:\\src",
+            "ri -R C:\\src",
+            "rm -Recurse $env:USERPROFILE\\repo",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "remove-item-recurse");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+    }
+
+    #[test]
     fn blocks_format_and_clear() {
         let pack = create_pack();
         assert_blocks_with_pattern(&pack, "format C: /q /y", "format-drive");
@@ -326,7 +1752,10 @@ mod tests {
         let pack = create_pack();
         let allowed = [
             // -WhatIf previews
+            "Remove-Item -Recurse C:\\src -WhatIf",
             "Remove-Item -Recurse -Force C:\\src -WhatIf",
+            "ri -R C:\\src -WhatIf",
+            "rm -Recurse C:\\src -WhatIf",
             "rm -Recurse -Force C:\\src -WhatIf",
             "Clear-Content C:\\app\\server.log -WhatIf",
             "Clear-RecycleBin -WhatIf",
@@ -367,5 +1796,480 @@ mod tests {
                 "recursive temp cleanup must require review: {command}"
             );
         }
+    }
+
+    #[test]
+    fn semantic_cmd_decoder_covers_every_protected_verb() {
+        let checks = [
+            ("d^el /s /q C:\\src", "del-recursive"),
+            ("e^rase /s C:\\data", "del-recursive"),
+            ("r^d /s /q C:\\src", "rd-recursive"),
+            ("r^mdir /s C:\\build", "rd-recursive"),
+            ("f^ormat C: /q", "format-drive"),
+            ("f^ormat \"D:\" /q", "format-drive"),
+        ];
+        for (command, expected) in checks {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::Cmd),
+                WindowsFilesystemSemanticDecision::Destructive(expected),
+                "caller-proven Cmd decoding must classify {command}"
+            );
+            assert!(
+                windows_filesystem_semantic_scan_required(command, ShellDialect::Cmd),
+                "escaped executable must override keyword candidate selection: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_powershell_decoder_covers_every_protected_verb() {
+        let remove_item_aliases = [
+            "Remove`-Item",
+            "r`mdir",
+            "r`d",
+            "r`i",
+            "r`m",
+            "d`el",
+            "e`rase",
+        ];
+        for executable in remove_item_aliases {
+            let command = format!("{executable} -Re`curse -Fo`rce C:\\src");
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(&command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+                "caller-proven PowerShell decoding must classify {command}"
+            );
+            assert!(windows_filesystem_semantic_scan_required(
+                &command,
+                ShellDialect::PowerShell
+            ));
+        }
+
+        for (command, expected) in [
+            ("Clear`-Content C:\\app\\server.log", "clear-content"),
+            ("c`lc .\\notes.txt", "clear-content"),
+            ("Clear`-RecycleBin -Force", "clear-recyclebin"),
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive(expected),
+                "caller-proven PowerShell decoding must classify {command}"
+            );
+            assert!(windows_filesystem_semantic_scan_required(
+                command,
+                ShellDialect::PowerShell
+            ));
+        }
+
+        for (command, expected) in [
+            ("& \"Clear`-Content\" C:\\app\\server.log", "clear-content"),
+            ("& \"Clear`-RecycleBin\" -Force", "clear-recyclebin"),
+            (
+                "& @('Clear-Content')[0] C:\\app\\server.log",
+                "clear-content",
+            ),
+            (
+                "Write-Output ready; & \"Remove`-Item\" -Re`curse -Fo`rce C:\\src",
+                "remove-item-recurse-force",
+            ),
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive(expected),
+                "PowerShell's call operator must preserve executable quoted strings: {command}"
+            );
+            assert!(windows_filesystem_semantic_scan_required(
+                command,
+                ShellDialect::PowerShell,
+            ));
+        }
+    }
+
+    #[test]
+    fn semantic_powershell_blocks_recurse_without_force_and_preserves_whatif() {
+        for command in [
+            "Remove-Item -Recurse C:\\src",
+            "ri -R C:\\src",
+            "& \"Remove-Item\" -Recurse C:\\src",
+            "& 'ri' -R C:\\src",
+            "Remove-Item -Recurse -- -important",
+            "Remove-Item -Recurse -- C:\\src -WhatIf",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse"),
+                "recursive Remove-Item is destructive without Force: {command}",
+            );
+            assert!(windows_filesystem_semantic_scan_required(
+                command,
+                ShellDialect::PowerShell,
+            ));
+        }
+
+        for command in [
+            "Remove-Item -Recurse C:\\src -WhatIf",
+            "ri -R C:\\src -WhatIf",
+            "& \"Remove-Item\" -Recurse C:\\src -WhatIf",
+            "& 'ri' -R C:\\src -WhatIf",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Safe,
+                "a proven WhatIf preview must remain safe: {command}",
+            );
+        }
+
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Remove-Item -- -Recurse C:\\src",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch,
+            "Recurse after PowerShell's end-of-parameters marker is positional data",
+        );
+    }
+
+    #[test]
+    fn semantic_powershell_binds_unique_remove_item_switch_prefixes() {
+        assert_eq!(
+            resolve_remove_item_parameter("R"),
+            Some(RemoveItemParameter::Recurse)
+        );
+        assert_eq!(
+            resolve_remove_item_parameter("Rec"),
+            Some(RemoveItemParameter::Recurse)
+        );
+        assert_eq!(resolve_remove_item_parameter("F"), None);
+        assert_eq!(
+            resolve_remove_item_parameter("Fi"),
+            Some(RemoveItemParameter::Value)
+        );
+        assert_eq!(
+            resolve_remove_item_parameter("Fo"),
+            Some(RemoveItemParameter::Force)
+        );
+        assert_eq!(resolve_remove_item_parameter("W"), None);
+        assert_eq!(
+            resolve_remove_item_parameter("EA"),
+            Some(RemoveItemParameter::Value),
+            "common-parameter aliases must bind exactly"
+        );
+        assert_eq!(
+            resolve_remove_item_parameter("LP"),
+            Some(RemoveItemParameter::Value),
+            "cmdlet parameter aliases must bind exactly"
+        );
+        assert_eq!(
+            resolve_remove_item_parameter("Wh"),
+            Some(RemoveItemParameter::WhatIf)
+        );
+        assert_eq!(
+            resolve_remove_item_parameter("wi"),
+            Some(RemoveItemParameter::WhatIf),
+            "WhatIf's parameter alias must bind exactly"
+        );
+    }
+
+    #[test]
+    fn semantic_powershell_switch_booleans_block_recursive_force_aliases() {
+        for command in [
+            "Remove-Item -Rec:$true -Fo:$true C:\\src",
+            "Remove-Item -Recurse:$TRUE -Force:$TrUe C:\\src",
+            "rm -R:$true -For:$true C:\\src",
+            "ri -Recu:$true -Forc:$true C:\\src",
+            "del -R: $true -Fo: $true C:\\src",
+            "Remove`-Item -Re`c:$true -Fo`r:$true C:\\src",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+                "PowerShell-bound true switches must classify {command}"
+            );
+            assert!(
+                windows_filesystem_semantic_scan_required(command, ShellDialect::PowerShell),
+                "boolean/escaped syntax must override candidate selection: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_powershell_switch_booleans_preserve_false_and_whatif() {
+        for command in [
+            "Remove-Item -Rec:$false -Fo:$true C:\\src",
+            "rm -R:$false -For:$false C:\\src",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::NoMatch,
+                "a false Recurse switch must remain disabled: {command}"
+            );
+        }
+
+        for command in [
+            "Remove-Item -Rec:$true -Fo:$false C:\\src",
+            "Remove-Item -R:$true -Fi:$true C:\\src",
+            "Remove-Item -R:$true C:\\src -EA SilentlyContinue",
+            "Remove-Item -R:$true -LP C:\\src",
+            "Remove-Item -Recurse -LiteralPath -foo",
+            "Remove-Item -Recurse -Path -foo",
+            "Remove-Item -Filter -foo . -Recurse",
+            "Remove-Item -Recurse -LiteralPath -- -foo",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse"),
+                "Recurse is destructive even when Force is false, absent, or replaced by another valid parameter: {command}"
+            );
+        }
+
+        for command in [
+            "Remove-Item -R:$true -F:$true C:\\src",
+            "Remove-Item -R:$true -NotAParameter C:\\src",
+            "Remove-Item -Recurse -LiteralPath -Force",
+            "Remove-Item -Recurse -LiteralPath -F",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::NoMatch,
+                "a statically invalid parameter prevents PowerShell from invoking Remove-Item: {command}"
+            );
+        }
+
+        for command in [
+            "Remove-Item -Rec:$true -Fo:$true C:\\src -Wh:$true",
+            "rm -R:$true -Fo:$true C:\\src -wi:$true",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Safe,
+                "a proven true WhatIf binding must preserve preview safety: {command}"
+            );
+        }
+
+        for command in [
+            "Remove-Item -Rec:$true -Fo:$true C:\\src -WhatIf:$false",
+            "rm -R:$true -Fo:$true C:\\src -Wh:$false",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+                "a false WhatIf binding must not allow destruction: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_powershell_accepts_only_binder_recognized_parameter_dashes() {
+        for command in [
+            "Remove-Item –Recurse –Force C:\\src",
+            "Remove-Item —Recurse —Force C:\\src",
+            "Remove-Item ―Recurse ―Force C:\\src",
+            "rm –R –Fo C:\\src",
+            "Remove-Item —Rec:$true —Fo:$true C:\\src",
+            "Remove-Item ―R: $true ―For: $true C:\\src",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+                "PowerShell-recognized parameter dashes must not bypass protection: {command}"
+            );
+            assert!(windows_filesystem_semantic_scan_required(
+                command,
+                ShellDialect::PowerShell,
+            ));
+        }
+
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Remove-Item –Rec:$false –Fo:$true C:\\src",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch,
+            "a false switch value stays disabled with a typographic parameter dash",
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Remove-Item —Rec:$true —Fo:$true C:\\src —Wh:$true",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Safe,
+            "a true WhatIf switch stays safe with a typographic parameter dash",
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Remove-Item ―Rec:$true ―Fo:$true C:\\src ―wi:$false",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+            "a false WhatIf switch must not allow destruction",
+        );
+
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Remove-Item −Recurse −Force C:\\src",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::NoMatch,
+            "U+2212 MINUS SIGN is argument data, not a PowerShell parameter dash",
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Remove-Item -Recurse -Force C:\\src −WhatIf",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("remove-item-recurse-force"),
+            "U+2212 MINUS SIGN must not synthesize WhatIf preview safety",
+        );
+    }
+
+    #[test]
+    fn semantic_powershell_dynamic_switch_values_fail_closed() {
+        for command in [
+            "Remove-Item -Rec:$mode C:\\src",
+            "Remove-Item -Rec:$mode -Fo:$true C:\\src",
+            "Remove-Item -Rec:$true -Fo:$mode C:\\src",
+            "Remove-Item -Rec: $mode -Fo: $true C:\\src",
+            "Remove-Item -Rec:$(Get-Flag) -Fo:$true C:\\src",
+            "Remove-Item -Rec:'$true' -Fo:$true C:\\src",
+            "Rem$tail -Recurse C:\\src",
+            "Remove-Item -Recurse -LiteralPath -$name",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Unverified,
+                "runtime-dependent switch values must fail closed: {command}"
+            );
+            assert!(windows_filesystem_semantic_scan_required(
+                command,
+                ShellDialect::PowerShell,
+            ));
+        }
+    }
+
+    #[test]
+    fn semantic_decoder_preserves_data_roles_and_whatif() {
+        let harmless = [
+            ("echo r^d /s C:\\src", ShellDialect::Cmd),
+            ("echo d^el /s C:\\src", ShellDialect::Cmd),
+            (
+                "Write-Output Clear`-Content C:\\app\\server.log",
+                ShellDialect::PowerShell,
+            ),
+            ("Write-Output Clear`-RecycleBin", ShellDialect::PowerShell),
+            (
+                "Remove-Item '-Re`curse' '-Fo`rce' C:\\src",
+                ShellDialect::PowerShell,
+            ),
+            ("Remove`-Item -Fo`rce` C:\\src", ShellDialect::PowerShell),
+            ("\"r^d\" /s C:\\src", ShellDialect::Cmd),
+            ("d^el /s^ C:\\src", ShellDialect::Cmd),
+            (
+                "& 'Clear`-Content' C:\\app\\server.log",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "& \"Write-Output\" Clear`-Content",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "& ('Write'+'-Output') 'Clear-Content C:\\important.conf'",
+                ShellDialect::PowerShell,
+            ),
+            (
+                "& @('Write-Output')[0] 'Clear-Content C:\\important.conf'",
+                ShellDialect::PowerShell,
+            ),
+            ("& \"@cmd\" report.txt", ShellDialect::PowerShell),
+        ];
+        for (command, dialect) in harmless {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                WindowsFilesystemSemanticDecision::NoMatch,
+                "data must not be decoded into Windows filesystem syntax: {command}"
+            );
+            assert!(
+                !windows_filesystem_semantic_scan_required(command, dialect),
+                "data-only escapes must not force pack selection: {command}"
+            );
+        }
+
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Clear`-Content C:\\app\\server.log -What`If",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Safe
+        );
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Clear`-Content '-What`If'",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("clear-content")
+        );
+    }
+
+    #[test]
+    fn semantic_decoder_fails_closed_on_unresolved_destructive_roles() {
+        for (command, dialect) in [
+            ("d^el C:\\src /s^", ShellDialect::Cmd),
+            ("f^ormat %DRIVE%: /q", ShellDialect::Cmd),
+            ("f^ormat \"%DRIVE%:\" /q", ShellDialect::Cmd),
+            ("d^el /? /s%MODE% C:\\src", ShellDialect::Cmd),
+            ("Remove`-Item @parameters C:\\src", ShellDialect::PowerShell),
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, dialect),
+                WindowsFilesystemSemanticDecision::Unverified,
+                "unresolved executable/option syntax must fail closed: {command}"
+            );
+            assert!(
+                windows_filesystem_semantic_scan_required(command, dialect),
+                "unresolved destructive syntax must override keyword candidate selection: {command}"
+            );
+        }
+
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "Remove`-Item -Re`curse C:\\src -Fo`rce`",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Unverified,
+            "malformed Force syntax must fail closed instead of being assigned a concrete rule",
+        );
+
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "& ('Clear' + '-Content') C:\\app\\server.log",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("clear-content"),
+            "a bounded static call expression must resolve to its exact protected cmdlet",
+        );
+
+        for command in [
+            "& @('Clear-Content')[$index] C:\\app\\server.log",
+            "& @('Clear-Content')[0 + $offset] C:\\app\\server.log",
+            "& ('Clear-Content')[0] C:\\app\\server.log",
+        ] {
+            assert_eq!(
+                windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::PowerShell,),
+                WindowsFilesystemSemanticDecision::Unverified,
+                "an index that does not preserve the decoded array executable must fail closed: {command}",
+            );
+            assert!(windows_filesystem_semantic_scan_required(
+                command,
+                ShellDialect::PowerShell,
+            ));
+        }
+
+        assert_eq!(
+            windows_filesystem_semantic_decision_in_dialect(
+                "& @('Write-Output')[0] safe; Clear-Content C:\\important.conf",
+                ShellDialect::PowerShell,
+            ),
+            WindowsFilesystemSemanticDecision::Destructive("clear-content"),
+            "an inert call target must not hide a later destructive statement",
+        );
     }
 }

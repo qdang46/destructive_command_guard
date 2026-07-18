@@ -217,6 +217,7 @@ impl AstMatcher {
     /// Create a new matcher with default destructive patterns.
     #[must_use]
     pub fn new() -> Self {
+        precompile_perl_patterns();
         Self {
             patterns: precompile_patterns(default_patterns()),
             timeout: Duration::from_millis(AST_TIMEOUT_MS),
@@ -227,6 +228,7 @@ impl AstMatcher {
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // HashMap is not const-constructible
     pub fn with_patterns(patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>) -> Self {
+        precompile_perl_patterns();
         Self {
             patterns: precompile_patterns(patterns),
             timeout: Duration::from_millis(AST_TIMEOUT_MS),
@@ -1388,6 +1390,20 @@ static PERL_RMDIR_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)\brmdir\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
         .expect("perl rmdir regex compiles")
 });
+
+fn precompile_perl_patterns() {
+    // Perl uses the bounded regex fallback rather than ast-grep. Compile its
+    // fixed patterns while constructing the matcher so first-use compilation
+    // cannot consume the per-match timeout and turn a valid first Perl scan
+    // into a fail-open timeout. Construction remains covered by the caller's
+    // absolute hook deadline.
+    LazyLock::force(&PERL_SYSTEM_EXEC_LITERAL);
+    LazyLock::force(&PERL_BACKTICKS_LITERAL);
+    LazyLock::force(&PERL_QX_SLASH_LITERAL);
+    LazyLock::force(&PERL_FILE_PATH_RMTREE_LITERAL);
+    LazyLock::force(&PERL_UNLINK_LITERAL);
+    LazyLock::force(&PERL_RMDIR_LITERAL);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PerlShellCall {

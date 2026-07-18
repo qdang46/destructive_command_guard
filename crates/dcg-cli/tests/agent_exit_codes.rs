@@ -24,6 +24,10 @@ fn dcg_binary() -> std::path::PathBuf {
 /// Run dcg in hook mode with JSON input.
 fn run_hook_mode_raw(input: &str) -> (String, String, i32) {
     let mut child = Command::new(dcg_binary())
+        // These tests validate hook protocol and exit-code semantics, not the
+        // production latency budget. Give loaded CI hosts enough scheduling
+        // headroom while leaving DCG's fail-closed production default intact.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

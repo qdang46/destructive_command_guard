@@ -1,18 +1,22 @@
 //! Allowlist file parsing and layered loading.
 //!
 //! This module implements loading of allowlist entries from three layers:
-//! - Project: `.dcg/allowlist.toml` at repo root
+//! - Project: `.dcg/allowlist.toml` at repo root, active only when the user
+//!   explicitly selects that repository's `.dcg.toml` through `DCG_CONFIG`
 //! - User: `~/.config/dcg/allowlist.toml`
 //! - System: `/etc/dcg/allowlist.toml` (optional)
 //!
 //! Test override:
 //! - `DCG_ALLOWLIST_SYSTEM_PATH` can override the system allowlist path
-//!   (useful for hermetic E2E tests).
+//!   (useful for hermetic E2E tests). The override is an explicit user trust
+//!   decision for that file, while its loaded entries retain System-layer
+//!   identity and precedence.
 //!
 //! Design goals:
 //! - Strongly-typed model (`AllowEntry`, `AllowSelector`)
 //! - Robust parsing: invalid TOML or invalid entries must not crash the hook
-//! - Explicit, testable layering precedence (project > user > system)
+//! - Explicit, testable layering precedence (trusted project > user > system)
+//! - No trust grants from repository contents alone
 
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
@@ -190,6 +194,20 @@ impl LayeredAllowlist {
         user: Option<PathBuf>,
         system: Option<PathBuf>,
     ) -> Self {
+        Self::load_from_paths_with_system_source(
+            project,
+            user,
+            system,
+            crate::config::ConfigSource::System,
+        )
+    }
+
+    fn load_from_paths_with_system_source(
+        project: Option<PathBuf>,
+        user: Option<PathBuf>,
+        system: Option<PathBuf>,
+        system_source: crate::config::ConfigSource,
+    ) -> Self {
         let mut layers: Vec<LoadedAllowlistLayer> = Vec::new();
 
         if let Some(path) = project {
@@ -212,7 +230,7 @@ impl LayeredAllowlist {
             layers.push(LoadedAllowlistLayer {
                 layer: AllowlistLayer::System,
                 path: path.clone(),
-                file: load_allowlist_file(AllowlistLayer::System, &path),
+                file: load_allowlist_file_with_source(AllowlistLayer::System, &path, system_source),
             });
         }
 
@@ -1459,39 +1477,72 @@ pub fn resolve_path_for_matching(
 /// Invalid TOML is treated as empty for that layer and reported in `errors`.
 #[must_use]
 pub fn load_default_allowlists() -> LayeredAllowlist {
-    let project = std::env::current_dir()
-        .ok()
-        .map(|cwd| project_allowlist_path(&cwd));
+    let project = std::env::current_dir().ok().and_then(|cwd| {
+        crate::config::explicitly_trusts_project_policy(&cwd).then(|| project_allowlist_path(&cwd))
+    });
 
-    // Check XDG-style path first (~/.config/dcg/), then platform-native
-    let user = dirs::home_dir()
-        .map(|h| h.join(".config").join("dcg").join("allowlist.toml"))
-        .filter(|p| p.exists())
-        .or_else(|| dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml")));
+    let user = Some(user_allowlist_path());
 
-    // System allowlist is optional; keep the fixed path but treat missing as empty.
-    // Allow tests to override via env for hermetic E2E (no reliance on real /etc).
-    let system = std::env::var("DCG_ALLOWLIST_SYSTEM_PATH").map_or_else(
-        |_| Some(crate::config::system_config_dir().join("allowlist.toml")),
-        |path| {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(trimmed))
-            }
-        },
-    );
+    let system_override = std::env::var("DCG_ALLOWLIST_SYSTEM_PATH").ok();
+    let (system, system_source) = system_allowlist_location(system_override.as_deref());
 
-    LayeredAllowlist::load_from_paths(project, user, system)
+    LayeredAllowlist::load_from_paths_with_system_source(project, user, system, system_source)
+}
+
+fn system_allowlist_location(
+    override_path: Option<&str>,
+) -> (Option<PathBuf>, crate::config::ConfigSource) {
+    // The default platform system path is privileged and must satisfy the
+    // strict System source policy. An environment override is instead an
+    // explicit user trust decision for that selected file; it still loads as
+    // the System allowlist layer so labels and precedence remain unchanged.
+    let Some(path) = override_path else {
+        return (
+            Some(crate::config::system_config_dir().join("allowlist.toml")),
+            crate::config::ConfigSource::System,
+        );
+    };
+
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        (None, crate::config::ConfigSource::Untrusted)
+    } else {
+        (
+            Some(PathBuf::from(trimmed)),
+            crate::config::ConfigSource::Untrusted,
+        )
+    }
+}
+
+/// Resolve the user allowlist path with the same precedence used by CLI
+/// mutations: explicit XDG location, existing `~/.config/dcg`, then the
+/// platform-native config directory.
+pub(crate) fn user_allowlist_path() -> PathBuf {
+    if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME")
+        && let Some(xdg_home) = crate::config::resolve_config_path_value(&xdg_home, None)
+    {
+        return xdg_home.join("dcg").join("allowlist.toml");
+    }
+
+    if let Some(home) = dirs::home_dir() {
+        let xdg_path = home.join(".config").join("dcg").join("allowlist.toml");
+        if xdg_path.exists() {
+            return xdg_path;
+        }
+    }
+
+    dirs::config_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"))
+        .join("dcg")
+        .join("allowlist.toml")
 }
 
 /// Resolve the project allowlist that governs `start`.
 ///
 /// Git repositories are rooted at their repository root. Outside Git, the
 /// nearest ancestor that already contains `.dcg/allowlist.toml` governs the
-/// directory tree; if no such file exists, explicit `--project` writes begin a
-/// new project scope at `start`.
+/// directory tree. The CLI separately enforces the explicit project-policy
+/// trust requirement before any project-layer mutation.
 pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
     if let Some(root) =
         crate::config::find_repo_root(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
@@ -1514,18 +1565,27 @@ pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
     start.join(".dcg").join("allowlist.toml")
 }
 
-fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
-    if !path.exists() {
-        return AllowlistFile::default();
-    }
-
-    // System layer is privileged: refuse symlinks to user-writable targets.
-    // Other layers only enforce the size cap (still want bounded reads).
+pub(crate) fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
+    // System-layer callers use the privileged source policy by default. The
+    // default loader bypasses this wrapper only for an explicitly selected
+    // `DCG_ALLOWLIST_SYSTEM_PATH`, whose path selection is the trust decision.
     let source = if layer == AllowlistLayer::System {
         crate::config::ConfigSource::System
     } else {
         crate::config::ConfigSource::Untrusted
     };
+
+    load_allowlist_file_with_source(layer, path, source)
+}
+
+fn load_allowlist_file_with_source(
+    layer: AllowlistLayer,
+    path: &Path,
+    source: crate::config::ConfigSource,
+) -> AllowlistFile {
+    if !path.exists() {
+        return AllowlistFile::default();
+    }
 
     let Some(content) = crate::config::read_config_file_bounded(path, source) else {
         return AllowlistFile {
@@ -1534,7 +1594,7 @@ fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
                 layer,
                 path: path.to_path_buf(),
                 entry_index: None,
-                message: "failed to read allowlist file (missing, too large, or unsafe symlink)"
+                message: "failed to read allowlist file (missing, too large, or rejected by source policy)"
                     .to_string(),
             }],
         };
@@ -1825,6 +1885,65 @@ mod tests {
             project_allowlist_path(&nested),
             tmp.path().join(".dcg").join("allowlist.toml")
         );
+    }
+
+    #[test]
+    fn explicit_system_path_uses_user_trust_without_changing_layer_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [[allow]]
+                rule = "core.git:reset-hard"
+                reason = "explicit system-path override"
+            "#,
+        )
+        .unwrap();
+
+        // Make the leaf itself ineligible for the privileged System source,
+        // independently of the ownership/mode of the test runner's temp root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        let (default_path, default_source) = system_allowlist_location(None);
+        assert_eq!(
+            default_path,
+            Some(crate::config::system_config_dir().join("allowlist.toml"))
+        );
+        assert_eq!(default_source, crate::config::ConfigSource::System);
+
+        let strict = LayeredAllowlist::load_from_paths(None, None, Some(path.clone()));
+        assert_eq!(strict.layers.len(), 1);
+        assert_eq!(strict.layers[0].layer, AllowlistLayer::System);
+        assert!(strict.layers[0].file.entries.is_empty());
+        assert_eq!(strict.layers[0].file.errors.len(), 1);
+
+        let (explicit_path, explicit_source) =
+            system_allowlist_location(Some(path.to_str().expect("UTF-8 temp path")));
+        assert_eq!(explicit_path, Some(path.clone()));
+        assert_eq!(explicit_source, crate::config::ConfigSource::Untrusted);
+
+        let explicit = LayeredAllowlist::load_from_paths_with_system_source(
+            None,
+            None,
+            explicit_path,
+            explicit_source,
+        );
+        assert_eq!(explicit.layers.len(), 1);
+        assert_eq!(explicit.layers[0].layer, AllowlistLayer::System);
+        assert_eq!(explicit.layers[0].path, path);
+        assert!(explicit.layers[0].file.errors.is_empty());
+        assert_eq!(explicit.layers[0].file.entries.len(), 1);
+
+        let hit = explicit
+            .match_rule("core.git", "reset-hard")
+            .expect("explicit override entry should load");
+        assert_eq!(hit.layer, AllowlistLayer::System);
     }
 
     // ----- command_prefix tail-injection regression tests -----

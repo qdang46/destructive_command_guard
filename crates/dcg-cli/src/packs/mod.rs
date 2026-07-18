@@ -538,6 +538,11 @@ impl Pack {
         if self.keywords.is_empty() {
             return true; // No keywords = always check patterns
         }
+        if self.id == "core.git"
+            && crate::packs::core::git::contains_git_ascii_case_insensitive(cmd)
+        {
+            return true;
+        }
 
         // Use Aho-Corasick automaton if available (O(n) regardless of keyword count).
         if let Some(ref ac) = self.keyword_matcher {
@@ -596,7 +601,8 @@ impl Pack {
     ///
     /// Like [`matches_safe`], but polls the deadline between individual
     /// backtracking-engine pattern evaluations. Returns `None` (no match) if
-    /// the deadline expires mid-scan, letting the caller fail-open.
+    /// the deadline expires mid-scan, letting the caller return its bounded
+    /// outcome (hook evaluation treats this as indeterminate).
     #[must_use]
     pub fn matches_safe_with_deadline(
         &self,
@@ -635,6 +641,24 @@ impl Pack {
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
     pub fn matches_destructive(&self, cmd: &str) -> Option<DestructiveMatch> {
+        if self.id == "core.git" {
+            match crate::packs::core::git::branch_command_decision(cmd) {
+                crate::packs::core::git::BranchCommandDecision::Destructive => {
+                    return self.destructive_match_by_name("branch-force-delete");
+                }
+                crate::packs::core::git::BranchCommandDecision::NonDestructive => return None,
+                crate::packs::core::git::BranchCommandDecision::NotBranch
+                | crate::packs::core::git::BranchCommandDecision::Unparsed => {}
+            }
+            let segments = crate::packs::split_command_segments(cmd);
+            if segments
+                .last()
+                .is_some_and(|segment| *segment != cmd.trim())
+            {
+                return self
+                    .matches_destructive_named_by(cmd, |name| name != Some("branch-force-delete"));
+            }
+        }
         self.destructive_patterns
             .iter()
             .find(|p| p.regex.is_match(cmd))
@@ -663,6 +687,18 @@ impl Pack {
             })
     }
 
+    fn destructive_match_by_name(&self, name: &str) -> Option<DestructiveMatch> {
+        self.destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some(name))
+            .map(|pattern| DestructiveMatch {
+                reason: pattern.reason,
+                name: pattern.name,
+                severity: pattern.severity,
+                explanation: pattern.explanation,
+            })
+    }
+
     /// Check a command against this pack.
     /// Returns Some(DestructiveMatch) if blocked, None if allowed.
     ///
@@ -678,6 +714,9 @@ impl Pack {
                 if let Some(m) = self.check_single(seg) {
                     return Some(m);
                 }
+            }
+            if self.id == "core.git" {
+                return None;
             }
             // Also check the whole command so patterns that legitimately
             // span segments still match.
@@ -711,6 +750,23 @@ impl Pack {
                     });
                 }
                 crate::packs::core::filesystem::RmParseDecision::NoMatch => {}
+            }
+        }
+
+        if self.id == "cdn.cloudflare_workers" {
+            match crate::packs::cdn::cloudflare_workers::wrangler_semantic_decision(cmd) {
+                crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Safe => {
+                    return None;
+                }
+                crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Destructive(
+                    name,
+                ) => return self.destructive_match_by_name(name),
+                crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::Unverified => {
+                    return self.destructive_match_by_name(
+                        crate::packs::cdn::cloudflare_workers::WRANGLER_UNVERIFIED_RULE,
+                    );
+                }
+                crate::packs::cdn::cloudflare_workers::WranglerSemanticDecision::NoMatch => {}
             }
         }
 
@@ -879,6 +935,11 @@ impl PackEntry {
         if self.keywords.is_empty() {
             return true; // No keywords = always check patterns
         }
+        if self.id == "core.git"
+            && crate::packs::core::git::contains_git_ascii_case_insensitive(cmd)
+        {
+            return true;
+        }
 
         let bytes = cmd.as_bytes();
         if self
@@ -928,6 +989,7 @@ pub struct EnabledKeywordIndex {
     pack_count: usize,
     full_mask: u128,
     always_check_mask: u128,
+    core_git_mask: u128,
     keyword_matcher: Option<aho_corasick::AhoCorasick>,
     keyword_pack_masks: Vec<u128>,
     whitespace_keywords: Vec<&'static str>,
@@ -955,6 +1017,11 @@ impl EnabledKeywordIndex {
         if self.always_check_mask != 0 {
             return true;
         }
+        if self.core_git_mask != 0
+            && crate::packs::core::git::contains_git_ascii_case_insensitive(cmd)
+        {
+            return true;
+        }
 
         if let Some(ac) = &self.keyword_matcher {
             if ac.is_match(cmd) {
@@ -977,6 +1044,11 @@ impl EnabledKeywordIndex {
     #[must_use]
     pub fn candidate_pack_mask(&self, cmd: &str) -> u128 {
         let mut mask = self.always_check_mask;
+        if self.core_git_mask != 0
+            && crate::packs::core::git::contains_git_ascii_case_insensitive(cmd)
+        {
+            mask |= self.core_git_mask;
+        }
 
         let Some(ac) = &self.keyword_matcher else {
             return mask;
@@ -1013,7 +1085,7 @@ impl EnabledKeywordIndex {
 
 /// Static pack entries - metadata is available without instantiating packs.
 /// Packs are built lazily on first access.
-static PACK_ENTRIES: [PackEntry; 91] = [
+static PACK_ENTRIES: [PackEntry; 92] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
@@ -1451,6 +1523,24 @@ static PACK_ENTRIES: [PackEntry; 91] = [
         "database.sqlite",
         &["sqlite3", "DROP", "DELETE", "TRUNCATE"],
         database::sqlite::create_pack,
+    ),
+    PackEntry::new(
+        "database.snowflake",
+        &[
+            "snow",
+            "Snow",
+            "SNOW",
+            "DROP",
+            "TRUNCATE",
+            "DELETE",
+            "UPDATE",
+            "ALTER",
+            "GRANT",
+            "REVOKE",
+            "REMOVE",
+            "OVERWRITE",
+        ],
+        database::snowflake::create_pack,
     ),
     PackEntry::new(
         "database.supabase",
@@ -2025,6 +2115,7 @@ impl PackRegistry {
         };
 
         let mut always_check_mask: u128 = 0;
+        let mut core_git_mask: u128 = 0;
         let mut keyword_to_index: HashMap<&'static str, usize> = HashMap::new();
         let mut patterns: Vec<&'static str> = Vec::new();
         let mut keyword_pack_masks: Vec<u128> = Vec::new();
@@ -2038,6 +2129,9 @@ impl PackRegistry {
             };
 
             let bit = 1u128 << pack_idx;
+            if pack_id == "core.git" {
+                core_git_mask |= bit;
+            }
 
             if entry.keywords.is_empty() {
                 always_check_mask |= bit;
@@ -2085,6 +2179,7 @@ impl PackRegistry {
             pack_count,
             full_mask,
             always_check_mask,
+            core_git_mask,
             keyword_matcher,
             keyword_pack_masks,
             whitespace_keywords,
@@ -2640,6 +2735,45 @@ pub fn split_command_segments(cmd: &str) -> Vec<&str> {
     segments
 }
 
+/// Split command segments using the syntax of a caller-proven shell dialect.
+///
+/// POSIX and unknown callers retain the established recursive splitter exactly.
+/// PowerShell and Cmd use the raw dialect tokenizer so escaped separators and
+/// PowerShell's `--%` stop-parsing state cannot be misclassified as command
+/// boundaries.
+#[must_use]
+pub(crate) fn split_command_segments_in_dialect(
+    cmd: &str,
+    dialect: crate::normalize::ShellDialect,
+) -> Vec<&str> {
+    if matches!(
+        dialect,
+        crate::normalize::ShellDialect::Posix | crate::normalize::ShellDialect::Unknown
+    ) {
+        return split_command_segments(cmd);
+    }
+
+    let tokens = crate::normalize::tokenize_for_shell_dialect(cmd, dialect);
+    let mut segments = Vec::new();
+    let mut segment_start = 0usize;
+    for token in tokens
+        .iter()
+        .filter(|token| token.kind == crate::normalize::NormalizeTokenKind::Separator)
+    {
+        push_trimmed_segment(cmd, segment_start, token.byte_range.start, &mut segments);
+        segment_start = token.byte_range.end;
+    }
+    push_trimmed_segment(cmd, segment_start, cmd.len(), &mut segments);
+
+    if segments.is_empty() {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed);
+        }
+    }
+    segments
+}
+
 const MAX_SEGMENT_RECURSION: usize = 64;
 
 fn collect_command_segments<'a>(
@@ -2979,6 +3113,9 @@ pub fn pack_aware_quick_reject_with_normalized<'a>(
     if enabled_keywords.is_empty() {
         return (false, normalize_command(cmd));
     }
+    if enabled_keywords.contains(&"git") && contains_ascii_case_insensitive_word(cmd, b"git") {
+        return (false, normalize_command(cmd));
+    }
 
     let bytes = cmd.as_bytes();
     let mut any_substring = enabled_keywords
@@ -3050,6 +3187,22 @@ pub fn pack_aware_quick_reject_with_normalized<'a>(
     }
 
     (true, normalized) // No keywords found in executable spans, safe to skip pack checking
+}
+
+#[inline]
+fn contains_ascii_case_insensitive_word(haystack: &str, needle: &[u8]) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .enumerate()
+        .any(|(start, window)| {
+            if !window.eq_ignore_ascii_case(needle) {
+                return false;
+            }
+            let end = start + needle.len();
+            (start == 0 || !is_word_byte(haystack.as_bytes()[start - 1]))
+                && (end == haystack.len() || !is_word_byte(haystack.as_bytes()[end]))
+        })
 }
 
 #[cfg(test)]
@@ -3293,6 +3446,51 @@ mod tests {
         assert_eq!(split_command_segments(r"echo a\; b"), vec![r"echo a\; b"]);
         assert_eq!(split_command_segments(r"echo a\| b"), vec![r"echo a\| b"]);
         assert_eq!(split_command_segments(r"echo a\& b"), vec![r"echo a\& b"]);
+    }
+
+    #[test]
+    fn split_command_segments_respects_windows_shell_dialects() {
+        use crate::normalize::ShellDialect;
+
+        assert_eq!(
+            split_command_segments_in_dialect(
+                "Write-Host x; g`it branch -`d feature",
+                ShellDialect::PowerShell,
+            ),
+            vec!["Write-Host x", "g`it branch -`d feature"]
+        );
+        assert_eq!(
+            split_command_segments_in_dialect(
+                "Write-Host x`; still-one-command",
+                ShellDialect::PowerShell,
+            ),
+            vec!["Write-Host x`; still-one-command"]
+        );
+        assert_eq!(
+            split_command_segments_in_dialect(
+                "git branch --% --format=x; --delete feature | Write-Host done",
+                ShellDialect::PowerShell,
+            ),
+            vec![
+                "git branch --% --format=x; --delete feature",
+                "Write-Host done"
+            ]
+        );
+        assert_eq!(
+            split_command_segments_in_dialect(
+                "echo x & g^it branch -^d feature",
+                ShellDialect::Cmd,
+            ),
+            vec!["echo x", "g^it branch -^d feature"]
+        );
+        assert_eq!(
+            split_command_segments_in_dialect("echo ^& g^it", ShellDialect::Cmd),
+            vec!["echo ^& g^it"]
+        );
+        assert_eq!(
+            split_command_segments_in_dialect("echo x; g^it", ShellDialect::Cmd),
+            vec!["echo x; g^it"]
+        );
     }
 
     #[test]
@@ -3682,6 +3880,44 @@ mod tests {
         assert!(index.has_any_keyword("git status"), "git is a keyword");
         assert!(index.has_any_keyword("rm -rf /tmp/foo"), "rm is a keyword");
         assert!(index.has_any_keyword("docker ps"), "docker is a keyword");
+    }
+
+    #[test]
+    fn core_git_branch_semantics_agree_across_pack_and_registry_apis() {
+        let pack = REGISTRY.get("core.git").expect("core.git pack");
+        let enabled = HashSet::from(["core.git".to_string()]);
+
+        for command in [
+            "git branch -d feature",
+            "git branch --del feature",
+            "git branch -M old existing",
+            "git branch --no-format -d feature",
+            "gIt.ExE branch --delete feature",
+        ] {
+            let pack_match = pack.check(command).expect("pack must deny");
+            let registry_match = REGISTRY.check_command(command, &enabled);
+            assert!(registry_match.blocked, "registry must deny {command:?}");
+            assert_eq!(pack_match.name, Some("branch-force-delete"));
+            assert_eq!(
+                registry_match.pattern_name.as_deref(),
+                Some("branch-force-delete")
+            );
+        }
+
+        for command in [
+            "git branch --format -d",
+            "git branch --merged -d feature",
+            "git branch -d --no-delete feature",
+            "git branch --delete=feature",
+            "git --exec-path branch -d feature",
+            "git branch --show-current && printf '%s' --delete",
+        ] {
+            assert!(pack.check(command).is_none(), "pack must allow {command:?}");
+            assert!(
+                !REGISTRY.check_command(command, &enabled).blocked,
+                "registry must allow {command:?}"
+            );
+        }
     }
 
     #[test]
@@ -4251,6 +4487,7 @@ mod tests {
             "restore-worktree",
             "restore-worktree-explicit",
             "reset-merge",
+            "branch-force-delete",
         ];
 
         for rule_name in high_or_above_rules {
@@ -4279,10 +4516,7 @@ mod tests {
     #[test]
     fn core_rules_have_appropriate_severity() {
         // Patterns that should be Medium (recoverable operations)
-        let medium_patterns = [
-            ("core.git", "branch-force-delete"), // Recoverable via reflog
-            ("core.git", "stash-drop"),          // Recoverable via fsck
-        ];
+        let medium_patterns = [("core.git", "stash-drop")]; // Recoverable via fsck
 
         for pack_id in ["core.git", "core.filesystem"] {
             let pack = REGISTRY.get(pack_id).expect("Pack should exist");

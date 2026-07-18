@@ -83,6 +83,10 @@ fn run_hook_mode_with_env(command: &str, env_vars: &[(&str, &str)]) -> (String, 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_hermetic_env(&mut cmd, home.path());
+    // These integration tests assert agent/profile semantics, not the
+    // production scheduler budget. Preserve deterministic results when the
+    // all-target matrix spawns many test binaries concurrently.
+    cmd.env("DCG_HOOK_TIMEOUT_MS", "5000");
 
     // Apply environment variables (overrides any defaults from apply_hermetic_env)
     for (key, value) in env_vars {
@@ -667,29 +671,57 @@ mod performance_tests {
 
     #[test]
     fn test_agent_detection_does_not_add_significant_latency() {
-        // Agent detection should be fast (< 50ms overhead)
-        let iterations = 5;
-        let mut total_time = std::time::Duration::ZERO;
-
-        for _ in 0..iterations {
+        // Measure agent detection against an otherwise identical hook process.
+        // Absolute process startup time is host-load dependent and does not
+        // isolate the feature this test owns.
+        let measure = |env_vars: &[(&str, &str)], label: &str| {
             let start = Instant::now();
-            let (stdout, _stderr, exit_code) =
-                run_hook_mode_with_env("git status", &[("CLAUDE_CODE", "1")]);
-            let duration = start.elapsed();
+            let (stdout, stderr, exit_code) = run_hook_mode_with_env("git status", env_vars);
+            let elapsed = start.elapsed();
+            assert_eq!(exit_code, 0, "{label} hook process must succeed");
+            assert!(
+                stdout.trim().is_empty(),
+                "{label} safe command must be allowed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
+            elapsed
+        };
+        let baseline_env = [("DCG_HOOK_TIMEOUT_MS", "5000")];
+        let detected_env = [("DCG_HOOK_TIMEOUT_MS", "5000"), ("CLAUDE_CODE", "1")];
 
-            assert_eq!(exit_code, 0);
-            assert!(stdout.trim().is_empty());
+        // Warm both process paths before measuring. Alternate their order to
+        // cancel scheduler/order bias, and use signed paired differences:
+        // saturating subtraction turns symmetric host jitter into a systematic
+        // positive "overhead" even when detection itself is effectively free.
+        let _ = measure(&baseline_env, "warm baseline");
+        let _ = measure(&detected_env, "warm detected");
 
-            total_time += duration;
+        let iterations = 9;
+        let mut overheads_ns = Vec::with_capacity(iterations);
+        for iteration in 0..iterations {
+            let (baseline, detected) = if iteration % 2 == 0 {
+                (
+                    measure(&baseline_env, "baseline"),
+                    measure(&detected_env, "agent-detected"),
+                )
+            } else {
+                let detected = measure(&detected_env, "agent-detected");
+                let baseline = measure(&baseline_env, "baseline");
+                (baseline, detected)
+            };
+            let baseline_ns =
+                i128::try_from(baseline.as_nanos()).expect("test duration fits in i128");
+            let detected_ns =
+                i128::try_from(detected.as_nanos()).expect("test duration fits in i128");
+            overheads_ns.push(detected_ns - baseline_ns);
         }
 
-        let avg_time = total_time / iterations as u32;
-
-        // Allow up to 100ms per call (generous for CI environments)
+        overheads_ns.sort_unstable();
+        let median_overhead_ns = overheads_ns[overheads_ns.len() / 2];
+        const MAX_MEDIAN_OVERHEAD_NS: i128 = 50_000_000;
         assert!(
-            avg_time.as_millis() < 100,
-            "Average hook evaluation time should be < 100ms, got: {:?}",
-            avg_time
+            median_overhead_ns < MAX_MEDIAN_OVERHEAD_NS,
+            "Median agent-detection overhead should be < 50ms, got {median_overhead_ns}ns; paired samples (ns): {:?}",
+            overheads_ns
         );
     }
 }

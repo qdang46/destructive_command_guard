@@ -93,6 +93,14 @@ fn run_dcg_hook_with_env(command: &str, extra_env: &[(&str, &std::ffi::OsStr)]) 
         .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        // These tests assert semantic allow/deny behavior, not the separately
+        // unit-tested 200 ms fail-closed deadline policy. A heavily loaded test
+        // host can deschedule the child after its deadline starts and turn the
+        // intended semantic result into an indeterminate blocking/ask response,
+        // so keep a generous E2E-only budget. `extra_env` is applied below and
+        // may still override this when a test intentionally exercises deadline
+        // behavior.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .env("DCG_PACKS", "core.git,core.filesystem")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
@@ -138,6 +146,11 @@ fn run_dcg_hook_raw(raw: &[u8], extra_env: &[(&str, &str)]) -> std::process::Out
         .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        // These raw-input tests assert parsing and allow/deny semantics. Keep
+        // scheduler pressure from turning an otherwise-safe command into an
+        // indeterminate deadline response; callers may still override this
+        // when explicitly testing timeout behavior.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .env("DCG_PACKS", "core.git,core.filesystem")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
@@ -249,6 +262,9 @@ fn run_dcg_hook_raw_cfg(
         .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        // Match the other semantic hook helpers: configuration tests should
+        // not accidentally become production-deadline stress tests.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .env("DCG_PACKS", "core.git,core.filesystem")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
@@ -452,7 +468,7 @@ mod explain_tests {
         let json: serde_json::Value =
             serde_json::from_str(&stdout).expect("explain --format json should produce valid JSON");
 
-        assert_eq!(json["schema_version"], 2, "should have schema_version");
+        assert_eq!(json["schema_version"], 3, "should have schema_version");
         assert!(json["command"].is_string(), "should have command field");
         assert!(json["decision"].is_string(), "should have decision field");
         assert!(
@@ -1595,8 +1611,10 @@ mod config_tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(combined.contains("DCG_CONFIG:"));
+        assert!(combined.contains(&missing.display().to_string()));
         assert!(
-            combined.contains("DCG_CONFIG points to a missing file"),
+            combined.contains("[missing; full]"),
             "expected doctor to surface missing DCG_CONFIG\noutput:\n{combined}"
         );
     }

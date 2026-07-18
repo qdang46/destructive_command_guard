@@ -26,6 +26,7 @@ use dcg_cli::cli::{self, Cli};
 use dcg_cli::config::Config;
 use dcg_cli::evaluator::{
     EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_at_path,
+    evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
 use dcg_cli::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
@@ -154,6 +155,58 @@ fn effective_agent_for_hook_protocol(
         hook::HookProtocol::Grok => Agent::Grok,
         hook::HookProtocol::Antigravity => Agent::Antigravity,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
+    }
+}
+
+const INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
+const INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
+
+fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
+    format!(
+        "DCG could not complete safety evaluation within {}ms (stage: {stage}); \
+         command was not verified. Review manually or increase hook_timeout_ms.",
+        budget.as_millis()
+    )
+}
+
+/// Publish one conservative protocol decision for every deadline exit path.
+///
+/// Deadline exhaustion is not an allow: Claude/Copilot can ask the operator,
+/// while protocols without an `ask` decision receive their documented block
+/// response. The protocol response is flushed before best-effort history is
+/// queued, and the history worker is detached before return: once the
+/// evaluation budget is exhausted, no audit sink may delay hook-process exit.
+/// History uses `Warn` as the closest existing non-Allow audit outcome and an
+/// internal synthetic rule identity so deadline events remain independently
+/// queryable without a schema migration.
+fn handle_indeterminate_evaluation(
+    protocol: hook::HookProtocol,
+    history_writer: Option<&mut HistoryWriter>,
+    history_agent_type: &str,
+    command: &str,
+    working_dir: &str,
+    stage: &str,
+    deadline: &Deadline,
+) {
+    let elapsed = deadline.elapsed();
+    let budget = deadline.max_duration();
+
+    let reason = format_indeterminate_reason(stage, budget);
+    hook::output_indeterminate_for_protocol(protocol, &reason);
+
+    if let Some(writer) = history_writer {
+        let entry = build_history_entry(
+            history_agent_type,
+            command,
+            working_dir,
+            HistoryOutcome::Warn,
+            elapsed,
+            Some(INDETERMINATE_HISTORY_PACK),
+            Some(INDETERMINATE_HISTORY_PATTERN),
+            None,
+        );
+        writer.log(entry);
+        writer.detach_worker_on_drop();
     }
 }
 
@@ -594,8 +647,8 @@ fn main() {
     };
 
     // Start evaluation deadline after input size checks (includes evaluation).
-    // Enforce a minimum timeout to prevent bypass via `hook_timeout_ms = 0`
-    // which would cause deadline_exceeded() to immediately allow all commands.
+    // Enforce a minimum timeout so a zero-valued override cannot force every
+    // hook request immediately into the conservative indeterminate path.
     let deadline = Deadline::new(
         config
             .general
@@ -605,20 +658,27 @@ fn main() {
             }),
     );
 
-    let Some((command, hook_protocol)) = hook::extract_command_with_protocol(&hook_input) else {
+    let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
         return;
     };
+    let command = extracted_command.command;
+    let hook_protocol = extracted_command.protocol;
+    let shell_dialect = extracted_command.dialect;
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, &detected_agent);
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, &detected_agent);
 
-    // Check command size limit (fail-open: allow and warn)
+    // Refuse oversized commands conservatively. The limit bounds every later
+    // parser and scanner, so truncating or treating the command as clean would
+    // let an attacker hide a destructive tail beyond the inspected prefix.
     let max_command_bytes = config.general.max_command_bytes();
     if command.len() > max_command_bytes {
-        eprintln!(
-            "[dcg] Warning: command ({} bytes) exceeds limit ({} bytes); allowing command (fail-open)",
+        let reason = format!(
+            "Command is {} bytes and exceeds limit {} bytes; DCG did not evaluate it. \
+             Reduce the command size or raise general.max_command_bytes after review.",
             command.len(),
             max_command_bytes
         );
+        hook::output_indeterminate_for_protocol(hook_protocol, &reason);
         return;
     }
 
@@ -666,7 +726,7 @@ fn main() {
         |path| path.to_string_lossy().to_string(),
     );
 
-    let history_writer = if config.history.enabled {
+    let mut history_writer = if config.history.enabled {
         Some(HistoryWriter::new(
             history_db_path(&config.history),
             &config.history,
@@ -682,21 +742,21 @@ fn main() {
     }
 
     if deadline.is_exceeded() {
-        if let Some(log_file) = config.general.log_file.as_deref() {
-            let _ = hook::log_budget_skip(
-                log_file,
-                &command,
-                "pre_evaluation",
-                deadline.elapsed(),
-                HOOK_EVALUATION_BUDGET,
-            );
-        }
+        handle_indeterminate_evaluation(
+            hook_protocol,
+            history_writer.as_mut(),
+            history_agent_type,
+            &command,
+            &working_dir,
+            "pre_evaluation",
+            &deadline,
+        );
         return;
     }
 
     // Use the shared evaluator for hook mode parity with `dcg test`.
     let eval_start = Instant::now();
-    let result = evaluate_command_with_pack_order_deadline_at_path(
+    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
         &command,
         &enabled_keywords,
         &ordered_packs,
@@ -707,6 +767,7 @@ fn main() {
         None,                // allow_once_audit
         cwd_path.as_deref(), // project_path: scopes path-aware allowlist entries (#186)
         Some(&deadline),
+        shell_dialect,
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -714,29 +775,16 @@ fn main() {
 
     let eval_duration = eval_start.elapsed();
 
-    if result.skipped_due_to_budget {
-        if let Some(writer) = history_writer.as_ref() {
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                None,
-                None,
-                None,
-            );
-            writer.log(entry);
-        }
-        if let Some(log_file) = config.general.log_file.as_deref() {
-            let _ = hook::log_budget_skip(
-                log_file,
-                &command,
-                "evaluation",
-                deadline.elapsed(),
-                HOOK_EVALUATION_BUDGET,
-            );
-        }
+    if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
+        handle_indeterminate_evaluation(
+            hook_protocol,
+            history_writer.as_mut(),
+            history_agent_type,
+            &command,
+            &working_dir,
+            "evaluation",
+            &deadline,
+        );
         return;
     }
 
@@ -1224,6 +1272,18 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indeterminate_reason_uses_configured_budget_and_stage() {
+        let reason = format_indeterminate_reason("pre_evaluation", Duration::from_millis(1_500));
+        assert!(reason.contains("within 1500ms"), "reason: {reason}");
+        assert!(reason.contains("stage: pre_evaluation"), "reason: {reason}");
+        assert!(
+            reason.contains("command was not verified"),
+            "reason: {reason}"
+        );
+        assert!(reason.contains("hook_timeout_ms"), "reason: {reason}");
+    }
 
     mod top_level_dispatch_tests {
         use super::*;

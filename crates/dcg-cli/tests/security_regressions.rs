@@ -9,12 +9,12 @@ use dcg_cli::packs::REGISTRY;
 /// to exceed `max_body_bytes`. The evaluator would skip extraction (fail-open)
 /// and allow the destructive command.
 ///
-/// Fix: `check_fallback_patterns` performs a robust substring/regex check
+/// Fix: `check_fallback_patterns` performs a bounded conservative regex check
 /// on the raw command when extraction is skipped due to size limits.
 #[test]
 fn test_heredoc_size_bypass_prevention() {
     let mut config = Config::default();
-    // Force fallback check by setting a tiny limit
+    // Force the bounded fallback by setting a tiny limit.
     config.heredoc.max_body_bytes = Some(10);
 
     let compiled_overrides = config.overrides.compile();
@@ -39,15 +39,15 @@ fn test_heredoc_size_bypass_prevention() {
         &allowlists,
     );
 
-    // Should be DENIED by fallback check
+    // Should be denied by the bounded fallback.
     assert!(
         result.is_denied(),
         "Oversized destructive command should be denied"
     );
     if let Some(reason) = result.reason() {
         assert!(
-            reason.contains("fallback check"),
-            "Denial reason should mention fallback check"
+            reason.contains("bounded fallback"),
+            "denial reason should identify the bounded fallback, got: {reason}"
         );
     }
 

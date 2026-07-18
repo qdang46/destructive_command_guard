@@ -87,8 +87,8 @@ const DANGEROUS_COMMANDS: &[(&str, &str)] = &[
     ),
     ("git push --force-with-lease", "git push with force options"),
     (
-        "git branch -D feature",
-        "git branch -D force deletes a branch",
+        "git branch -d feature",
+        "git branch deletion or forced ref updates require explicit user approval",
     ),
     ("git stash drop", "git stash drop permanently removes"),
     ("git stash clear", "git stash clear removes all stashes"),

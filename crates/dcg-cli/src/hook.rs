@@ -6,6 +6,7 @@
 
 use crate::evaluator::MatchSpan;
 use crate::highlight::HighlightSpan;
+use crate::normalize::ShellDialect;
 use crate::output::auto_theme;
 use crate::output::denial::DenialBox;
 use crate::output::theme::Severity as ThemeSeverity;
@@ -378,6 +379,23 @@ pub enum HookProtocol {
     Antigravity,
 }
 
+/// A shell command extracted from a hook request together with its execution
+/// context.
+///
+/// Protocol controls how dcg answers the hook client. Shell dialect controls
+/// how the command text is tokenized and interpreted. They are deliberately
+/// independent: for example, Copilot can invoke a tool named `powershell`,
+/// while Codex can invoke a tool named `bash`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractedHookCommand {
+    /// Raw command exactly as supplied by the hook client.
+    pub command: String,
+    /// Response protocol expected by the hook client.
+    pub protocol: HookProtocol,
+    /// Shell syntax proven by the hook tool name, or `Unknown`.
+    pub dialect: ShellDialect,
+}
+
 /// Allow-once metadata for denial output.
 #[derive(Debug, Clone)]
 pub struct AllowOnceInfo {
@@ -575,7 +593,7 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // payload, letting the destructive command through.
     let is_claude_compatible_shell_tool = matches!(
         tool_name.as_str(),
-        "bash" | "launch-process" | "powershell" | "pwsh"
+        "bash" | "launch-process" | "powershell" | "pwsh" | "cmd" | "cmd.exe"
     ) || is_vscode_terminal_tool(&tool_name);
     let has_codex_turn_id = input
         .turn_id
@@ -691,6 +709,8 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             | "launch-process"
             | "powershell"
             | "pwsh"
+            | "cmd"
+            | "cmd.exe"
             | "run_shell_command"
             | "run-shell-command"
             // Hermes Agent shell tool. Distinct from Cursor's "terminal"
@@ -705,6 +725,26 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             | "run_terminal_cmd"
             | "run_command"
         )
+}
+
+/// Infer the command parser's dialect from an explicit, trustworthy shell
+/// tool name.
+///
+/// Generic terminal adapters do not identify the shell that ultimately
+/// executes their command, so they intentionally remain [`ShellDialect::Unknown`].
+/// A protocol classification must never be used as a dialect proxy.
+#[must_use]
+pub(crate) fn shell_dialect_for_tool_name(tool_name: Option<&str>) -> ShellDialect {
+    let Some(tool_name) = tool_name else {
+        return ShellDialect::Unknown;
+    };
+
+    match tool_name.to_ascii_lowercase().as_str() {
+        "bash" => ShellDialect::Posix,
+        "powershell" | "pwsh" => ShellDialect::PowerShell,
+        "cmd" | "cmd.exe" => ShellDialect::Cmd,
+        _ => ShellDialect::Unknown,
+    }
 }
 
 pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
@@ -776,10 +816,12 @@ fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<Strin
     }
 }
 
-/// Extract command and protocol from hook input.
+/// Extract a command and its independent protocol/dialect context from hook
+/// input.
 #[must_use]
-pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookProtocol)> {
+pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCommand> {
     let protocol = detect_protocol(input);
+    let dialect = shell_dialect_for_tool_name(input.tool_name.as_deref());
 
     // Only process shell-command invocations for supported clients. Copilot
     // can omit toolName and put the shell command directly in toolArgs, so
@@ -791,19 +833,31 @@ pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookP
     // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
     if let Some(tool_call) = input.tool_call.as_ref() {
         if let Some(command) = extract_command_from_tool_call(tool_call) {
-            return Some((command, protocol));
+            return Some(ExtractedHookCommand {
+                command,
+                protocol,
+                dialect,
+            });
         }
     }
 
     if let Some(tool_input) = input.tool_input.as_ref() {
         if let Some(command) = extract_command_from_tool_input(tool_input) {
-            return Some((command, protocol));
+            return Some(ExtractedHookCommand {
+                command,
+                protocol,
+                dialect,
+            });
         }
     }
 
     if let Some(tool_args) = input.tool_args.as_ref() {
         if let Some(command) = extract_command_from_tool_args(tool_args) {
-            return Some((command, protocol));
+            return Some(ExtractedHookCommand {
+                command,
+                protocol,
+                dialect,
+            });
         }
     }
 
@@ -819,6 +873,15 @@ pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookP
     }
 
     None
+}
+
+/// Extract command and protocol from hook input.
+///
+/// This compatibility wrapper preserves the original public API while the
+/// typed context path additionally carries shell dialect information.
+#[must_use]
+pub fn extract_command_with_protocol(input: &HookInput) -> Option<(String, HookProtocol)> {
+    extract_command_with_context(input).map(|extracted| (extracted.command, extracted.protocol))
 }
 
 /// Extract the command string from hook input.
@@ -1019,10 +1082,7 @@ pub(crate) fn print_colorful_warning_to(
             let _ = writeln!(writer, "  $ {cyan}{explain_cmd}{reset}");
 
             if let Some(ref rule) = rule_id {
-                let _ = writeln!(
-                    writer,
-                    "  $ {cyan}dcg allowlist add {rule} --project{reset}"
-                );
+                let _ = writeln!(writer, "  $ {cyan}dcg allowlist add {rule} --user{reset}");
             }
 
             let _ = writeln!(writer);
@@ -1418,6 +1478,157 @@ pub fn output_denial(
     );
 }
 
+/// Write a safety-evaluation indeterminate response to hook protocol streams.
+///
+/// An indeterminate result is neither an allow nor a rule-based denial: dcg
+/// did not finish proving the command safe before its evaluation deadline.
+/// Protocols with an explicit review decision receive `ask`; protocols that
+/// cannot represent `ask` receive their documented blocking decision. This
+/// deliberately never emits an explicit allow or an empty response.
+#[cold]
+#[inline(never)]
+pub fn write_indeterminate_to(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    protocol: HookProtocol,
+    reason: &str,
+) {
+    let _ = writeln!(stderr);
+    let _ = writeln!(stderr, "{} {reason}", "dcg INDETERMINATE:".yellow().bold());
+
+    match protocol {
+        HookProtocol::ClaudeCompatible => {
+            let output = HookOutput {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PreToolUse",
+                    permission_decision: "ask",
+                    permission_decision_reason: Cow::Borrowed(reason),
+                    allow_once_code: None,
+                    allow_once_full_hash: None,
+                    rule_id: None,
+                    pack_id: None,
+                    severity: None,
+                    confidence: None,
+                    remediation: None,
+                },
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Copilot => {
+            let output = CopilotHookOutput {
+                permission_decision: "ask",
+                permission_decision_reason: Cow::Borrowed(reason),
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Codex => {
+            // Codex's hook parser is strict and does not support `ask`.
+            // Emit only its accepted minimal deny envelope.
+            let output = HookOutput {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PreToolUse",
+                    permission_decision: "deny",
+                    permission_decision_reason: Cow::Borrowed(reason),
+                    allow_once_code: None,
+                    allow_once_full_hash: None,
+                    rule_id: None,
+                    pack_id: None,
+                    severity: None,
+                    confidence: None,
+                    remediation: None,
+                },
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Gemini => {
+            let output = GeminiHookOutput {
+                decision: "deny",
+                reason: Cow::Borrowed(reason),
+                system_message: Some(Cow::Borrowed(reason)),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id: None,
+                pack_id: None,
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Hermes => {
+            let output = HermesHookOutput {
+                decision: "block",
+                reason: Cow::Borrowed(reason),
+                action: "block",
+                message: Cow::Borrowed(reason),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id: None,
+                pack_id: None,
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Grok => {
+            let output = GrokHookOutput {
+                decision: "deny",
+                reason: Cow::Borrowed(reason),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id: None,
+                pack_id: None,
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Antigravity => {
+            let output = GeminiHookOutput {
+                decision: "block",
+                reason: Cow::Borrowed(reason),
+                system_message: Some(Cow::Borrowed(reason)),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id: None,
+                pack_id: None,
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+    }
+
+    // A deadline response is useful only if the hook runner receives it before
+    // its own process timeout. Stdout is normally a pipe in hook mode and is
+    // therefore block-buffered, so do not rely on process teardown to publish
+    // the conservative decision. Flush both protocol and diagnostic streams
+    // before any caller performs optional audit I/O.
+    let _ = stdout.flush();
+    let _ = stderr.flush();
+}
+
+/// Emit a safety-evaluation indeterminate response on process stdout/stderr.
+#[cold]
+#[inline(never)]
+pub fn output_indeterminate_for_protocol(protocol: HookProtocol, reason: &str) {
+    let out = io::stdout();
+    let mut out_handle = out.lock();
+    let err = io::stderr();
+    let mut err_handle = err.lock();
+    write_indeterminate_to(&mut out_handle, &mut err_handle, protocol, reason);
+}
+
 /// Write a warning response to arbitrary stdout/stderr writers (test seam).
 #[cold]
 #[inline(never)]
@@ -1707,6 +1918,24 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[derive(Default)]
+    struct FlushProbe {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for FlushProbe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<String>,
@@ -1750,6 +1979,107 @@ mod tests {
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), Some("git status".to_string()));
+    }
+
+    #[test]
+    fn test_shell_dialect_inference_requires_explicit_shell_tool_name() {
+        for tool_name in ["bash", "Bash", "BASH"] {
+            assert_eq!(
+                shell_dialect_for_tool_name(Some(tool_name)),
+                ShellDialect::Posix
+            );
+        }
+        for tool_name in ["powershell", "PowerShell", "pwsh", "PWSH"] {
+            assert_eq!(
+                shell_dialect_for_tool_name(Some(tool_name)),
+                ShellDialect::PowerShell
+            );
+        }
+        for tool_name in ["cmd", "CMD", "cmd.exe", "CMD.EXE"] {
+            assert_eq!(
+                shell_dialect_for_tool_name(Some(tool_name)),
+                ShellDialect::Cmd
+            );
+        }
+
+        for tool_name in [
+            "launch-process",
+            "runTerminalCommand",
+            "run_in_terminal",
+            "runInTerminal",
+            "run_shell_command",
+            "run-shell-command",
+            "terminal",
+            "run_terminal_cmd",
+            "run_command",
+            "powershell.exe",
+            "shell",
+        ] {
+            assert_eq!(
+                shell_dialect_for_tool_name(Some(tool_name)),
+                ShellDialect::Unknown,
+                "generic or unsupported tool name {tool_name:?} must not guess a dialect"
+            );
+        }
+        assert_eq!(shell_dialect_for_tool_name(None), ShellDialect::Unknown);
+    }
+
+    #[test]
+    fn test_extracted_context_keeps_protocol_and_dialect_independent() {
+        let cases = [
+            (
+                r#"{"event":"pre-tool-use","toolName":"powershell","toolArgs":{"command":"git status"}}"#,
+                HookProtocol::Copilot,
+                ShellDialect::PowerShell,
+            ),
+            (
+                r#"{"tool_name":"bash","tool_input":{"command":"git status"},"turn_id":"turn-1"}"#,
+                HookProtocol::Codex,
+                ShellDialect::Posix,
+            ),
+            (
+                r#"{"tool_name":"runTerminalCommand","tool_input":{"command":"git status"}}"#,
+                HookProtocol::ClaudeCompatible,
+                ShellDialect::Unknown,
+            ),
+            (
+                r#"{"tool_name":"cmd.exe","tool_input":{"command":"git status"},"turn_id":"turn-2"}"#,
+                HookProtocol::Codex,
+                ShellDialect::Cmd,
+            ),
+        ];
+
+        for (json, expected_protocol, expected_dialect) in cases {
+            let input: HookInput = serde_json::from_str(json).unwrap();
+            let extracted = extract_command_with_context(&input).expect("shell command");
+            assert_eq!(extracted.command, "git status");
+            assert_eq!(extracted.protocol, expected_protocol);
+            assert_eq!(extracted.dialect, expected_dialect);
+        }
+    }
+
+    #[test]
+    fn test_legacy_extraction_wrappers_match_typed_context() {
+        let cases = [
+            r#"{"tool_name":"Bash","tool_input":{"command":"echo hello"}}"#,
+            r#"{"event":"pre-tool-use","toolName":"powershell","toolArgs":"{\"command\":\"echo hello\"}"}"#,
+            r#"{"tool_name":"run_terminal_cmd","hook_event_name":"pre_tool_use","tool_input":{"command":"echo hello"}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo hello"}}}"#,
+        ];
+
+        for json in cases {
+            let input: HookInput = serde_json::from_str(json).unwrap();
+            let extracted = extract_command_with_context(&input).expect("shell command");
+            let legacy_with_protocol = extract_command_with_protocol(&input);
+            let legacy_command = extract_command(&input);
+            assert_eq!(
+                legacy_with_protocol
+                    .as_ref()
+                    .map(|(command, protocol)| (command.as_str(), *protocol)),
+                Some((extracted.command.as_str(), extracted.protocol))
+            );
+            assert_eq!(legacy_command.as_deref(), Some(extracted.command.as_str()));
+        }
     }
 
     #[test]
@@ -3052,6 +3382,69 @@ mod tests {
                 .unwrap()
                 .contains("BLOCKED by dcg")
         );
+    }
+
+    #[test]
+    fn test_write_indeterminate_never_allows_or_emits_empty_stdout() {
+        const REASON: &str = "DCG could not complete safety evaluation within 200ms \
+            (stage: evaluation); command was not verified. Review manually or increase \
+            hook_timeout_ms.";
+
+        let cases = [
+            (HookProtocol::ClaudeCompatible, "ask"),
+            (HookProtocol::Copilot, "ask"),
+            (HookProtocol::Codex, "deny"),
+            (HookProtocol::Gemini, "deny"),
+            (HookProtocol::Hermes, "block"),
+            (HookProtocol::Grok, "deny"),
+            (HookProtocol::Antigravity, "block"),
+        ];
+
+        for (protocol, expected_decision) in cases {
+            let mut stdout = FlushProbe::default();
+            let mut stderr = FlushProbe::default();
+            write_indeterminate_to(&mut stdout, &mut stderr, protocol, REASON);
+
+            assert!(
+                !stdout.bytes.is_empty(),
+                "{protocol:?} must not silently allow an indeterminate result"
+            );
+            assert!(
+                !stderr.bytes.is_empty(),
+                "{protocol:?} must surface an operator-visible diagnostic"
+            );
+            assert_eq!(stdout.flushes, 1, "{protocol:?} must flush its decision");
+            assert_eq!(stderr.flushes, 1, "{protocol:?} must flush diagnostics");
+
+            let json: serde_json::Value = serde_json::from_slice(&stdout.bytes)
+                .unwrap_or_else(|error| panic!("{protocol:?} output must be JSON: {error}"));
+            let (decision, reason) = match protocol {
+                HookProtocol::ClaudeCompatible | HookProtocol::Codex => {
+                    let specific = &json["hookSpecificOutput"];
+                    (
+                        specific["permissionDecision"].as_str(),
+                        specific["permissionDecisionReason"].as_str(),
+                    )
+                }
+                HookProtocol::Copilot => (
+                    json["permissionDecision"].as_str(),
+                    json["permissionDecisionReason"].as_str(),
+                ),
+                HookProtocol::Gemini
+                | HookProtocol::Hermes
+                | HookProtocol::Grok
+                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+            };
+
+            assert_eq!(decision, Some(expected_decision), "payload: {json}");
+            assert_eq!(reason, Some(REASON), "payload: {json}");
+            assert_ne!(decision, Some("allow"), "payload: {json}");
+
+            if protocol == HookProtocol::Hermes {
+                assert_eq!(json["action"], "block");
+                assert_eq!(json["message"], REASON);
+            }
+        }
     }
 
     #[test]

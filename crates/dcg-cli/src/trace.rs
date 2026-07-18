@@ -47,9 +47,11 @@ use serde::Serialize;
 use std::time::Instant;
 
 /// Current JSON schema version for explain output.
+///
 /// JSON schema version for `dcg explain --format json`.
 /// v2 adds `matched_span`, `matched_text_preview`, and `explanation` in `match`.
-pub const EXPLAIN_JSON_SCHEMA_VERSION: u32 = 2;
+/// v3 adds the conservative `indeterminate` decision.
+pub const EXPLAIN_JSON_SCHEMA_VERSION: u32 = 3;
 
 /// A complete trace of a command evaluation.
 ///
@@ -62,7 +64,7 @@ pub struct ExplainTrace {
     pub normalized_command: Option<String>,
     /// The sanitized command (after masking safe string arguments).
     pub sanitized_command: Option<String>,
-    /// The final decision (Allow or Deny).
+    /// The final decision (Allow, Deny, or Indeterminate).
     pub decision: EvaluationDecision,
     /// Whether evaluation was skipped due to time budget exhaustion.
     pub skipped_due_to_budget: bool,
@@ -387,6 +389,7 @@ impl ExplainTrace {
         let decision_str = match self.decision {
             EvaluationDecision::Allow => "ALLOW",
             EvaluationDecision::Deny => "DENY",
+            EvaluationDecision::Indeterminate => "INDETERMINATE",
         };
 
         let duration_str = format_duration(self.total_duration_us);
@@ -446,8 +449,16 @@ impl ExplainTrace {
         let decision_str = match self.decision {
             EvaluationDecision::Allow => format!("{green}{bold}ALLOW{reset}"),
             EvaluationDecision::Deny => format!("{red}{bold}DENY{reset}"),
+            EvaluationDecision::Indeterminate => {
+                format!("{yellow}{bold}INDETERMINATE{reset}")
+            }
         };
         out.push_str(&format!("{bold}Decision:{reset} {decision_str}\n"));
+        if self.decision == EvaluationDecision::Indeterminate {
+            out.push_str(&format!(
+                "{yellow}{bold}Action:{reset}   Execution is not allowed without a safety decision.\n"
+            ));
+        }
         out.push_str(&format!(
             "{bold}Latency:{reset}  {}\n",
             format_duration(self.total_duration_us)
@@ -685,6 +696,7 @@ impl ExplainTrace {
             decision: match self.decision {
                 EvaluationDecision::Allow => "allow".to_string(),
                 EvaluationDecision::Deny => "deny".to_string(),
+                EvaluationDecision::Indeterminate => "indeterminate".to_string(),
             },
             skipped_due_to_budget: self.skipped_due_to_budget.then_some(true),
             total_duration_us: self.total_duration_us,
@@ -718,7 +730,7 @@ pub struct ExplainJsonOutput {
     /// Sanitized command (if different from original).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sanitized_command: Option<String>,
-    /// Decision: "allow" or "deny".
+    /// Decision: "allow", "deny", or "indeterminate".
     pub decision: String,
     /// Whether evaluation was skipped due to time budget exhaustion.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -966,6 +978,7 @@ impl TraceDetails {
                 decision: match decision {
                     EvaluationDecision::Allow => "allow".to_string(),
                     EvaluationDecision::Deny => "deny".to_string(),
+                    EvaluationDecision::Indeterminate => "indeterminate".to_string(),
                 },
                 allowlisted: *allowlisted,
             },
@@ -1166,8 +1179,9 @@ fn format_step_details_summary(details: &TraceDetails) -> String {
             let dec = match decision {
                 EvaluationDecision::Allow => "ALLOW",
                 EvaluationDecision::Deny => "DENY",
+                EvaluationDecision::Indeterminate => "INDETERMINATE",
             };
-            if *allowlisted {
+            if *allowlisted && *decision == EvaluationDecision::Allow {
                 format!("{dec} (allowlisted)")
             } else {
                 dec.to_string()
@@ -1526,6 +1540,46 @@ mod tests {
 
         let compact = trace.format_compact(None);
         assert_eq!(compact, "ALLOW (94us) git status");
+    }
+
+    #[test]
+    fn format_indeterminate_is_explicit_and_never_looks_allowed() {
+        let trace = ExplainTrace {
+            command: "complex command".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Indeterminate,
+            skipped_due_to_budget: true,
+            total_duration_us: 200_000,
+            steps: vec![TraceStep {
+                name: "policy_decision",
+                duration_us: 0,
+                details: TraceDetails::PolicyDecision {
+                    decision: EvaluationDecision::Indeterminate,
+                    allowlisted: false,
+                },
+            }],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        assert_eq!(
+            trace.format_compact(None),
+            "INDETERMINATE (200ms) complex command"
+        );
+
+        let pretty = trace.format_pretty(false);
+        assert!(pretty.contains("Decision: INDETERMINATE"));
+        assert!(pretty.contains("Execution is not allowed"));
+        assert!(!pretty.contains("Decision: ALLOW"));
+
+        let json = trace.format_json();
+        assert!(json.contains("\"schema_version\": 3"));
+        assert!(json.contains("\"decision\": \"indeterminate\""));
+        assert!(json.contains("\"skipped_due_to_budget\": true"));
+        assert!(!json.contains("\"decision\": \"allow\""));
+        assert!(json.contains("\"decision\": \"indeterminate\""));
     }
 
     #[test]
@@ -2018,7 +2072,7 @@ mod tests {
         };
 
         let json = trace.format_json();
-        assert!(json.contains("\"schema_version\": 2"));
+        assert!(json.contains("\"schema_version\": 3"));
         assert!(json.contains("\"decision\": \"allow\""));
         assert!(json.contains("\"command\": \"git status\""));
         assert!(json.contains("\"total_duration_us\": 94"));
@@ -2030,7 +2084,7 @@ mod tests {
             command: "git status".to_string(),
             normalized_command: None,
             sanitized_command: None,
-            decision: EvaluationDecision::Allow,
+            decision: EvaluationDecision::Indeterminate,
             skipped_due_to_budget: true,
             total_duration_us: 10,
             steps: vec![],
@@ -2041,6 +2095,7 @@ mod tests {
 
         let json = trace.format_json();
         assert!(json.contains("\"skipped_due_to_budget\": true"));
+        assert!(json.contains("\"decision\": \"indeterminate\""));
     }
 
     #[test]
@@ -2263,7 +2318,7 @@ mod tests {
 
     #[test]
     fn json_schema_version_is_stable() {
-        assert_eq!(EXPLAIN_JSON_SCHEMA_VERSION, 2);
+        assert_eq!(EXPLAIN_JSON_SCHEMA_VERSION, 3);
     }
 
     #[test]
@@ -2283,7 +2338,7 @@ mod tests {
 
         let output = trace.to_json_output();
 
-        assert_eq!(output.schema_version, 2);
+        assert_eq!(output.schema_version, 3);
         assert_eq!(output.command, "git status");
         assert_eq!(output.decision, "allow");
         assert_eq!(output.total_duration_us, 100);
@@ -2634,6 +2689,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         let version = parsed["schema_version"].as_u64();
-        assert_eq!(version, Some(2), "Schema version should be 2");
+        assert_eq!(
+            version,
+            Some(u64::from(EXPLAIN_JSON_SCHEMA_VERSION)),
+            "serialized schema version must match the public constant"
+        );
     }
 }

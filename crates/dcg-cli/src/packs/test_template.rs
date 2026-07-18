@@ -255,7 +255,7 @@ mod pack_test_template {
         assert_allows(&pack, "git push"); // Without --force
         assert_allows(&pack, "git pull");
         assert_allows(&pack, "git fetch");
-        assert_allows(&pack, "git branch -d feature"); // Safe delete with -d
+        assert_allows(&pack, "git branch --merged");
     }
 
     /// Test: Substring matches should not trigger (keyword boundary)
@@ -302,9 +302,10 @@ mod pack_test_template {
     fn test_severity_medium_patterns() {
         let pack = example_pack::create_pack();
 
-        // These were moved to Medium (recoverable via reflog/fsck)
+        // Stash drop remains Medium; branch deletion is an approval boundary.
         assert_blocks_with_severity(&pack, "git stash drop", Severity::Medium);
-        assert_blocks_with_severity(&pack, "git branch -D feature", Severity::Medium);
+        assert_blocks_with_severity(&pack, "git branch -d feature", Severity::High);
+        assert_blocks_with_severity(&pack, "git branch -D feature", Severity::High);
     }
 
     // =========================================================================

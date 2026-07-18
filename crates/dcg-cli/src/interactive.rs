@@ -888,7 +888,7 @@ fn select_allowlist_scope(timeout: Duration) -> Result<AllowlistScope, InputErro
     let _ = writeln!(handle, "  {} Temporary (24 hours)", "[t]".cyan());
     let _ = writeln!(
         handle,
-        "  {} Permanent (add to project allowlist)",
+        "  {} Permanent (add to user allowlist)",
         "[p]".cyan()
     );
     let _ = writeln!(handle);

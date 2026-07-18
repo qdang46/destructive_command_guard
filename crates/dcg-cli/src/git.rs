@@ -629,11 +629,19 @@ mod tests {
     }
 
     #[test]
-    fn test_is_in_git_repo() {
-        // This test runs in the dcg repo
-        let result = is_in_git_repo();
-        // Should be true since we're in a git repo
-        assert!(result, "Expected to be in a git repo");
+    fn test_is_in_git_repo_at_path_is_hermetic() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        init_git_repo(repo.path());
+        assert!(
+            is_in_git_repo_at_path(repo.path()),
+            "initialized temporary repository must be detected"
+        );
+
+        let plain = tempfile::tempdir().expect("plain tempdir");
+        assert!(
+            !is_in_git_repo_at_path(plain.path()),
+            "plain temporary directory must not be detected as a repository"
+        );
     }
 
     #[test]

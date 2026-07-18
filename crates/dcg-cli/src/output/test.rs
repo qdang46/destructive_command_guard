@@ -1,7 +1,7 @@
 //! Test result box renderer for terminal output.
 //!
 //! Provides formatted output for the `dcg test` command showing:
-//! - Whether a command would be blocked or allowed
+//! - Whether a command would be blocked, allowed, or withheld because analysis was indeterminate
 //! - Pattern match details for blocked commands
 //! - Allowlist match details for allowed commands
 //!
@@ -55,6 +55,11 @@ pub enum TestOutcome {
         /// Why the command is allowed.
         reason: AllowedReason,
     },
+    /// Safety analysis did not complete, so the command must not be allowed to execute.
+    Indeterminate {
+        /// Why evaluation could not reach a safety decision.
+        reason: String,
+    },
 }
 
 /// Reason why a command was allowed.
@@ -69,8 +74,6 @@ pub enum AllowedReason {
         /// Which layer the allowlist entry came from.
         layer: String,
     },
-    /// Evaluation was skipped due to budget constraints (fail-open).
-    BudgetExhausted,
 }
 
 impl TestResultBox {
@@ -94,11 +97,7 @@ impl TestResultBox {
                 }
             }
             EvaluationDecision::Allow => {
-                if eval.skipped_due_to_budget {
-                    TestOutcome::Allowed {
-                        reason: AllowedReason::BudgetExhausted,
-                    }
-                } else if let Some(override_info) = &eval.allowlist_override {
+                if let Some(override_info) = &eval.allowlist_override {
                     TestOutcome::Allowed {
                         reason: AllowedReason::AllowlistMatch {
                             entry: override_info.reason.clone(),
@@ -111,6 +110,13 @@ impl TestResultBox {
                     }
                 }
             }
+            EvaluationDecision::Indeterminate => TestOutcome::Indeterminate {
+                reason: if eval.skipped_due_to_budget {
+                    "Evaluation budget exhausted before a safety decision".to_string()
+                } else {
+                    "Safety evaluation could not reach a decision".to_string()
+                },
+            },
         };
 
         Self { command, result }
@@ -168,10 +174,21 @@ impl TestResultBox {
         }
     }
 
-    /// Returns whether the result indicates the command would be blocked.
+    /// Returns whether the result indicates execution would be withheld.
+    ///
+    /// Indeterminate evaluation is treated conservatively: it is not an allow.
     #[must_use]
     pub const fn is_blocked(&self) -> bool {
-        matches!(self.result, TestOutcome::Blocked { .. })
+        matches!(
+            self.result,
+            TestOutcome::Blocked { .. } | TestOutcome::Indeterminate { .. }
+        )
+    }
+
+    /// Returns whether safety evaluation could not reach a decision.
+    #[must_use]
+    pub const fn is_indeterminate(&self) -> bool {
+        matches!(self.result, TestOutcome::Indeterminate { .. })
     }
 
     /// Render the test result box with the given theme.
@@ -225,6 +242,9 @@ impl TestResultBox {
                 (" WOULD BE BLOCKED ", box_style, color_str)
             }
             TestOutcome::Allowed { .. } => (" WOULD BE ALLOWED ", &ROUNDED, theme.success_markup()),
+            TestOutcome::Indeterminate { .. } => {
+                (" INDETERMINATE ", &ROUNDED, theme.warning_markup())
+            }
         };
 
         // Build content as a Vec of lines
@@ -273,11 +293,14 @@ impl TestResultBox {
                     AllowedReason::AllowlistMatch { entry, layer } => {
                         format!("Allowlist: [italic]\"{entry}\"[/] ({layer})")
                     }
-                    AllowedReason::BudgetExhausted => {
-                        "[yellow]Budget exhausted (fail-open)[/]".to_string()
-                    }
                 };
                 lines.push(format!("[dim]Reason:[/]      {reason_text}"));
+            }
+            TestOutcome::Indeterminate { reason } => {
+                lines.push(format!("[dim]Reason:[/]      [yellow]{reason}[/]"));
+                lines.push(
+                    "[yellow]Execution is not allowed without a safety decision.[/]".to_string(),
+                );
             }
         }
 
@@ -351,13 +374,17 @@ impl TestResultBox {
                         let _ = writeln!(output, "  Reason:     Allowlist match: \"{entry}\"");
                         let _ = writeln!(output, "  Layer:      {layer}");
                     }
-                    AllowedReason::BudgetExhausted => {
-                        let _ = writeln!(
-                            output,
-                            "  Reason:     Evaluation budget exhausted (fail-open)"
-                        );
-                    }
                 }
+            }
+            TestOutcome::Indeterminate { reason } => {
+                let _ = writeln!(output, "INDETERMINATE");
+                let _ = writeln!(output);
+                let _ = writeln!(output, "  Command:    {}", self.command);
+                let _ = writeln!(output, "  Reason:     {reason}");
+                let _ = writeln!(
+                    output,
+                    "  Action:     Execution is not allowed without a safety decision"
+                );
             }
         }
 
@@ -374,6 +401,7 @@ impl TestResultBox {
         let (header, header_color) = match &self.result {
             TestOutcome::Blocked { .. } => (" WOULD BE BLOCKED ", theme.error_color),
             TestOutcome::Allowed { .. } => (" WOULD BE ALLOWED ", theme.success_color),
+            TestOutcome::Indeterminate { .. } => (" INDETERMINATE ", theme.warning_color),
         };
 
         let color_code = ansi_color_code(header_color);
@@ -474,16 +502,18 @@ impl TestResultBox {
                         );
                         self.render_unicode_row(&mut output, "Layer:", layer, width, &color_code);
                     }
-                    AllowedReason::BudgetExhausted => {
-                        self.render_unicode_row(
-                            &mut output,
-                            "Reason:",
-                            "Evaluation budget exhausted (fail-open)",
-                            width,
-                            &color_code,
-                        );
-                    }
                 }
+            }
+            TestOutcome::Indeterminate { reason } => {
+                self.render_unicode_row(&mut output, "Command:", &self.command, width, &color_code);
+                self.render_unicode_row(&mut output, "Reason:", reason, width, &color_code);
+                self.render_unicode_row(
+                    &mut output,
+                    "Action:",
+                    "Execution is not allowed without a safety decision",
+                    width,
+                    &color_code,
+                );
             }
         }
 
@@ -529,6 +559,7 @@ impl TestResultBox {
         let header = match &self.result {
             TestOutcome::Blocked { .. } => " WOULD BE BLOCKED ",
             TestOutcome::Allowed { .. } => " WOULD BE ALLOWED ",
+            TestOutcome::Indeterminate { .. } => " INDETERMINATE ",
         };
 
         let header_len = header.chars().count();
@@ -596,15 +627,17 @@ impl TestResultBox {
                         );
                         self.render_ascii_row(&mut output, "Layer:", layer, width);
                     }
-                    AllowedReason::BudgetExhausted => {
-                        self.render_ascii_row(
-                            &mut output,
-                            "Reason:",
-                            "Evaluation budget exhausted (fail-open)",
-                            width,
-                        );
-                    }
                 }
+            }
+            TestOutcome::Indeterminate { reason } => {
+                self.render_ascii_row(&mut output, "Command:", &self.command, width);
+                self.render_ascii_row(&mut output, "Reason:", reason, width);
+                self.render_ascii_row(
+                    &mut output,
+                    "Action:",
+                    "Execution is not allowed without a safety decision",
+                    width,
+                );
             }
         }
 
@@ -633,6 +666,7 @@ impl TestResultBox {
         let (header, header_color) = match &self.result {
             TestOutcome::Blocked { .. } => ("WOULD BE BLOCKED", theme.error_color),
             TestOutcome::Allowed { .. } => ("WOULD BE ALLOWED", theme.success_color),
+            TestOutcome::Indeterminate { .. } => ("INDETERMINATE", theme.warning_color),
         };
 
         let color_code = ansi_color_code(header_color);
@@ -679,13 +713,15 @@ impl TestResultBox {
                         let _ = writeln!(output, "  Reason:     Allowlist match: \"{entry}\"");
                         let _ = writeln!(output, "  Layer:      {layer}");
                     }
-                    AllowedReason::BudgetExhausted => {
-                        let _ = writeln!(
-                            output,
-                            "  Reason:     Evaluation budget exhausted (fail-open)"
-                        );
-                    }
                 }
+            }
+            TestOutcome::Indeterminate { reason } => {
+                let _ = writeln!(output, "  Command:    {}", self.command);
+                let _ = writeln!(output, "  Reason:     {reason}");
+                let _ = writeln!(
+                    output,
+                    "  Action:     Execution is not allowed without a safety decision"
+                );
             }
         }
 
@@ -880,6 +916,13 @@ mod tests {
 
         let allowed = TestResultBox::allowed_no_match("echo hello");
         assert!(!allowed.is_blocked());
+
+        let indeterminate = TestResultBox::from_evaluation(
+            "complex command",
+            &EvaluationResult::indeterminate_due_to_budget(),
+        );
+        assert!(indeterminate.is_blocked());
+        assert!(indeterminate.is_indeterminate());
     }
 
     #[test]
@@ -1001,6 +1044,7 @@ mod tests {
             allowlist_override: None,
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
+            quick_rejected: false,
             branch_context: None,
             session_occurrence: None,
             graduated_response: None,
@@ -1028,15 +1072,18 @@ mod tests {
     }
 
     #[test]
-    fn test_from_evaluation_budget_exhausted() {
-        let eval = EvaluationResult::allowed_due_to_budget();
+    fn test_from_evaluation_budget_exhausted_is_not_allowed() {
+        let eval = EvaluationResult::indeterminate_due_to_budget();
 
         let result = TestResultBox::from_evaluation("complex command", &eval);
 
-        assert!(!result.is_blocked());
+        assert!(result.is_blocked());
+        assert!(result.is_indeterminate());
         let output = result.render_plain();
-        assert!(output.contains("WOULD BE ALLOWED"));
+        assert!(output.contains("INDETERMINATE"));
         assert!(output.contains("budget exhausted"));
+        assert!(output.contains("Execution is not allowed"));
+        assert!(!output.contains("WOULD BE ALLOWED"));
     }
 
     #[test]

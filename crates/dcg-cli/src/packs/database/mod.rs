@@ -6,11 +6,13 @@
 //! - `MongoDB` (`mongosh`, `mongodump`)
 //! - `Redis` (`redis-cli`)
 //! - `SQLite` (`sqlite3`)
+//! - Snowflake (modern `snow sql` CLI)
 //! - `Supabase` (`supabase db`, `supabase migration`, `supabase projects`)
 
 pub mod mongodb;
 pub mod mysql;
 pub mod postgresql;
 pub mod redis;
+pub mod snowflake;
 pub mod sqlite;
 pub mod supabase;

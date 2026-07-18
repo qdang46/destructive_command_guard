@@ -1716,6 +1716,30 @@ fn extract_heredocs(
 /// - `cat file.txt | tee <<EOF` -> Some("tee")
 /// - `$(cat <<EOF)` -> Some("cat")
 fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option<String> {
+    extract_heredoc_target_token(command, heredoc_start).map(|target| {
+        target
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(target.as_str())
+            .to_string()
+    })
+}
+
+/// Extract the lexical command token that owns a heredoc, preserving an
+/// explicit path. Most callers need only the basename, but shell-name override
+/// analysis must distinguish a bare `cat` (subject to function/alias lookup)
+/// from `/bin/cat` (not subject to shell name lookup).
+fn extract_heredoc_target_token(command: &str, heredoc_start: usize) -> Option<String> {
+    extract_heredoc_target_resolution(command, heredoc_start).map(|(target, _wrapped)| target)
+}
+
+/// Resolve the lexical heredoc target while retaining whether the owning
+/// simple command used a shell/external wrapper before that target. Wrapper
+/// resolution is mutable shell state, so the masking proof must not erase it.
+fn extract_heredoc_target_resolution(
+    command: &str,
+    heredoc_start: usize,
+) -> Option<(String, bool)> {
     if heredoc_start == 0 {
         return None;
     }
@@ -1743,6 +1767,7 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
     // the command that owns the heredoc rather than the last argument before
     // the operator.
     let tokens = tokenize_backwards(trimmed);
+    let mut wrapper_seen = false;
 
     for token in tokens.iter().rev() {
         if is_shell_env_assignment(token) {
@@ -1756,6 +1781,7 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
 
         // Skip common shell wrappers until we reach the actual target command.
         if SHELL_WRAPPER_COMMANDS.contains(&token.as_str()) {
+            wrapper_seen = true;
             continue;
         }
 
@@ -1791,7 +1817,7 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
                 continue;
             }
 
-            return Some(basename.to_string());
+            return Some((token.clone(), wrapper_seen));
         }
 
         // Skip if this looks like a file with extension
@@ -1805,23 +1831,26 @@ fn extract_heredoc_target_command(command: &str, heredoc_start: usize) -> Option
             continue;
         }
 
-        return Some(token.clone());
+        return Some((token.clone(), wrapper_seen));
     }
 
     None
 }
 
 fn is_shell_env_assignment(token: &str) -> bool {
-    let Some((name, _value)) = token.split_once('=') else {
-        return false;
-    };
+    shell_assignment_name(token).is_some()
+}
 
-    !name.is_empty()
+fn shell_assignment_name(token: &str) -> Option<&str> {
+    let (raw_name, _value) = token.split_once('=')?;
+    let name = raw_name.strip_suffix('+').unwrap_or(raw_name);
+    (!name.is_empty()
         && name.bytes().enumerate().all(|(idx, byte)| match byte {
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => true,
             b'0'..=b'9' => idx > 0,
             _ => false,
-        })
+        }))
+    .then_some(name)
 }
 
 /// Tokenize a command string backwards, respecting quotes.
@@ -1957,8 +1986,7 @@ const NON_EXECUTING_HEREDOC_COMMANDS: &[&str] = &[
 /// positive (#181).
 ///
 /// Unlike the unconditional [`NON_EXECUTING_HEREDOC_COMMANDS`] sinks, these are
-/// masked *only when the heredoc delimiter is quoted* (see
-/// [`is_quoted_noop_builtin_heredoc`]). A quoted delimiter suppresses all shell
+/// masked *only when the AST proves the heredoc delimiter is quoted. A quoted delimiter suppresses all shell
 /// expansion, guaranteeing the body is inert literal data. With an *unquoted*
 /// delimiter the body still undergoes command substitution — `true <<EOF` /
 /// `$(rm -rf …)` / `EOF` really runs the deletion — so those must keep flowing
@@ -1971,33 +1999,355 @@ fn is_noop_stdin_discarding_command(cmd: &str) -> bool {
     NOOP_STDIN_DISCARDING_COMMANDS.contains(&cmd_name)
 }
 
-/// Returns `true` when the heredoc at `heredoc_start` targets a no-op stdin
-/// discarding builtin (`:`/`true`/`false`) *and* uses a quoted delimiter, so its
-/// body is provably inert and safe to mask (#181).
-#[must_use]
-fn is_quoted_noop_builtin_heredoc(command: &str, heredoc_start: usize) -> bool {
-    if !extract_heredoc_target_command(command, heredoc_start)
-        .as_deref()
-        .is_some_and(is_noop_stdin_discarding_command)
-    {
-        return false;
+/// Return whether a nominal stdin-data sink can be shadowed by shell state
+/// visible before this redirection. A function or alias named `cat`, `tee`,
+/// etc. may execute its stdin, and `eval`/`source` can install such a binding
+/// without exposing it to static inspection. Masking is therefore sound only
+/// when the command name still resolves to the documented sink. The exact
+/// normalized `/bin/<name>` and `/usr/bin/<name>` OS utility paths bypass shell
+/// name lookup; arbitrary absolute or relative paths carry no such guarantee.
+pub(crate) fn stdin_data_sink_may_be_overridden(
+    command: &str,
+    redirection_start: usize,
+    target_command: &str,
+) -> bool {
+    let target = target_command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(target_command)
+        .trim_end_matches(".exe");
+    let Some((lexical_target, wrapper_seen)) =
+        extract_heredoc_target_resolution(command, redirection_start)
+    else {
+        return true;
+    };
+    // `sudo`, `env`, `nohup`, `command`, and `builtin` have materially
+    // different lookup and execution rules, and every one can itself be a
+    // function/alias or PATH-selected executable. Skipping such a token and
+    // proving only its final argument is unsound. Preserve the heredoc body for
+    // the evaluator instead of attempting a partial wrapper proof.
+    if wrapper_seen {
+        return true;
     }
-    heredoc_delimiter_is_quoted(command, heredoc_start)
+    if lexical_target.contains(['/', '\\']) {
+        // Basename classification alone is not a proof about an arbitrary
+        // executable: `./cat` and `/tmp/cat` may run their stdin as shell. Only
+        // the two normalized OS utility paths retain the documented data-sink
+        // contract; every other path-qualified token fails closed.
+        return !is_trusted_os_data_sink_path(&lexical_target, target);
+    }
+    if std::env::var_os(format!("BASH_FUNC_{target}%%")).is_some() {
+        return true;
+    }
+
+    let Some(prefix) = command.get(..redirection_start) else {
+        return true;
+    };
+    let ast = AstGrep::new(prefix, SupportLang::Bash);
+    let mut overridden = false;
+    let mut parse_error = false;
+    find_visible_shell_name_override(ast.root(), target, &mut overridden, &mut parse_error);
+    overridden || parse_error
 }
 
-/// Check whether the heredoc delimiter directly after `<<` at `heredoc_start` is
-/// quoted (single or double), which suppresses expansion of the body. Handles
-/// the `<<-`/`<<~` markers and interposed whitespace (`cat <<- 'EOF'`).
 #[must_use]
-fn heredoc_delimiter_is_quoted(command: &str, heredoc_start: usize) -> bool {
-    let after_op = &command[(heredoc_start + 2).min(command.len())..];
-    // Skip an optional tab/indent-strip marker adjacent to `<<`.
-    let after_marker = after_op
-        .strip_prefix('-')
-        .or_else(|| after_op.strip_prefix('~'))
-        .unwrap_or(after_op);
-    let delim = after_marker.trim_start_matches([' ', '\t']);
-    delim.starts_with('\'') || delim.starts_with('"')
+fn is_trusted_os_data_sink_path(lexical_target: &str, basename: &str) -> bool {
+    lexical_target
+        .strip_prefix("/bin/")
+        .is_some_and(|name| name == basename)
+        || lexical_target
+            .strip_prefix("/usr/bin/")
+            .is_some_and(|name| name == basename)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn find_visible_shell_name_override<D: ast_grep_core::Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    target: &str,
+    overridden: &mut bool,
+    parse_error: &mut bool,
+) {
+    if *overridden || *parse_error {
+        return;
+    }
+    match node.kind().as_ref() {
+        "ERROR" => {
+            *parse_error = true;
+            return;
+        }
+        "function_definition" => {
+            let Some(name) = node.field("name") else {
+                // A function definition whose binding cannot be resolved is
+                // exactly the case where proving a later bare sink is unsafe.
+                *overridden = true;
+                return;
+            };
+            let name = name.text();
+            if name.as_ref() == target || !is_static_shell_name(name.as_ref()) {
+                *overridden = true;
+                return;
+            }
+            // Keep descending into a differently named function body. A later
+            // invocation can make an `eval`/`source` inside it mutate the
+            // parent shell, and proving the complete shell call graph here
+            // would be less reliable than conservatively retaining the body.
+        }
+        "variable_assignment" => {
+            let text = node.text();
+            if shell_assignment_name(text.as_ref()) == Some("PATH") {
+                *overridden = true;
+                return;
+            }
+        }
+        "command" => {
+            let text = node.text();
+            match shell_words::split(text.as_ref()) {
+                Ok(tokens) => {
+                    if shell_command_may_override_name(&tokens, target) {
+                        *overridden = true;
+                        return;
+                    }
+                    // The complete simple command was resolved above. Its
+                    // assignment children are temporary environment state
+                    // unless the command itself is a modeled mutator; do not
+                    // reclassify `PATH=/tmp printf ...` as persistent state.
+                    return;
+                }
+                Err(_) => {
+                    // AST-valid shell that the secondary word splitter cannot
+                    // resolve must never establish a data-only proof.
+                    *parse_error = true;
+                    *overridden = true;
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+    for child in node.children() {
+        find_visible_shell_name_override(child, target, overridden, parse_error);
+    }
+}
+
+#[must_use]
+fn is_static_shell_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' => true,
+            b'0'..=b'9' => index > 0,
+            _ => false,
+        })
+}
+
+#[must_use]
+fn shell_word_has_runtime_expansion(word: &str) -> bool {
+    word.bytes()
+        .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'['))
+}
+
+#[must_use]
+fn shell_word_assigns_path(word: &str) -> bool {
+    shell_assignment_name(word) == Some("PATH")
+}
+
+/// Resolve the command word after assignment prefixes and the two shell
+/// builtins that can explicitly dispatch another builtin. Query-only
+/// `command -v/-V` and `builtin -p` forms do not execute the following word.
+fn effective_shell_command(tokens: &[String]) -> Option<(usize, &str)> {
+    let mut index = tokens
+        .iter()
+        .position(|word| !is_shell_env_assignment(word))?;
+
+    match tokens[index].as_str() {
+        "command" => {
+            index += 1;
+            while let Some(option) = tokens.get(index).map(String::as_str) {
+                match option {
+                    "-v" | "-V" => return None,
+                    "-p" | "--" => index += 1,
+                    _ => break,
+                }
+            }
+        }
+        "builtin" => {
+            index += 1;
+            if tokens.get(index).is_some_and(|option| option == "-p") {
+                return None;
+            }
+            if tokens.get(index).is_some_and(|option| option == "--") {
+                index += 1;
+            }
+        }
+        _ => {}
+    }
+
+    tokens.get(index).map(|word| (index, word.as_str()))
+}
+
+#[must_use]
+fn alias_command_may_override_name(arguments: &[String], target: &str) -> bool {
+    arguments.iter().any(|argument| {
+        if matches!(argument.as_str(), "--" | "-p") {
+            return false;
+        }
+        if let Some((name, _value)) = argument.split_once('=') {
+            return name == target || !is_static_shell_name(name);
+        }
+
+        // A static operand merely asks `alias` to print that binding. A word
+        // containing expansion or globbing can become `target=value` only at
+        // runtime, so its mutation target is unresolved and must fail closed.
+        shell_word_has_runtime_expansion(argument)
+    })
+}
+
+#[must_use]
+fn assignment_builtin_may_override_path(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        if argument == "--" || argument.starts_with('-') {
+            return false;
+        }
+        shell_word_assigns_path(argument) || shell_word_has_runtime_expansion(argument)
+    })
+}
+
+#[must_use]
+fn env_command_may_override_name(
+    arguments: &[String],
+    target: &str,
+    mut path_resolution_changed: bool,
+) -> bool {
+    if !arguments.iter().any(|argument| argument == target) {
+        // The target extractor found a different simple command; this `env`
+        // invocation belongs to earlier shell state and cannot persistently
+        // alter PATH in the parent shell.
+        return false;
+    }
+    let mut index = 0usize;
+    while let Some(argument) = arguments.get(index).map(String::as_str) {
+        if shell_word_assigns_path(argument) {
+            path_resolution_changed = true;
+            index += 1;
+            continue;
+        }
+        if is_shell_env_assignment(argument) {
+            index += 1;
+            continue;
+        }
+        match argument {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "-i" | "--ignore-environment" => {
+                path_resolution_changed = true;
+                index += 1;
+            }
+            "-u" | "--unset" => {
+                let Some(name) = arguments.get(index + 1) else {
+                    return false;
+                };
+                if name == "PATH" || shell_word_has_runtime_expansion(name) {
+                    path_resolution_changed = true;
+                }
+                index += 2;
+            }
+            "-C" | "--chdir" => {
+                if arguments.get(index + 1).is_none() {
+                    return false;
+                }
+                index += 2;
+            }
+            _ if argument.starts_with("--unset=") => {
+                let name = argument.trim_start_matches("--unset=");
+                if name == "PATH" || shell_word_has_runtime_expansion(name) {
+                    path_resolution_changed = true;
+                }
+                index += 1;
+            }
+            _ if argument.starts_with('-') => {
+                // Unknown env option arity makes the command position
+                // unresolved. The target extractor nevertheless classified a
+                // bare data sink, so retaining the body is the safe outcome.
+                return arguments[index + 1..]
+                    .iter()
+                    .any(|word| word == target || shell_word_has_runtime_expansion(word));
+            }
+            _ if shell_word_has_runtime_expansion(argument) => return true,
+            _ => break,
+        }
+    }
+
+    path_resolution_changed && index < arguments.len()
+}
+
+#[must_use]
+fn hash_command_may_override_name(arguments: &[String], target: &str) -> bool {
+    let Some(option_index) = arguments
+        .iter()
+        .position(|argument| argument == "-p" || argument.starts_with("-p"))
+    else {
+        return false;
+    };
+    let path_is_attached = arguments[option_index].len() > 2;
+    let name_index = option_index + usize::from(!path_is_attached) + 1;
+    arguments
+        .get(name_index)
+        .is_none_or(|name| name == target || shell_word_has_runtime_expansion(name))
+}
+
+#[must_use]
+fn enable_command_may_override_name(arguments: &[String], target: &str) -> bool {
+    let Some(option_index) = arguments
+        .iter()
+        .position(|argument| argument == "-f" || argument.starts_with("-f"))
+    else {
+        return false;
+    };
+    let library_is_attached = arguments[option_index].len() > 2;
+    let name_index = option_index + usize::from(!library_is_attached) + 1;
+    arguments
+        .get(name_index)
+        .is_none_or(|name| name == target || shell_word_has_runtime_expansion(name))
+}
+
+#[must_use]
+fn shell_command_may_override_name(tokens: &[String], target: &str) -> bool {
+    if tokens.iter().all(|word| is_shell_env_assignment(word))
+        && tokens.iter().any(|word| shell_word_assigns_path(word))
+    {
+        return true;
+    }
+    let Some((command_index, command)) = effective_shell_command(tokens) else {
+        return false;
+    };
+    let leading_path_mutation = tokens[..command_index]
+        .iter()
+        .any(|word| shell_word_assigns_path(word));
+    if leading_path_mutation && command == target {
+        return true;
+    }
+    match command {
+        // These execute shell text from an opaque runtime source. Even a source
+        // file whose current contents appear harmless may be replaced between
+        // inspection and execution, so bare-name masking cannot remain sound.
+        "eval" | "source" | "." => true,
+        "alias" => alias_command_may_override_name(&tokens[command_index + 1..], target),
+        "export" | "declare" | "typeset" | "local" | "readonly" => {
+            assignment_builtin_may_override_path(&tokens[command_index + 1..])
+        }
+        "unset" => tokens[command_index + 1..]
+            .iter()
+            .any(|name| name == "PATH" || shell_word_has_runtime_expansion(name)),
+        "env" => env_command_may_override_name(
+            &tokens[command_index + 1..],
+            target,
+            leading_path_mutation,
+        ),
+        "hash" => hash_command_may_override_name(&tokens[command_index + 1..], target),
+        "enable" => enable_command_may_override_name(&tokens[command_index + 1..], target),
+        _ => false,
+    }
 }
 
 const SHELL_WRAPPER_COMMANDS: &[&str] = &["sudo", "env", "command", "builtin", "nohup"];
@@ -2067,9 +2417,9 @@ pub fn is_interpreter_source_heredoc_command(cmd: &str) -> bool {
 }
 
 /// Check whether the command owning the heredoc at `heredoc_start` is a `git`
-/// invocation that reads the heredoc body as DATA from stdin — a commit/tag/note
-/// *message* (`-F -`, `-F-`, `--file=-`, `--file -`) or blob/index/object
-/// *content* (`--stdin`).
+/// built-in invocation that reads the heredoc body as DATA from stdin — a
+/// commit/tag/note *message* (`-F -`, `-F-`, `--file=-`, `--file -`) or the
+/// documented `hash-object`/`update-index` `--stdin` input.
 ///
 /// For these targets git consumes stdin as data (a commit message, blob content,
 /// an index path list, …) and NEVER executes it as shell, so the body is masked
@@ -2082,10 +2432,11 @@ pub fn is_interpreter_source_heredoc_command(cmd: &str) -> bool {
 /// so the fail-safe direction is correct — when the parse is ambiguous it returns
 /// `false` and the body keeps flowing through the scan (a false positive at
 /// worst). It requires program `git` plus an EXPLICIT stdin sentinel; it does not
-/// fire on a bare `git commit <<EOF` (no `-F -`). Only the heredoc body is masked
-/// by the caller: the `git …` line itself and everything after the terminator are
-/// still scanned, so a real destructive command chained after the heredoc still
-/// blocks. `--stdin-paths` is deliberately NOT matched (kept conservative).
+/// fire on a bare `git commit <<EOF` (no `-F -`), an unknown/aliased subcommand,
+/// or configuration-bearing `-c`/`--config-env`/`GIT_CONFIG*` input. Only the
+/// heredoc body is masked by the caller: the `git …` line itself and everything
+/// after the terminator are still scanned, so a real destructive command chained
+/// after the heredoc still blocks. `--stdin-paths` is deliberately NOT matched.
 /// The scan is bounded to the heredoc's own physical line (see below) and
 /// `tokenize_backwards` additionally stops at shell separators (`| ; & $ ( )`),
 /// so it never reads tokens across a command boundary; quoted args (e.g. a
@@ -2118,7 +2469,17 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
     // (sudo/env/command/builtin/nohup) the same way target extraction does.
     let mut idx = 0;
     while let Some(t) = tokens.get(idx) {
-        if is_shell_env_assignment(t) || SHELL_WRAPPER_COMMANDS.contains(&t.as_str()) {
+        if is_shell_env_assignment(t) {
+            // Environment-provided Git configuration can define shell aliases.
+            // If any such state is visible, do not prove the heredoc a data
+            // sink; leaving the body scannable is the safe direction.
+            if t.split_once('=')
+                .is_some_and(|(name, _)| name.starts_with("GIT_CONFIG"))
+            {
+                return false;
+            }
+            idx += 1;
+        } else if SHELL_WRAPPER_COMMANDS.contains(&t.as_str()) {
             idx += 1;
         } else {
             break;
@@ -2131,24 +2492,102 @@ fn is_git_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
         return false;
     }
 
-    // Look for an explicit stdin-data sentinel among git's arguments.
     let args = &tokens[idx + 1..];
-    for (i, arg) in args.iter().enumerate() {
+    let Some((subcommand, subcommand_args)) = git_builtin_subcommand_and_args(args) else {
+        return false;
+    };
+
+    // Only built-in subcommands with a documented data-only stdin contract are
+    // eligible. Unknown commands may be persistent or visible shell aliases,
+    // and Git passes the heredoc through to those aliases unchanged.
+    let accepts_file_stdin = matches!(subcommand, "commit" | "tag" | "notes");
+    let accepts_plain_stdin = matches!(subcommand, "hash-object" | "update-index");
+    for (i, arg) in subcommand_args.iter().enumerate() {
         match arg.as_str() {
             // `-F -` / `--file -`: message read from stdin (commit/tag/notes).
-            "-F" | "--file" => {
-                if args.get(i + 1).map(String::as_str) == Some("-") {
+            "-F" | "--file" if accepts_file_stdin => {
+                if subcommand_args.get(i + 1).map(String::as_str) == Some("-") {
                     return true;
                 }
             }
             // Glued / `=-` forms of the same.
-            "-F-" | "--file=-" => return true,
+            "-F-" | "--file=-" if accepts_file_stdin => return true,
             // Blob/index/object content from stdin (NOT --stdin-paths).
-            "--stdin" => return true,
+            "--stdin" if accepts_plain_stdin => return true,
             _ => {}
         }
     }
     false
+}
+
+/// Resolve a statically visible built-in Git subcommand after bounded global
+/// option parsing. Configuration-bearing options are rejected because they can
+/// define aliases; unknown option arity likewise fails closed.
+fn git_builtin_subcommand_and_args(args: &[String]) -> Option<(&str, &[String])> {
+    let mut index = 0usize;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if matches!(arg, "-c" | "--config-env")
+            || arg.starts_with("-c")
+            || arg.starts_with("--config-env=")
+        {
+            return None;
+        }
+        if matches!(
+            arg,
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+        ) {
+            index = index.checked_add(2)?;
+            if index > args.len() {
+                return None;
+            }
+            continue;
+        }
+        if arg.starts_with("-C") && arg.len() > 2
+            || [
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--super-prefix=",
+                "--exec-path=",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            arg,
+            "-p" | "-P"
+                | "--paginate"
+                | "--no-pager"
+                | "--no-replace-objects"
+                | "--bare"
+                | "--literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+                | "--no-optional-locks"
+        ) {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            return None;
+        }
+        break;
+    }
+
+    let subcommand = args.get(index)?.as_str();
+    matches!(
+        subcommand,
+        "commit" | "tag" | "notes" | "hash-object" | "update-index"
+    )
+    .then(|| (subcommand, &args[index + 1..]))
 }
 
 /// Check whether the command owning the heredoc is `spx session handoff`.
@@ -2215,127 +2654,304 @@ fn is_structured_stdin_data_sink(command: &str, heredoc_start: usize) -> bool {
 /// heredoc content was replaced with placeholder text.
 #[must_use]
 pub fn mask_non_executing_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
+    mask_non_executing_heredocs_with_policy(command, false)
+}
+
+/// Mask quoted heredoc bodies only when their target consumes stdin as data.
+///
+/// A quoted POSIX heredoc delimiter suppresses expansion in the outer shell,
+/// so command-substitution analysis must not treat literal `$()` text passed
+/// to `cat`, `tee`, or another data sink as executable. Unquoted heredocs are
+/// deliberately left intact because the outer shell expands them before the
+/// data sink runs. Shell/interpreter targets are likewise left intact because
+/// they may execute the body after receiving it.
+#[must_use]
+pub fn mask_non_expanding_data_heredocs(command: &str) -> std::borrow::Cow<'_, str> {
+    mask_non_executing_heredocs_with_policy(command, true)
+}
+
+fn mask_non_executing_heredocs_with_policy(
+    command: &str,
+    require_quoted_delimiter: bool,
+) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
 
     // Quick check: no heredoc operator means nothing to mask
     if !command.contains("<<") {
         return Cow::Borrowed(command);
     }
+    // Only AST-proven redirect operators may introduce heredocs. Treating raw
+    // `<<` text inside quotes/comments as syntax can make an inert fake
+    // delimiter erase later executable lines from the security view. When
+    // parsing is ambiguous, preserve every byte and accept a conservative
+    // false positive instead of masking uncertain source.
+    let Some(active_heredocs) = active_heredocs(command) else {
+        return Cow::Borrowed(command);
+    };
 
     let mut result = String::new();
     let mut pos = 0;
-    let bytes = command.as_bytes();
+    let mut active_heredocs = active_heredocs.into_iter();
 
     while pos < command.len() {
-        // Find next potential heredoc operator
-        if let Some(offset) = command[pos..].find("<<") {
-            let heredoc_start = pos + offset;
-
-            // Check for <<< (here-string)
-            if heredoc_start + 3 <= command.len() && bytes.get(heredoc_start + 2) == Some(&b'<') {
-                // Extract target command for here-string
-                let target_cmd = extract_heredoc_target_command(command, heredoc_start);
-                let should_mask_herestring =
-                    target_cmd.as_ref().is_some_and(|cmd| {
-                        is_non_executing_heredoc_command(cmd)
-                            || is_interpreter_source_heredoc_command(cmd)
-                    }) || is_structured_stdin_data_sink(command, heredoc_start);
-
-                if should_mask_herestring {
-                    // Mask here-string content for non-executing targets
-                    if let Some((content_start, content_end)) =
-                        find_herestring_content_bounds(command, heredoc_start + 3)
-                    {
-                        // Copy up to the content start (includes <<<)
-                        if result.is_empty() {
-                            result = command[..content_start].to_string();
-                        } else {
-                            result.push_str(&command[pos..content_start]);
-                        }
-                        // Replace content with placeholder
-                        result.push_str("'MASKED'");
-                        pos = content_end;
-                        continue;
-                    }
-                }
-
-                // Not masking - just advance past <<< and continue
-                if !result.is_empty() {
-                    result.push_str(&command[pos..heredoc_start + 3]);
-                }
-                pos = heredoc_start + 3;
-                continue;
-            }
-
-            // Extract target command (what receives the heredoc)
-            let target_cmd = extract_heredoc_target_command(command, heredoc_start);
-
-            // Mask the body out of the raw-shell rescan when the target either
-            // (a) does not execute its stdin at all (cat/tee/…), or
-            // (b) is a non-shell interpreter reading its program from the body
-            //     (python -/node -/ruby/…), which the language-aware AST path has
-            //     already analyzed authoritatively (#136). Shell interpreters are
-            //     excluded so real `bash <<SH … rm -rf … SH` still blocks.
-            let should_mask = target_cmd.as_ref().is_some_and(|cmd| {
-                is_non_executing_heredoc_command(cmd) || is_interpreter_source_heredoc_command(cmd)
-            }) || is_structured_stdin_data_sink(command, heredoc_start)
-                || is_quoted_noop_builtin_heredoc(command, heredoc_start);
-
-            if should_mask {
-                // Parse the heredoc delimiter
-                let after_op = &command[heredoc_start + 2..];
-                if let Some((delimiter, body_start_offset, heredoc_type)) =
-                    parse_heredoc_delimiter(after_op)
-                {
-                    // Find the heredoc body end (terminating delimiter)
-                    let body_start = heredoc_start + 2 + body_start_offset;
-                    if let Some(body_end) =
-                        find_heredoc_terminator(command, body_start, &delimiter, heredoc_type)
-                    {
-                        // Mask the heredoc body while preserving length and newlines.
-                        if result.is_empty() {
-                            result = command[..body_start].to_string();
-                        } else {
-                            result.push_str(&command[pos..body_start]);
-                        }
-
-                        // Identify the start of the terminator line so we keep it intact.
-                        let body_slice = &command[body_start..body_end];
-                        let terminator_rel = body_slice.rfind('\n').map_or(0, |idx| idx + 1);
-                        let terminator_abs = body_start + terminator_rel;
-
-                        let masked_body =
-                            mask_preserve_newlines(&command[body_start..terminator_abs]);
-                        result.push_str(&masked_body);
-                        result.push_str(&command[terminator_abs..body_end]);
-
-                        pos = body_end;
-                        continue;
-                    }
-                }
-            }
-
-            // Not masking - copy everything up to and including <<
-            if result.is_empty() {
-                // First heredoc we're not masking - check if we need to start building result
-            } else {
-                result.push_str(&command[pos..heredoc_start + 2]);
-            }
-            pos = heredoc_start + 2;
-        } else {
-            // No more heredoc operators
+        let Some(active_heredoc) = active_heredocs.next() else {
             if result.is_empty() {
                 return Cow::Borrowed(command);
             }
             result.push_str(&command[pos..]);
             break;
+        };
+        let heredoc_start = active_heredoc.operator_start;
+        if heredoc_start < pos {
+            continue;
         }
+
+        // Check for <<< (here-string)
+        if matches!(active_heredoc.body, ActiveHeredocBody::HereString) {
+            // Extract target command for here-string
+            let target_cmd = extract_heredoc_target_command(command, heredoc_start);
+            let target_may_be_overridden = target_cmd.as_deref().is_some_and(|target| {
+                stdin_data_sink_may_be_overridden(command, heredoc_start, target)
+            });
+            let should_mask_herestring = !require_quoted_delimiter
+                && !target_may_be_overridden
+                && (target_cmd.as_ref().is_some_and(|cmd| {
+                    is_non_executing_heredoc_command(cmd)
+                        || is_interpreter_source_heredoc_command(cmd)
+                }) || is_structured_stdin_data_sink(command, heredoc_start));
+
+            if should_mask_herestring {
+                // Mask here-string content for non-executing targets
+                if let Some((content_start, content_end)) =
+                    find_herestring_content_bounds(command, heredoc_start + 3)
+                {
+                    // Copy up to the content start (includes <<<)
+                    if result.is_empty() {
+                        result = command[..content_start].to_string();
+                    } else {
+                        result.push_str(&command[pos..content_start]);
+                    }
+                    // Replace content with placeholder
+                    result.push_str("'MASKED'");
+                    pos = content_end;
+                    continue;
+                }
+            }
+
+            // Not masking - just advance past <<< and continue
+            if !result.is_empty() {
+                result.push_str(&command[pos..heredoc_start + 3]);
+            }
+            pos = heredoc_start + 3;
+            continue;
+        }
+
+        // Extract target command (what receives the heredoc)
+        let target_cmd = extract_heredoc_target_command(command, heredoc_start);
+        let ActiveHeredocBody::Heredoc {
+            body_start,
+            body_end,
+            delimiter_quoted,
+        } = active_heredoc.body
+        else {
+            // Unknown future body kinds must remain unmasked rather than
+            // turning an advisory false-positive filter into a hook panic.
+            continue;
+        };
+        let target_may_be_overridden = target_cmd.as_deref().is_some_and(|target| {
+            stdin_data_sink_may_be_overridden(command, heredoc_start, target)
+        });
+
+        // Mask the body out of the raw-shell rescan when the target either
+        // (a) does not execute its stdin at all (cat/tee/…), or
+        // (b) is a non-shell interpreter reading its program from the body
+        //     (python -/node -/ruby/…), which the language-aware AST path has
+        //     already analyzed authoritatively (#136). Shell interpreters are
+        //     excluded so real `bash <<SH … rm -rf … SH` still blocks.
+        let target_is_data_sink = !target_may_be_overridden
+            && (target_cmd.as_ref().is_some_and(|cmd| {
+                is_non_executing_heredoc_command(cmd) || is_interpreter_source_heredoc_command(cmd)
+            }) || is_structured_stdin_data_sink(command, heredoc_start)
+                || (delimiter_quoted
+                    && target_cmd
+                        .as_deref()
+                        .is_some_and(is_noop_stdin_discarding_command)));
+        let should_mask = target_is_data_sink && (!require_quoted_delimiter || delimiter_quoted);
+
+        if should_mask {
+            // Tree-sitter's body span is authoritative for delimiter quote
+            // removal and concatenation (`<<'E'OF`, `<<E\OF`, ...). Re-parsing
+            // the raw delimiter token here can overrun the real terminator and
+            // erase later executable commands.
+            if result.is_empty() {
+                result = command[..body_start].to_string();
+            } else {
+                result.push_str(&command[pos..body_start]);
+            }
+            result.push_str(&mask_preserve_newlines(&command[body_start..body_end]));
+            pos = body_end;
+            continue;
+        }
+
+        // Not masking - copy everything up to and including <<
+        if result.is_empty() {
+            // First heredoc we're not masking - check if we need to start building result
+        } else {
+            result.push_str(&command[pos..heredoc_start + 2]);
+        }
+        pos = heredoc_start + 2;
     }
 
     if result.is_empty() {
         Cow::Borrowed(command)
     } else {
         Cow::Owned(result)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveHeredocBody {
+    HereString,
+    Heredoc {
+        body_start: usize,
+        body_end: usize,
+        delimiter_quoted: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveHeredoc {
+    operator_start: usize,
+    body: ActiveHeredocBody,
+}
+
+fn active_heredocs(command: &str) -> Option<Vec<ActiveHeredoc>> {
+    const MAX_HEREDOC_MASK_SOURCE_BYTES: usize = 256 * 1024;
+    if command.len() > MAX_HEREDOC_MASK_SOURCE_BYTES {
+        return None;
+    }
+
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    let mut heredocs = Vec::new();
+    let mut parse_error = false;
+    collect_active_heredocs(ast.root(), &mut heredocs, &mut parse_error);
+    if parse_error {
+        return active_indent_stripped_heredoc_fallback(command);
+    }
+    heredocs.sort_by_key(|heredoc| heredoc.operator_start);
+    heredocs.dedup_by_key(|heredoc| heredoc.operator_start);
+    Some(heredocs)
+}
+
+/// tree-sitter-bash deliberately rejects Ruby's `<<~` heredoc operator even
+/// though dcg's tier-2 extractor supports it for embedded Ruby/documentation
+/// workflows. Preserve that established masking behavior only when the input
+/// has exactly one heredoc-like operator and the quote-aware trigger scanner
+/// proves it is active shell syntax. Ambiguous multi-operator parse failures
+/// remain unmasked so malformed input cannot erase later executable text.
+fn active_indent_stripped_heredoc_fallback(command: &str) -> Option<Vec<ActiveHeredoc>> {
+    if command.match_indices("<<").count() != 1 || !contains_active_heredoc_operator(command) {
+        return None;
+    }
+
+    let extracted = match extract_content(command, &ExtractionLimits::default()) {
+        ExtractionResult::Extracted(extracted) | ExtractionResult::Partial { extracted, .. } => {
+            extracted
+        }
+        ExtractionResult::NoContent
+        | ExtractionResult::Skipped(_)
+        | ExtractionResult::Failed(_) => return None,
+    };
+    let mut candidates = extracted.into_iter().filter(|content| {
+        content.heredoc_type == Some(HeredocType::IndentStripped) && content.content_range.is_some()
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let body_range = candidate.content_range?;
+    Some(vec![ActiveHeredoc {
+        operator_start: candidate.byte_range.start,
+        body: ActiveHeredocBody::Heredoc {
+            body_start: body_range.start,
+            body_end: body_range.end,
+            delimiter_quoted: candidate.quoted,
+        },
+    }])
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn collect_active_heredocs<D: ast_grep_core::Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    heredocs: &mut Vec<ActiveHeredoc>,
+    parse_error: &mut bool,
+) {
+    let kind = node.kind();
+    if kind == "ERROR" {
+        *parse_error = true;
+        return;
+    }
+    if kind == "herestring_redirect" {
+        let text = node.text();
+        if let Some(offset) = text.find("<<") {
+            heredocs.push(ActiveHeredoc {
+                operator_start: node.range().start + offset,
+                body: ActiveHeredocBody::HereString,
+            });
+        } else {
+            *parse_error = true;
+        }
+        return;
+    }
+    if kind == "heredoc_redirect" {
+        let text = node.text();
+        let Some(offset) = text.find("<<") else {
+            *parse_error = true;
+            return;
+        };
+        let mut body_range = None;
+        let mut end_start = None;
+        // tree-sitter-bash exposes the normalized delimiter as
+        // `heredoc_start`; its node text does not retain the quote or
+        // backslash bytes that suppress expansion. Inspect the redirect
+        // header itself so `<<'EOF'`, `<<\"EOF\"`, and `<<E\\OF` remain
+        // distinguishable from an expanding `<<EOF` body.
+        let header = text
+            .split_once(['\r', '\n'])
+            .map_or_else(|| text.as_ref(), |(line, _)| line);
+        let mut delimiter_quoted = header.contains(['\'', '"', '\\']);
+        for child in node.children() {
+            match child.kind().as_ref() {
+                "heredoc_body" => body_range = Some(child.range()),
+                "heredoc_end" => end_start = Some(child.range().start),
+                "heredoc_start" => {
+                    delimiter_quoted |= child.text().contains(['\'', '"', '\\']);
+                }
+                _ => {}
+            }
+        }
+        let body_range =
+            body_range.or_else(|| end_start.map(|start| std::ops::Range { start, end: start }));
+        let Some(body_range) = body_range else {
+            *parse_error = true;
+            return;
+        };
+        if body_range.start > body_range.end || body_range.end > node.range().end {
+            *parse_error = true;
+            return;
+        }
+        heredocs.push(ActiveHeredoc {
+            operator_start: node.range().start + offset,
+            body: ActiveHeredocBody::Heredoc {
+                body_start: body_range.start,
+                body_end: body_range.end,
+                delimiter_quoted,
+            },
+        });
+        return;
+    }
+    for child in node.children() {
+        collect_active_heredocs(child, heredocs, parse_error);
     }
 }
 
@@ -2348,120 +2964,6 @@ fn mask_preserve_newlines(input: &str) -> String {
         }
     }
     String::from_utf8(out).unwrap_or_default()
-}
-
-/// Parse a heredoc delimiter after the << operator.
-/// Returns (delimiter, `body_start_offset`, `heredoc_type`) if successful.
-fn parse_heredoc_delimiter(after_op: &str) -> Option<(String, usize, HeredocType)> {
-    let trimmed = after_op.trim_start_matches([' ', '\t']);
-    let skip_whitespace = after_op.len() - trimmed.len();
-
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    // `<<-` strips leading tabs from each body line (bash); `<<~` is the
-    // Ruby-style "squiggly" heredoc that strips the common leading
-    // indentation. Both accept an optional run of whitespace before the
-    // delimiter (e.g. `cat <<- 'EOF'` is valid). Without consuming that
-    // whitespace, the delimiter parser falls through to the unquoted branch
-    // with a leading space and bails — the heredoc body then escapes masking
-    // and pack matching denies prose like "gh repo delete" inside
-    // `cat <<- 'EOF'` (issue #109).
-    //
-    // The marker MUST be adjacent to `<<` (no whitespace between them).
-    // `cat << -EOF` is bash-legal as a Standard heredoc whose delimiter is
-    // the literal `-EOF`; the `-` is part of the delimiter token rather
-    // than a tab-strip marker. We disambiguate by checking that no leading
-    // whitespace was consumed before the candidate marker character.
-    //
-    // We must distinguish `-` from `~` here because the heredoc body
-    // terminator is matched by [`find_heredoc_terminator`] using the type:
-    // `TabStripped` strips only tabs, while `IndentStripped` strips all
-    // leading whitespace. Conflating the two means a `<<~` heredoc with
-    // space-indented terminator (`  EOF`) is never recognized, the body
-    // escapes masking, and pack matching produces false positives on
-    // documentation prose. The regex-based extractor in [`extract_heredocs`]
-    // already maps `~` to `IndentStripped`; this path must agree.
-    let (heredoc_type, marker_len) = if skip_whitespace == 0 {
-        match trimmed.as_bytes().first() {
-            Some(b'-') => (HeredocType::TabStripped, 1),
-            Some(b'~') => (HeredocType::IndentStripped, 1),
-            _ => (HeredocType::Standard, 0),
-        }
-    } else {
-        (HeredocType::Standard, 0)
-    };
-
-    let after_marker = &trimmed[marker_len..];
-    let after_marker_trimmed = after_marker.trim_start_matches([' ', '\t']);
-    let inter_whitespace = after_marker.len() - after_marker_trimmed.len();
-    let delim_chars = after_marker_trimmed;
-
-    // Handle quoted delimiters
-    let (delimiter, delim_len) = if let Some(stripped) = delim_chars.strip_prefix('"') {
-        // Find closing quote
-        let end = stripped.find('"')?;
-        let (body, _) = stripped.split_at(end);
-        (body.to_string(), end + 2)
-    } else if let Some(stripped) = delim_chars.strip_prefix('\'') {
-        // Find closing quote
-        let end = stripped.find('\'')?;
-        let (body, _) = stripped.split_at(end);
-        (body.to_string(), end + 2)
-    } else {
-        // Unquoted - extract word
-        let end = delim_chars
-            .find(|c: char| c.is_whitespace() || c == '\n' || c == ';' || c == '&' || c == '|')
-            .unwrap_or(delim_chars.len());
-        if end == 0 {
-            return None;
-        }
-        (delim_chars[..end].to_string(), end)
-    };
-
-    // Calculate total offset to body start (skip to newline)
-    let total_delim_offset = skip_whitespace + marker_len + inter_whitespace + delim_len;
-    let remaining = &after_op[total_delim_offset..];
-
-    // Find the newline that starts the body
-    let newline_offset = remaining.find('\n').map_or(remaining.len(), |i| i + 1);
-
-    Some((delimiter, total_delim_offset + newline_offset, heredoc_type))
-}
-
-/// Find the end of a heredoc body (position after the terminating delimiter line).
-fn find_heredoc_terminator(
-    command: &str,
-    body_start: usize,
-    delimiter: &str,
-    heredoc_type: HeredocType,
-) -> Option<usize> {
-    if body_start >= command.len() {
-        return None;
-    }
-
-    let body = &command[body_start..];
-    let mut line_start = 0;
-
-    for line in body.split_inclusive('\n') {
-        let trimmed = match heredoc_type {
-            HeredocType::TabStripped => line.trim_start_matches('\t'),
-            HeredocType::IndentStripped => line.trim_start(),
-            HeredocType::Standard | HeredocType::HereString => line,
-        };
-
-        let line_content = trimmed.trim_end_matches(['\n', '\r']);
-
-        if line_content == delimiter {
-            // Found terminator - return position after this line
-            return Some(body_start + line_start + line.len());
-        }
-
-        line_start += line.len();
-    }
-
-    None
 }
 
 /// Find the bounds of a here-string's content (start and end byte positions).
@@ -2684,6 +3186,114 @@ pub struct ExtractedShellCommand {
     pub end: usize,
     /// 1-based line number.
     pub line_number: usize,
+}
+
+/// Extract executable POSIX command-substitution bodies with the Bash parser.
+///
+/// A hand-written parenthesis scanner cannot soundly distinguish the closing
+/// delimiter from `)` in comments, nested groups, `case` patterns, functions,
+/// or nested substitutions inside double quotes. Tree-sitter-bash already
+/// models those grammar rules, so the evaluator uses this bounded AST view for
+/// security decisions. Any recovery/error node fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PosixCommandSubstitution {
+    /// Command body after removing the outer `$()` or backtick delimiters.
+    pub body: String,
+    /// Start byte of the complete substitution in the parsed source.
+    pub start: usize,
+    /// Exclusive end byte of the complete substitution in the parsed source.
+    pub end: usize,
+}
+
+/// The Bash AST could not provide complete, non-overlapping source ranges for
+/// every POSIX command substitution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PosixCommandSubstitutionParseError;
+
+pub fn extract_posix_command_substitutions(
+    content: &str,
+) -> Result<Vec<PosixCommandSubstitution>, PosixCommandSubstitutionParseError> {
+    // Keep the common evaluator path independent of tree-sitter. Backticks
+    // and `$(` are the only POSIX command-substitution introducers; arithmetic
+    // expansion may pass this prefilter, but the AST will not classify it as a
+    // command substitution.
+    if content.trim().is_empty() || (!content.contains("$(") && !content.contains('`')) {
+        return Ok(Vec::new());
+    }
+    const MAX_SUBSTITUTION_SOURCE_BYTES: usize = 256 * 1024;
+    if content.len() > MAX_SUBSTITUTION_SOURCE_BYTES {
+        return Err(PosixCommandSubstitutionParseError);
+    }
+
+    let ast = AstGrep::new(content, SupportLang::Bash);
+    let root = ast.root();
+    let mut substitutions = Vec::new();
+    let mut parse_error = false;
+    collect_command_substitutions_recursive(root, &mut substitutions, &mut parse_error);
+    if parse_error {
+        Err(PosixCommandSubstitutionParseError)
+    } else {
+        substitutions.sort_by(|left, right| {
+            left.start
+                .cmp(&right.start)
+                .then_with(|| right.end.cmp(&left.end))
+        });
+        Ok(substitutions)
+    }
+}
+
+pub fn extract_posix_command_substitution_bodies(
+    content: &str,
+) -> Result<Vec<String>, PosixCommandSubstitutionParseError> {
+    extract_posix_command_substitutions(content).map(|substitutions| {
+        substitutions
+            .into_iter()
+            .map(|substitution| substitution.body)
+            .collect()
+    })
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    substitutions: &mut Vec<PosixCommandSubstitution>,
+    parse_error: &mut bool,
+) {
+    let kind = node.kind();
+    if kind == "ERROR" {
+        *parse_error = true;
+    } else if kind == "command_substitution" {
+        let text = node.text();
+        let text = text.as_ref();
+        let body = text
+            .strip_prefix("$(")
+            .and_then(|inner| inner.strip_suffix(')'))
+            .or_else(|| {
+                text.strip_prefix('`')
+                    .and_then(|inner| inner.strip_suffix('`'))
+            });
+        if let Some(body) = body {
+            // Backquoted substitutions escape nested backticks as `\``. The
+            // nested shell parse sees those as executable delimiters after the
+            // outer backquote layer is removed, so expose them to recursion.
+            let range = node.range();
+            substitutions.push(PosixCommandSubstitution {
+                body: body.replace("\\`", "`"),
+                start: range.start,
+                end: range.end,
+            });
+        } else {
+            *parse_error = true;
+        }
+        // The evaluator recursively parses each captured body. Descending here
+        // would emit nested substitutions twice and make deeply nested input
+        // grow exponentially across recursion levels.
+        return;
+    }
+
+    for child in node.children() {
+        collect_command_substitutions_recursive(child, substitutions, parse_error);
+    }
 }
 
 /// Extract executable shell commands from heredoc/script content.
@@ -3087,6 +3697,18 @@ mod tests {
     mod tier2_extraction {
         use super::*;
 
+        /// Run semantic extraction assertions with enough budget to remain
+        /// deterministic when the full test matrix saturates the host. Tests
+        /// that deliberately set a non-default timeout (including the zero-ms
+        /// timeout contract) retain that exact value.
+        fn extract_content(command: &str, limits: &ExtractionLimits) -> ExtractionResult {
+            let mut test_limits = *limits;
+            if test_limits.timeout_ms == ExtractionLimits::default().timeout_ms {
+                test_limits.timeout_ms = 5_000;
+            }
+            super::super::extract_content(command, &test_limits)
+        }
+
         #[test]
         fn extraction_limits_default() {
             let limits = ExtractionLimits::default();
@@ -3159,7 +3781,11 @@ mod tests {
 
         #[test]
         fn extracts_cmd_slash_c_unquoted_rest_of_line() {
-            let result = extract_content(r"cmd /c del /s /q C:\src", &ExtractionLimits::default());
+            let mut limits = ExtractionLimits::default();
+            // Assert Windows wrapper semantics independently of the production
+            // 50 ms scheduler budget under a highly parallel all-target run.
+            limits.timeout_ms = 5_000;
+            let result = extract_content(r"cmd /c del /s /q C:\src", &limits);
             let ExtractionResult::Extracted(contents) = result else {
                 panic!("expected Extracted");
             };
@@ -3194,6 +3820,11 @@ mod tests {
         fn extracts_powershell_encoded_command_base64_utf16le() {
             // base64(UTF-16LE("Remove-Item -Recurse -Force C:\src"))
             let enc = "UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=";
+            let mut limits = ExtractionLimits::default();
+            // This is a decoder contract test; leave production's 50 ms limit
+            // intact while preventing parallel scheduler contention from
+            // converting the semantic result into a timeout.
+            limits.timeout_ms = 5_000;
             for cmd in [
                 format!("powershell -EncodedCommand {enc}"),
                 format!("powershell -enc {enc}"),
@@ -3204,7 +3835,7 @@ mod tests {
                 format!("powershell -WindowStyle Hidden -nop -enc {enc}"),
                 format!("pwsh -ExecutionPolicy Bypass -NoProfile -e {enc}"),
             ] {
-                let result = extract_content(&cmd, &ExtractionLimits::default());
+                let result = extract_content(&cmd, &limits);
                 let ExtractionResult::Extracted(contents) = result else {
                     panic!("expected Extracted for {cmd}");
                 };
@@ -3475,7 +4106,15 @@ mod tests {
             // Codex's exact Windows command_execution shape: a quoted absolute
             // path to powershell.exe followed by -Command and the inner command.
             let cmd = "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -Command 'echo hi'";
-            let result = extract_content(cmd, &ExtractionLimits::default());
+            // This test asserts extraction metadata, not the production
+            // deadline. Give it a deterministic budget under parallel test
+            // scheduler pressure; dedicated timeout tests cover the 50 ms
+            // default and bounded fallback behavior.
+            let limits = ExtractionLimits {
+                timeout_ms: 5_000,
+                ..ExtractionLimits::default()
+            };
+            let result = extract_content(cmd, &limits);
             if let ExtractionResult::Extracted(contents) = result {
                 assert!(
                     contents
@@ -4905,6 +5544,21 @@ fi"#;
             "hash-object --stdin body should be masked: {m3:?}"
         );
 
+        // A Git shell alias inherits stdin and may execute the body. Neither
+        // `--stdin` nor message-style `-F -` can turn an unknown/aliased
+        // subcommand into a proven data sink.
+        for aliased in [
+            "git -c 'alias.x=!bash -s --' x --stdin <<'EOF'\nrm -r ./tree\nEOF",
+            "git -c 'alias.x=!bash -s --' x -F - <<'EOF'\nrm -r ./tree\nEOF",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!bash -s --' git x --stdin <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            let masked = mask_non_executing_heredocs(aliased);
+            assert!(
+                masked.contains("rm -r ./tree"),
+                "Git aliases must never make executable stdin look like inert data: {masked:?}"
+            );
+        }
+
         // Conservative: a bare `git commit <<EOF` (no stdin sentinel) is NOT masked.
         let c4 = "git commit <<EOF\nrestore\nEOF";
         let m4 = mask_non_executing_heredocs(c4);
@@ -4968,12 +5622,28 @@ EOF";
             "the owning command must remain scannable: {masked:?}"
         );
 
-        let wrapped = "env SPX_FORMAT=json /usr/local/bin/spx session handoff <<EOF\n\
+        let wrapped = "env SPX_FORMAT=json /usr/bin/spx session handoff <<EOF\n\
 git restore --worktree .\n\
 EOF";
         assert!(
-            !mask_non_executing_heredocs(wrapped).contains("restore"),
-            "env/path wrappers must preserve the exact handoff data-sink contract"
+            mask_non_executing_heredocs(wrapped).contains("restore"),
+            "an env wrapper invalidates even a trusted path's stdin-data contract"
+        );
+
+        let arbitrary_path = "/usr/local/bin/spx session handoff <<EOF\n\
+git restore --worktree .\n\
+EOF";
+        assert!(
+            mask_non_executing_heredocs(arbitrary_path).contains("restore"),
+            "an arbitrary executable path cannot establish the spx handoff contract"
+        );
+
+        let trusted_path = "/usr/bin/spx session handoff <<EOF\n\
+git restore --worktree .\n\
+EOF";
+        assert!(
+            !mask_non_executing_heredocs(trusted_path).contains("restore"),
+            "a direct trusted spx path preserves the exact handoff data-sink contract"
         );
 
         let other = "spx session run <<EOF\ngit restore --worktree .\nEOF";
@@ -5074,5 +5744,179 @@ EOF";
             !m2.contains(&rmrf),
             "cat's own same-line heredoc body should still be masked: {m2:?}"
         );
+    }
+
+    #[test]
+    fn inert_heredoc_text_cannot_mask_later_executable_lines() {
+        let command = "printf '%s\\n' \"<<'EOF'\"\necho \"$(rm -r ./tree)\"\nEOF";
+        let masked = mask_non_executing_heredocs(command);
+        assert!(
+            masked.contains("rm -r ./tree"),
+            "quoted text that resembles a heredoc operator is data, not a masking boundary: {masked:?}"
+        );
+
+        let real_data = "cat <<'EOF'\nrm -r ./tree\nEOF";
+        assert!(
+            !mask_non_executing_heredocs(real_data).contains("rm -r ./tree"),
+            "an AST-proven quoted cat heredoc remains inert data"
+        );
+        assert!(
+            !mask_non_expanding_data_heredocs(real_data).contains("rm -r ./tree"),
+            "an AST-proven quoted cat heredoc suppresses command substitution"
+        );
+
+        for command in [
+            "cat <<'E'OF >/dev/null\ndata\nEOF\necho \"$(rm -r ./tree)\"\nE",
+            "cat <<E\\OF >/dev/null\ndata\nEOF\necho \"$(rm -r ./tree)\"\nE\\OF",
+        ] {
+            let masked = mask_non_executing_heredocs(command);
+            assert!(
+                masked.contains("rm -r ./tree"),
+                "shell quote-removal in a delimiter must not extend the authoritative AST body span: {masked:?}"
+            );
+        }
+
+        for command in [
+            "cat() { bash -s; }\ncat <<'EOF'\nrm -r ./tree\nEOF",
+            "alias cat='bash -s'\ncat <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            let masked = mask_non_executing_heredocs(command);
+            assert!(
+                masked.contains("rm -r ./tree"),
+                "a visible function/alias can replace a nominal data sink and execute stdin: {masked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_shell_state_keeps_bare_data_sink_body_visible() {
+        let destructive = "rm -r ./tree";
+        for command in [
+            "eval 'cat(){ bash -s; }'; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "source ./runtime-bindings.sh; cat <<'EOF'\nrm -r ./tree\nEOF",
+            ". ./runtime-bindings.sh; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "cat() { bash -s; }\ncat <<'EOF'\nrm -r ./tree\nEOF",
+            "alias cat='bash -s'\ncat <<'EOF'\nrm -r ./tree\nEOF",
+            "binding='cat=bash -s'; alias \"$binding\"\ncat <<'EOF'\nrm -r ./tree\nEOF",
+            "install_bindings() { source ./runtime-bindings.sh; }\ninstall_bindings\ncat <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            let fully_masked = mask_non_executing_heredocs(command);
+            assert!(
+                fully_masked.contains(destructive),
+                "runtime shell state can make a bare data-sink name execute stdin: {fully_masked:?}"
+            );
+
+            let expansion_masked = mask_non_expanding_data_heredocs(command);
+            assert!(
+                expansion_masked.contains(destructive),
+                "quoted-delimiter masking must fail closed after runtime name mutation: {expansion_masked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_os_data_sink_paths_are_not_shadowed_by_shell_name_state() {
+        for command in [
+            "eval 'cat(){ bash -s; }'; /bin/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "source ./runtime-bindings.sh; /usr/bin/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "cat <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            assert!(
+                !mask_non_executing_heredocs(command).contains("rm -r ./tree"),
+                "a normal bare sink or exact trusted OS path retains data-only masking: {command:?}"
+            );
+            assert!(
+                !mask_non_expanding_data_heredocs(command).contains("rm -r ./tree"),
+                "quoted data sent to a proven cat sink remains inert: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arbitrary_path_qualified_data_sink_names_may_execute_stdin() {
+        for command in [
+            "./cat <<'EOF'\nrm -r ./tree\nEOF",
+            "bin/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "/tmp/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "/usr/local/bin/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "/bin/../tmp/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "/bin//cat <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            assert!(
+                mask_non_executing_heredocs(command).contains("rm -r ./tree"),
+                "a basename does not prove an arbitrary executable consumes stdin as data: {command:?}"
+            );
+            assert!(
+                mask_non_expanding_data_heredocs(command).contains("rm -r ./tree"),
+                "quoted-delimiter masking must reject untrusted executable paths: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_and_command_resolution_mutations_keep_bare_sink_body_visible() {
+        for command in [
+            "PATH=/tmp:$PATH cat <<'EOF'\nrm -r ./tree\nEOF",
+            "PATH=/tmp:$PATH; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "export PATH=/tmp:$PATH; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "env PATH=/tmp:$PATH cat <<'EOF'\nrm -r ./tree\nEOF",
+            "hash -p /tmp/cat cat; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "enable -f /tmp/cat.so cat; cat <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            assert!(
+                mask_non_executing_heredocs(command).contains("rm -r ./tree"),
+                "visible command-resolution mutation invalidates a bare data-sink proof: {command:?}"
+            );
+            assert!(
+                mask_non_expanding_data_heredocs(command).contains("rm -r ./tree"),
+                "quoted-delimiter masking must fail closed after command-resolution mutation: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrapper_bearing_data_sink_targets_are_never_masked() {
+        for command in [
+            "sudo() { bash -s; }\nsudo cat <<'EOF'\nrm -r ./tree\nEOF",
+            "alias env='bash -s'\nenv cat <<'EOF'\nrm -r ./tree\nEOF",
+            "PATH=/tmp:$PATH sudo cat <<'EOF'\nrm -r ./tree\nEOF",
+            "sudo /bin/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "env /usr/bin/cat <<'EOF'\nrm -r ./tree\nEOF",
+            "nohup cat <<'EOF'\nrm -r ./tree\nEOF",
+            "command cat <<'EOF'\nrm -r ./tree\nEOF",
+            "builtin cat <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            assert!(
+                mask_non_executing_heredocs(command).contains("rm -r ./tree"),
+                "a skipped wrapper invalidates the final sink's data-only contract: {command:?}"
+            );
+            assert!(
+                mask_non_expanding_data_heredocs(command).contains("rm -r ./tree"),
+                "quoted-delimiter masking must retain wrapper-bearing stdin: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_mutator_text_does_not_disable_data_sink_masking() {
+        for command in [
+            "printf '%s\\n' \"eval 'cat(){ bash -s; }'\"; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "printf '%s\\n' 'source ./runtime-bindings.sh; . ./other.sh'; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "printf '%s\\n' \"alias cat='bash -s'\"; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "printf '%s\\n' 'PATH=/tmp; export PATH=/tmp; env PATH=/tmp cat; hash -p /tmp/cat cat; enable -f /tmp/cat.so cat'; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "printf '%s\\n' 'sudo cat; env cat; nohup cat; command cat; builtin cat'; cat <<'EOF'\nrm -r ./tree\nEOF",
+            "# eval 'cat(){ bash -s; }'\ncat <<'EOF'\nrm -r ./tree\nEOF",
+            "# PATH=/tmp; export PATH=/tmp; hash -p /tmp/cat cat\ncat <<'EOF'\nrm -r ./tree\nEOF",
+            "# sudo /bin/cat; env /usr/bin/cat\ncat <<'EOF'\nrm -r ./tree\nEOF",
+        ] {
+            assert!(
+                !mask_non_executing_heredocs(command).contains("rm -r ./tree"),
+                "quoted/commented/unexecuted mutator text is not visible shell state: {command:?}"
+            );
+            assert!(
+                !mask_non_expanding_data_heredocs(command).contains("rm -r ./tree"),
+                "literal mutator words must not cause an obvious masking false positive: {command:?}"
+            );
+        }
     }
 }

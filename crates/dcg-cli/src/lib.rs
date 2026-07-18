@@ -11,7 +11,7 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                        Configuration                             │
-//! │  (env vars → project config → user config → system → defaults)  │
+//! │ (env → explicit → user → system → defaults; repo hardening only)│
 //! └─────────────────────────────────────────────────────────────────┘
 //!                                  │
 //!                                  ▼
@@ -201,10 +201,10 @@ pub use stats::{
 
 // Re-export performance budget types
 pub use perf::{
-    ABSOLUTE_MAX, Budget, BudgetStatus, Deadline, FAIL_OPEN_THRESHOLD_MS, FAST_PATH,
-    FAST_PATH_BUDGET_US, FULL_HEREDOC_PIPELINE, HEREDOC_EXTRACT, HEREDOC_TRIGGER,
-    HOOK_EVALUATION_BUDGET, HOOK_EVALUATION_BUDGET_MS, LANGUAGE_DETECT, PATTERN_MATCH,
-    QUICK_REJECT, SLOW_PATH_BUDGET_MS, should_fail_open,
+    ABSOLUTE_MAX, Budget, BudgetStatus, Deadline, FAST_PATH, FAST_PATH_BUDGET_US,
+    FULL_HEREDOC_PIPELINE, HEREDOC_EXTRACT, HEREDOC_TRIGGER, HOOK_EVALUATION_BUDGET,
+    HOOK_EVALUATION_BUDGET_MS, LANGUAGE_DETECT, PATTERN_MATCH, QUICK_REJECT, SLOW_PATH_BUDGET_MS,
+    exceeds_absolute_budget,
 };
 
 // Re-export normalize types for wrapper stripping

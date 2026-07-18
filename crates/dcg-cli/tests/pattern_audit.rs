@@ -365,6 +365,7 @@ fn test_audit_backtracking_requirements() {
                 "redis-scan",
             ]),
         ),
+        ("database.sqlite", HashSet::new()),
         ("dns.generic", HashSet::from(["dns-dig-safe"])),
         (
             "dns.cloudflare",
@@ -1012,7 +1013,11 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "windows.filesystem",
-            HashSet::from(["whatif-preview", "remove-item-recurse-force"]),
+            HashSet::from([
+                "whatif-preview",
+                "remove-item-recurse",
+                "remove-item-recurse-force",
+            ]),
         ),
         ("windows.misc", HashSet::from(["robocopy-mirror"])),
         (

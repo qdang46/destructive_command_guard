@@ -115,6 +115,12 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
             continue;
         }
 
+        if let Some((remaining, wrapper)) = strip_execution_wrapper(&current) {
+            stripped_wrappers.push(wrapper);
+            current = remaining;
+            continue;
+        }
+
         if let Some((remaining, wrapper)) = strip_leading_backslash(&current) {
             stripped_wrappers.push(wrapper);
             current = remaining;
@@ -770,6 +776,131 @@ fn strip_command_wrapper(command: &str) -> Option<(String, StrippedWrapper)> {
     ))
 }
 
+/// Strip POSIX execution wrappers that synchronously execute a following
+/// command: `exec`, `nohup`, and `time`.
+///
+/// Only options with unambiguous operand arity are accepted. Unknown options,
+/// informational modes, dynamic option values, and missing commands leave the
+/// input unchanged rather than guessing where the executable begins.
+fn strip_execution_wrapper(command: &str) -> Option<(String, StrippedWrapper)> {
+    let trimmed = command.trim_start();
+    let first_word_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let first_word = &trimmed[..first_word_end];
+    let basename = first_word.rsplit('/').next().unwrap_or(first_word);
+    if !matches!(basename, "exec" | "nohup" | "time") {
+        return None;
+    }
+
+    let rest = trimmed[first_word.len()..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut index = 0usize;
+    let consume_value = |mut index: usize| -> Option<usize> {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        let end = consume_word_token(bytes, index, bytes.len());
+        (!token_has_inline_code(&bytes[index..end])).then_some(end)
+    };
+
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return None;
+        }
+        let word_end = consume_word_token(bytes, index, bytes.len());
+        let word = &rest[index..word_end];
+        if word == "--" {
+            index = word_end;
+            break;
+        }
+        if word == "-" || !word.starts_with('-') {
+            break;
+        }
+        if token_has_inline_code(word.as_bytes()) {
+            return None;
+        }
+
+        match basename {
+            "exec" => {
+                if word == "-a" {
+                    index = consume_value(word_end)?;
+                } else if word[1..].chars().all(|flag| matches!(flag, 'c' | 'l')) {
+                    index = word_end;
+                } else {
+                    return None;
+                }
+            }
+            "nohup" => {
+                // GNU nohup has only informational options; a leading-dash
+                // command must be introduced by `--`.
+                return None;
+            }
+            "time" => {
+                if matches!(word, "--help" | "--version" | "-V") {
+                    return None;
+                }
+                if matches!(
+                    word,
+                    "-a" | "--append"
+                        | "-p"
+                        | "--portability"
+                        | "-q"
+                        | "--quiet"
+                        | "-v"
+                        | "--verbose"
+                ) {
+                    index = word_end;
+                } else if matches!(word, "-f" | "--format" | "-o" | "--output") {
+                    index = consume_value(word_end)?;
+                } else if word.starts_with("--format=")
+                    || word.starts_with("--output=")
+                    || word.len() > 2 && matches!(word.as_bytes()[1], b'f' | b'o')
+                    || word[1..]
+                        .chars()
+                        .all(|flag| matches!(flag, 'a' | 'p' | 'q' | 'v'))
+                {
+                    index = word_end;
+                } else {
+                    return None;
+                }
+            }
+            _ => unreachable!("wrapper basename was validated above"),
+        }
+    }
+
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    let remaining = &rest[index..];
+    if remaining.is_empty() || starts_with_shell_redirection(remaining) {
+        return None;
+    }
+    let stripped_text = trimmed[..trimmed.len() - remaining.len()]
+        .trim_end()
+        .to_string();
+    let wrapper_type = match basename {
+        "exec" => "exec",
+        "nohup" => "nohup",
+        "time" => "time",
+        _ => unreachable!("wrapper basename was validated above"),
+    };
+    Some((
+        remaining.to_string(),
+        StrippedWrapper {
+            wrapper_type,
+            stripped_text,
+        },
+    ))
+}
+
 pub(crate) fn starts_with_shell_redirection(s: &str) -> bool {
     let bytes = s.trim_start().as_bytes();
     if bytes.is_empty() {
@@ -1006,6 +1137,946 @@ impl NormalizeToken {
 }
 
 pub type NormalizeTokens = SmallVec<[NormalizeToken; 16]>;
+
+/// The shell syntax that produced a raw command token.
+///
+/// This is intentionally explicit rather than auto-detected: the caller owns
+/// the trustworthy execution context (hook, shell adapter, or test harness),
+/// while a command string alone is inherently ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellDialect {
+    Posix,
+    PowerShell,
+    Cmd,
+    Unknown,
+}
+
+/// Whether a raw token is shell syntax or opaque user data.
+///
+/// Only syntax tokens may be decoded. In particular, option values that happen
+/// to contain backticks or carets must be passed as [`Self::Data`] so their
+/// bytes remain exactly as supplied by the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellTokenRole {
+    Syntax,
+    Data,
+}
+
+/// Stateful, token-level shell syntax decoder.
+///
+/// The state is needed only for PowerShell's `--%` stop-parsing token. Create a
+/// decoder per command segment. A syntax token whose decoded value is `--%`
+/// (including quoted forms) is consumed as shell control syntax
+/// ([`Self::decode`] returns `None`); subsequent tokens are still returned as
+/// parser-visible tokens, but byte-for-byte because PowerShell no longer
+/// interprets their shell syntax. POSIX syntax-role tokens decode only
+/// deterministic quote/escape syntax; unknown and data-role input deliberately
+/// remain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShellTokenDecoder {
+    dialect: ShellDialect,
+    powershell_stop_parsing: bool,
+}
+
+impl ShellTokenDecoder {
+    #[must_use]
+    pub(crate) const fn new(dialect: ShellDialect) -> Self {
+        Self {
+            dialect,
+            powershell_stop_parsing: false,
+        }
+    }
+
+    /// Decode one raw token according to its parser role.
+    ///
+    /// PowerShell backticks escape the following character outside
+    /// single-quoted verbatim strings, including inside double quotes. A
+    /// backtick immediately before LF or CRLF is a line continuation and both
+    /// are removed. Cmd carets remove exactly one escape layer outside double
+    /// quotes; carets inside double quotes are literal. POSIX decoding handles
+    /// ordinary quote/backslash concatenation plus Bash ANSI-C and locale
+    /// quoting, while preserving unresolved expansions. Data tokens are never
+    /// decoded by any dialect.
+    ///
+    /// `None` means that the token is shell-only control syntax and must not be
+    /// passed to the downstream argv parser. Currently this is returned only
+    /// for a PowerShell syntax token whose decoded value is `--%`. Callers must
+    /// continue parsing later tokens: after `--%`, an exact `--delete` remains
+    /// visible to Git, while an escaped-looking ``--d`elete`` remains literal.
+    #[must_use]
+    pub(crate) fn decode<'a>(
+        &mut self,
+        token: &'a str,
+        role: ShellTokenRole,
+    ) -> Option<Cow<'a, str>> {
+        if role == ShellTokenRole::Data {
+            return Some(Cow::Borrowed(token));
+        }
+
+        match self.dialect {
+            ShellDialect::Posix => Some(decode_posix_syntax_token(token)),
+            ShellDialect::Unknown => Some(Cow::Borrowed(token)),
+            ShellDialect::PowerShell => {
+                if self.powershell_stop_parsing {
+                    return Some(Cow::Borrowed(token));
+                }
+                let decoded = decode_powershell_syntax_token(token);
+                if decoded.as_ref() == "--%" {
+                    self.powershell_stop_parsing = true;
+                    return None;
+                }
+                Some(decoded)
+            }
+            ShellDialect::Cmd => Some(decode_cmd_syntax_token(token)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PosixQuote {
+    Unquoted,
+    Single,
+    Double,
+}
+
+fn decode_posix_syntax_token(token: &str) -> Cow<'_, str> {
+    if !token
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'\'' | b'"' | b'\\' | b'$' | b'`' | b'<' | b'>'))
+    {
+        return Cow::Borrowed(token);
+    }
+
+    let mut output = String::with_capacity(token.len());
+    let mut chars = token.chars().peekable();
+    let mut quote = PosixQuote::Unquoted;
+    let mut changed = false;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            PosixQuote::Single => {
+                if ch == '\'' {
+                    quote = PosixQuote::Unquoted;
+                    changed = true;
+                } else {
+                    output.push(ch);
+                }
+            }
+            PosixQuote::Double => match ch {
+                '"' => {
+                    quote = PosixQuote::Unquoted;
+                    changed = true;
+                }
+                '\\' => {
+                    let Some(escaped) = chars.next() else {
+                        return Cow::Borrowed(token);
+                    };
+                    match escaped {
+                        '\n' => changed = true,
+                        '\r' if chars.peek() == Some(&'\n') => {
+                            chars.next();
+                            changed = true;
+                        }
+                        '$' | '`' | '"' | '\\' => {
+                            output.push(escaped);
+                            changed = true;
+                        }
+                        other => {
+                            // POSIX retains a backslash before characters that
+                            // are not special inside double quotes.
+                            output.push('\\');
+                            output.push(other);
+                        }
+                    }
+                }
+                '$' => return Cow::Borrowed(token),
+                '`' => return Cow::Borrowed(token),
+                other => output.push(other),
+            },
+            PosixQuote::Unquoted => match ch {
+                '\'' => {
+                    quote = PosixQuote::Single;
+                    changed = true;
+                }
+                '"' => {
+                    quote = PosixQuote::Double;
+                    changed = true;
+                }
+                '\\' => {
+                    let Some(escaped) = chars.next() else {
+                        return Cow::Borrowed(token);
+                    };
+                    changed = true;
+                    match escaped {
+                        '\n' => {}
+                        '\r' if chars.peek() == Some(&'\n') => {
+                            chars.next();
+                        }
+                        other => output.push(other),
+                    }
+                }
+                '$' if chars.peek() == Some(&'\'') => {
+                    chars.next();
+                    if decode_ansi_c_quoted(&mut chars, &mut output).is_err() {
+                        return Cow::Borrowed(token);
+                    }
+                    changed = true;
+                }
+                '$' if chars.peek() == Some(&'"') => {
+                    // Bash locale-translation quoting has double-quote shell
+                    // semantics after translation. Literal option spellings
+                    // are deterministic; nested expansions still fail open.
+                    chars.next();
+                    quote = PosixQuote::Double;
+                    changed = true;
+                }
+                '$' => return Cow::Borrowed(token),
+                '`' => return Cow::Borrowed(token),
+                '<' | '>' if chars.peek() == Some(&'(') => return Cow::Borrowed(token),
+                other => output.push(other),
+            },
+        }
+    }
+
+    if quote != PosixQuote::Unquoted {
+        return Cow::Borrowed(token);
+    }
+
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(token)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvalidAnsiCQuote;
+
+fn decode_ansi_c_quoted(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    output: &mut String,
+) -> Result<(), InvalidAnsiCQuote> {
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            return Ok(());
+        }
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+
+        let escaped = chars.next().ok_or(InvalidAnsiCQuote)?;
+        match escaped {
+            '\n' => {}
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+            }
+            'a' => output.push('\u{0007}'),
+            'b' => output.push('\u{0008}'),
+            'e' | 'E' => output.push('\u{001b}'),
+            'f' => output.push('\u{000c}'),
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            'v' => output.push('\u{000b}'),
+            '\\' | '\'' | '"' | '?' => output.push(escaped),
+            'c' => {
+                let control = chars.next().ok_or(InvalidAnsiCQuote)?;
+                if !control.is_ascii() {
+                    return Err(InvalidAnsiCQuote);
+                }
+                let byte = control as u8;
+                let value = if byte == b'?' {
+                    0x7f
+                } else {
+                    byte.to_ascii_uppercase() & 0x1f
+                };
+                if value == 0 {
+                    return discard_ansi_c_quote_tail(chars);
+                }
+                output.push(char::from(value));
+            }
+            'x' => {
+                let value = consume_radix_digits(chars, 16, 2).ok_or(InvalidAnsiCQuote)?;
+                if value == 0 {
+                    return discard_ansi_c_quote_tail(chars);
+                }
+                if value > u32::from(u8::MAX) {
+                    return Err(InvalidAnsiCQuote);
+                }
+                output.push(char::from_u32(value).ok_or(InvalidAnsiCQuote)?);
+            }
+            'u' => {
+                let value = consume_radix_digits(chars, 16, 4).ok_or(InvalidAnsiCQuote)?;
+                if value == 0 {
+                    return discard_ansi_c_quote_tail(chars);
+                }
+                output.push(char::from_u32(value).ok_or(InvalidAnsiCQuote)?);
+            }
+            'U' => {
+                let value = consume_radix_digits(chars, 16, 8).ok_or(InvalidAnsiCQuote)?;
+                if value == 0 {
+                    return discard_ansi_c_quote_tail(chars);
+                }
+                output.push(char::from_u32(value).ok_or(InvalidAnsiCQuote)?);
+            }
+            first @ '0'..='7' => {
+                let mut value = first.to_digit(8).ok_or(InvalidAnsiCQuote)?;
+                for _ in 0..2 {
+                    let Some(next) = chars.peek().copied() else {
+                        break;
+                    };
+                    let Some(digit) = next.to_digit(8) else {
+                        break;
+                    };
+                    chars.next();
+                    value = value
+                        .checked_mul(8)
+                        .and_then(|n| n.checked_add(digit))
+                        .ok_or(InvalidAnsiCQuote)?;
+                }
+                if value == 0 {
+                    return discard_ansi_c_quote_tail(chars);
+                }
+                if value > u32::from(u8::MAX) {
+                    return Err(InvalidAnsiCQuote);
+                }
+                output.push(char::from_u32(value).ok_or(InvalidAnsiCQuote)?);
+            }
+            other => {
+                // Bash preserves the backslash for unknown ANSI-C escapes.
+                output.push('\\');
+                output.push(other);
+            }
+        }
+    }
+
+    Err(InvalidAnsiCQuote)
+}
+
+/// Bash strings cannot contain NUL. Within `$'...'`, the first decoded NUL
+/// truncates that quoted segment's value, while parsing still continues to its
+/// closing quote and any later concatenated shell text remains significant.
+fn discard_ansi_c_quote_tail(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> Result<(), InvalidAnsiCQuote> {
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                chars.next().ok_or(InvalidAnsiCQuote)?;
+            }
+            '\'' => return Ok(()),
+            _ => {}
+        }
+    }
+    Err(InvalidAnsiCQuote)
+}
+
+fn consume_radix_digits(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    radix: u32,
+    max_digits: usize,
+) -> Option<u32> {
+    let mut value = 0u32;
+    let mut consumed = 0usize;
+    while consumed < max_digits {
+        let digit = chars.peek().and_then(|ch| ch.to_digit(radix));
+        let Some(digit) = digit else {
+            break;
+        };
+        chars.next();
+        value = value.checked_mul(radix)?.checked_add(digit)?;
+        consumed += 1;
+    }
+    (consumed > 0).then_some(value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellQuote {
+    Unquoted,
+    Single,
+    Double,
+}
+
+fn decode_powershell_syntax_token(token: &str) -> Cow<'_, str> {
+    if !token
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'\'' | b'"' | b'`'))
+    {
+        return Cow::Borrowed(token);
+    }
+
+    let mut output = String::with_capacity(token.len());
+    let mut chars = token.chars().peekable();
+    let mut quote = PowerShellQuote::Unquoted;
+    let mut changed = false;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            PowerShellQuote::Single => {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        // PowerShell represents a literal apostrophe inside a
+                        // single-quoted string by doubling it.
+                        chars.next();
+                        output.push('\'');
+                    } else {
+                        quote = PowerShellQuote::Unquoted;
+                    }
+                    changed = true;
+                } else {
+                    // Backticks are ordinary bytes in verbatim single quotes.
+                    output.push(ch);
+                }
+            }
+            PowerShellQuote::Unquoted | PowerShellQuote::Double => match ch {
+                '\'' if quote == PowerShellQuote::Unquoted => {
+                    quote = PowerShellQuote::Single;
+                    changed = true;
+                }
+                '"' => {
+                    quote = if quote == PowerShellQuote::Double {
+                        PowerShellQuote::Unquoted
+                    } else {
+                        PowerShellQuote::Double
+                    };
+                    changed = true;
+                }
+                '`' => {
+                    let Some(escaped) = chars.next() else {
+                        // A trailing backtick is incomplete syntax. Preserve
+                        // the entire raw token and fail open.
+                        return Cow::Borrowed(token);
+                    };
+                    changed = true;
+                    match escaped {
+                        '\n' => {}
+                        '\r' if chars.peek() == Some(&'\n') => {
+                            chars.next();
+                        }
+                        other => output.push(other),
+                    }
+                }
+                other => output.push(other),
+            },
+        }
+    }
+
+    if quote != PowerShellQuote::Unquoted {
+        // Do not reinterpret malformed/incomplete quoting.
+        return Cow::Borrowed(token);
+    }
+
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(token)
+    }
+}
+
+fn decode_cmd_syntax_token(token: &str) -> Cow<'_, str> {
+    if !token
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'"' | b'^'))
+    {
+        return Cow::Borrowed(token);
+    }
+
+    let mut output = String::with_capacity(token.len());
+    let mut chars = token.chars().peekable();
+    let mut in_double_quotes = false;
+    let mut changed = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_double_quotes = !in_double_quotes;
+                changed = true;
+            }
+            '^' if !in_double_quotes => {
+                let Some(escaped) = chars.next() else {
+                    // A trailing caret is incomplete syntax. Preserve the
+                    // entire raw token and fail open.
+                    return Cow::Borrowed(token);
+                };
+                changed = true;
+                match escaped {
+                    '\n' => {}
+                    '\r' if chars.peek() == Some(&'\n') => {
+                        chars.next();
+                    }
+                    other => output.push(other),
+                }
+            }
+            other => output.push(other),
+        }
+    }
+
+    if in_double_quotes {
+        // Do not reinterpret malformed/incomplete quoting.
+        return Cow::Borrowed(token);
+    }
+
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(token)
+    }
+}
+
+/// Tokenize a command while preserving every raw token's byte span.
+///
+/// POSIX and unknown input deliberately use the established normalizer
+/// tokenizer unchanged. PowerShell and Cmd need dialect-specific scanners so
+/// their escape characters can keep whitespace, line continuations, and shell
+/// metacharacters inside the same raw word. No token text is decoded here;
+/// callers can slice the original command through [`NormalizeToken::text`] and
+/// pass syntax-role words to [`ShellTokenDecoder::decode`].
+///
+/// PowerShell's `--%` token remains present as a raw word for the decoder to
+/// consume. Until the next physical newline or unquoted pipeline (`|`, `|&`,
+/// or `||`), semicolons and other shell metacharacters are kept in raw words;
+/// native-argument whitespace and quote grouping are still tokenized
+/// conservatively. The pipeline/newline is emitted as a separator and normal
+/// PowerShell tokenization resumes after it.
+#[must_use]
+pub(crate) fn tokenize_for_shell_dialect(command: &str, dialect: ShellDialect) -> NormalizeTokens {
+    match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => tokenize_for_normalization(command),
+        ShellDialect::PowerShell => tokenize_powershell_raw(command),
+        ShellDialect::Cmd => tokenize_cmd_raw(command),
+    }
+}
+
+fn tokenize_powershell_raw(command: &str) -> NormalizeTokens {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let mut tokens = NormalizeTokens::new();
+    let mut i = 0usize;
+    let mut literal_mode = false;
+
+    while i < len {
+        i = skip_shell_horizontal_whitespace(bytes, i, len);
+        if i >= len {
+            break;
+        }
+
+        // A backtick immediately followed by a physical newline is a
+        // PowerShell line continuation, not an argv word.  When it occurs at
+        // a token boundary (for example, `& ` followed by `` `\r\n $block``),
+        // consuming it as a zero-width decoded Word hides the real operand
+        // from callers that intentionally inspect the next syntax token.
+        // Continuations embedded inside a word remain part of that raw word
+        // and are decoded by `ShellTokenDecoder` below.
+        if !literal_mode
+            && bytes.get(i) == Some(&b'`')
+            && let Some(end) = powershell_line_continuation_end(bytes, i, len)
+        {
+            i = end;
+            continue;
+        }
+
+        if let Some(end) = consume_raw_newline(bytes, i, len, &mut tokens) {
+            // PowerShell's stop-parsing mode ends at the physical newline.
+            literal_mode = false;
+            i = end;
+            continue;
+        }
+
+        if !literal_mode {
+            if let Some(end) = consume_powershell_separator(bytes, i, len, &mut tokens) {
+                i = end;
+                continue;
+            }
+        } else if let Some(end) = powershell_pipeline_end(bytes, i, len) {
+            i = push_raw_separator(&mut tokens, i, end);
+            literal_mode = false;
+            continue;
+        }
+
+        let start = i;
+        i = if literal_mode {
+            consume_powershell_literal_word(bytes, i, len)
+        } else {
+            consume_powershell_word(bytes, i, len)
+        };
+
+        if start == i {
+            // Defensive progress guarantee for malformed or future syntax.
+            i += 1;
+            continue;
+        }
+
+        tokens.push(NormalizeToken {
+            kind: NormalizeTokenKind::Word,
+            byte_range: start..i,
+        });
+
+        if !literal_mode {
+            let raw = &command[start..i];
+            // PowerShell recognizes stop-parsing by the token's decoded value:
+            // quoted `"--%"` and `'--%'` behave the same as bare `--%`.
+            if decode_powershell_syntax_token(raw).as_ref() == "--%" {
+                literal_mode = true;
+            }
+        }
+    }
+
+    tokens
+}
+
+#[inline]
+fn powershell_line_continuation_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'`') {
+        return None;
+    }
+    match bytes.get(i + 1) {
+        Some(b'\n') => Some(i + 2),
+        Some(b'\r') if i + 2 < len && bytes.get(i + 2) == Some(&b'\n') => Some(i + 3),
+        _ => None,
+    }
+}
+
+#[inline]
+fn cmd_line_continuation_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'^') {
+        return None;
+    }
+    raw_newline_end(bytes, i + 1, len)
+}
+
+fn tokenize_cmd_raw(command: &str) -> NormalizeTokens {
+    let bytes = command.as_bytes();
+    let len = bytes.len();
+    let mut tokens = NormalizeTokens::new();
+    let mut i = 0usize;
+
+    while i < len {
+        i = skip_shell_horizontal_whitespace(bytes, i, len);
+        if i >= len {
+            break;
+        }
+
+        // Like PowerShell's backtick continuation, a caret-newline at a
+        // token boundary is shell syntax rather than an empty argv word.
+        if let Some(end) = cmd_line_continuation_end(bytes, i, len) {
+            i = end;
+            continue;
+        }
+
+        if let Some(end) = consume_raw_newline(bytes, i, len, &mut tokens) {
+            i = end;
+            continue;
+        }
+        if let Some(end) = consume_cmd_separator(bytes, i, len, &mut tokens) {
+            i = end;
+            continue;
+        }
+
+        let start = i;
+        i = consume_cmd_word(bytes, i, len);
+        if start == i {
+            // Defensive progress guarantee for malformed or future syntax.
+            i += 1;
+            continue;
+        }
+        tokens.push(NormalizeToken {
+            kind: NormalizeTokenKind::Word,
+            byte_range: start..i,
+        });
+    }
+
+    tokens
+}
+
+#[inline]
+fn skip_shell_horizontal_whitespace(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    while i < len && bytes[i].is_ascii_whitespace() && !matches!(bytes[i], b'\r' | b'\n') {
+        i += 1;
+    }
+    i
+}
+
+fn consume_raw_newline(
+    bytes: &[u8],
+    i: usize,
+    len: usize,
+    tokens: &mut NormalizeTokens,
+) -> Option<usize> {
+    let end = raw_newline_end(bytes, i, len)?;
+    tokens.push(NormalizeToken {
+        kind: NormalizeTokenKind::Separator,
+        byte_range: i..end,
+    });
+    Some(end)
+}
+
+#[inline]
+fn raw_newline_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
+    match bytes.get(i)? {
+        b'\r' if i + 1 < len && bytes[i + 1] == b'\n' => Some(i + 2),
+        b'\r' | b'\n' => Some(i + 1),
+        _ => None,
+    }
+}
+
+fn push_raw_separator(tokens: &mut NormalizeTokens, start: usize, end: usize) -> usize {
+    tokens.push(NormalizeToken {
+        kind: NormalizeTokenKind::Separator,
+        byte_range: start..end,
+    });
+    end
+}
+
+fn consume_powershell_separator(
+    bytes: &[u8],
+    i: usize,
+    len: usize,
+    tokens: &mut NormalizeTokens,
+) -> Option<usize> {
+    let end = match bytes[i] {
+        b'|' if i + 1 < len && matches!(bytes[i + 1], b'|' | b'&') => i + 2,
+        b'|' | b'&' if i + 1 < len && bytes[i + 1] == bytes[i] => i + 2,
+        b'&' if i + 1 < len && bytes[i + 1] == b'>' => return None,
+        b'|' | b'&' | b';' | b'(' | b')' => i + 1,
+        _ => return None,
+    };
+    Some(push_raw_separator(tokens, i, end))
+}
+
+fn consume_cmd_separator(
+    bytes: &[u8],
+    i: usize,
+    len: usize,
+    tokens: &mut NormalizeTokens,
+) -> Option<usize> {
+    let end = match bytes[i] {
+        b'|' | b'&' if i + 1 < len && bytes[i + 1] == bytes[i] => i + 2,
+        b'|' | b'&' | b'(' | b')' => i + 1,
+        _ => return None,
+    };
+    Some(push_raw_separator(tokens, i, end))
+}
+
+#[inline]
+fn consume_shell_escape(bytes: &[u8], i: usize, len: usize) -> usize {
+    // Both PowerShell's backtick and Cmd's caret consume a CRLF physical
+    // newline as one continuation unit.  Consuming only the escape plus `\r`
+    // would expose the remaining `\n` as a command boundary and split a word
+    // that the shell joins.  LF-only continuations already take the ordinary
+    // two-byte path.
+    if i + 2 < len && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+        i + 3
+    } else {
+        (i + 2).min(len)
+    }
+}
+
+fn consume_powershell_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    let mut quote = PowerShellQuote::Unquoted;
+
+    while i < len {
+        let byte = bytes[i];
+        match quote {
+            PowerShellQuote::Unquoted => {
+                if byte.is_ascii_whitespace() || powershell_separator_end(bytes, i, len).is_some() {
+                    break;
+                }
+                match byte {
+                    b'`' => i = consume_shell_escape(bytes, i, len),
+                    b'@' => {
+                        i = consume_powershell_here_string(bytes, i, len).unwrap_or(i + 1);
+                    }
+                    b'\'' => {
+                        quote = PowerShellQuote::Single;
+                        i += 1;
+                    }
+                    b'"' => {
+                        quote = PowerShellQuote::Double;
+                        i += 1;
+                    }
+                    _ => i += 1,
+                }
+            }
+            PowerShellQuote::Single => {
+                if byte == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 2;
+                    } else {
+                        quote = PowerShellQuote::Unquoted;
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            PowerShellQuote::Double => match byte {
+                b'`' => i = consume_shell_escape(bytes, i, len),
+                b'"' => {
+                    quote = PowerShellQuote::Unquoted;
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+        }
+    }
+
+    i
+}
+
+/// Consume a PowerShell single- or double-quoted here-string as one raw word.
+///
+/// A here-string header is `@'` or `@"`, followed only by horizontal
+/// whitespace and a physical newline. Its closing mark is the matching quote
+/// plus `@` at the start of a later line; PowerShell does not permit the
+/// closing mark to be indented. Quotes and separators in the body are literal
+/// to this tokenizer. If a syntactically valid header has no closing mark, the
+/// rest of the input is kept in one word so malformed input cannot expose
+/// body text as executable command segments.
+fn consume_powershell_here_string(bytes: &[u8], start: usize, len: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'@') {
+        return None;
+    }
+    let quote = *bytes.get(start + 1)?;
+    if !matches!(quote, b'\'' | b'"') {
+        return None;
+    }
+
+    let header_newline = skip_powershell_header_whitespace(bytes, start + 2, len);
+    let mut line_start = raw_newline_end(bytes, header_newline, len)?;
+
+    while line_start < len {
+        if bytes.get(line_start) == Some(&quote) && bytes.get(line_start + 1) == Some(&b'@') {
+            return Some(line_start + 2);
+        }
+
+        let mut newline_start = line_start;
+        while newline_start < len && !matches!(bytes[newline_start], b'\r' | b'\n') {
+            newline_start += 1;
+        }
+        let Some(next_line_start) = raw_newline_end(bytes, newline_start, len) else {
+            return Some(len);
+        };
+        line_start = next_line_start;
+    }
+
+    Some(len)
+}
+
+fn skip_powershell_header_whitespace(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    while i < len {
+        let width = match bytes[i] {
+            0x00..=0x7f => 1,
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => break,
+        };
+        let Some(encoded) = bytes.get(i..i + width) else {
+            break;
+        };
+        let Ok(encoded) = std::str::from_utf8(encoded) else {
+            break;
+        };
+        let Some(character) = encoded.chars().next() else {
+            break;
+        };
+        if matches!(character, '\r' | '\n') || !character.is_whitespace() {
+            break;
+        }
+        i += character.len_utf8();
+    }
+    i
+}
+
+fn powershell_separator_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
+    match bytes[i] {
+        b'|' if i + 1 < len && matches!(bytes[i + 1], b'|' | b'&') => Some(i + 2),
+        b'|' | b'&' if i + 1 < len && bytes[i + 1] == bytes[i] => Some(i + 2),
+        b'&' if i + 1 < len && bytes[i + 1] == b'>' => None,
+        b'|' | b'&' | b';' | b'(' | b')' => Some(i + 1),
+        _ => None,
+    }
+}
+
+fn consume_powershell_literal_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    let mut quote: Option<u8> = None;
+
+    while i < len {
+        let byte = bytes[i];
+        if matches!(byte, b'\r' | b'\n') {
+            break;
+        }
+        if quote.is_none() {
+            if byte.is_ascii_whitespace() || powershell_pipeline_end(bytes, i, len).is_some() {
+                break;
+            }
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = if quote == Some(byte) {
+                None
+            } else if quote.is_none() {
+                Some(byte)
+            } else {
+                quote
+            };
+        }
+        i += 1;
+    }
+
+    i
+}
+
+fn powershell_pipeline_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
+    if bytes[i] != b'|' {
+        return None;
+    }
+    Some(if i + 1 < len && matches!(bytes[i + 1], b'|' | b'&') {
+        i + 2
+    } else {
+        i + 1
+    })
+}
+
+fn consume_cmd_word(bytes: &[u8], mut i: usize, len: usize) -> usize {
+    let mut in_double_quotes = false;
+
+    while i < len {
+        let byte = bytes[i];
+        if !in_double_quotes {
+            if byte.is_ascii_whitespace() || cmd_separator_end(bytes, i, len).is_some() {
+                break;
+            }
+            match byte {
+                b'^' => i = consume_shell_escape(bytes, i, len),
+                b'"' => {
+                    in_double_quotes = true;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        } else if byte == b'"' {
+            in_double_quotes = false;
+            i += 1;
+        } else {
+            // Carets are literal inside Cmd double quotes.
+            i += 1;
+        }
+    }
+
+    i
+}
+
+fn cmd_separator_end(bytes: &[u8], i: usize, len: usize) -> Option<usize> {
+    match bytes[i] {
+        b'|' | b'&' if i + 1 < len && bytes[i + 1] == bytes[i] => Some(i + 2),
+        b'|' | b'&' | b'(' | b')' => Some(i + 1),
+        _ => None,
+    }
+}
 
 #[must_use]
 pub fn tokenize_for_normalization(command: &str) -> NormalizeTokens {
@@ -1732,6 +2803,107 @@ pub fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Decode caller-proven shell syntax only at executable command positions.
+///
+/// Bash ANSI-C quoting is executable syntax, not opaque text: for example,
+/// `$'\x72\x6d' -rf /` invokes `rm`. Decoding every token globally would be
+/// incorrect, however, because the same bytes can be inert data (`echo
+/// $'rm -rf /'`). This pass therefore follows the same wrapper/assignment
+/// state machine as [`dequote_segment_command_words`] and rewrites only words
+/// that the shell will resolve as executables. Escape decoding itself is
+/// linear in the token length, and numeric escapes consume a fixed,
+/// shell-defined maximum number of digits.
+fn decode_segment_command_words_in_dialect(command: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    if !command.contains("$'") {
+        return Cow::Borrowed(command);
+    }
+
+    // `$'...'` is a strong, self-identifying POSIX/Bash syntax signal. CLI
+    // inspection commands do not carry a hook-proven dialect, so Unknown may
+    // decode this one bounded construct at executable positions. Explicit
+    // PowerShell and Cmd envelopes must never be reinterpreted as POSIX.
+    let decode_dialect = match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => ShellDialect::Posix,
+        ShellDialect::PowerShell | ShellDialect::Cmd => return Cow::Borrowed(command),
+    };
+
+    let tokens = tokenize_for_shell_dialect(command, decode_dialect);
+    if tokens.is_empty() {
+        return Cow::Borrowed(command);
+    }
+
+    let mut replacements: Vec<(Range<usize>, String)> = Vec::new();
+    let mut segment_has_command = false;
+    let mut wrapper = NormalizeWrapper::None;
+    let mut decoder = ShellTokenDecoder::new(decode_dialect);
+
+    for token in &tokens {
+        if token.kind == NormalizeTokenKind::Separator {
+            segment_has_command = false;
+            wrapper = NormalizeWrapper::None;
+            decoder = ShellTokenDecoder::new(decode_dialect);
+            continue;
+        }
+        if segment_has_command {
+            continue;
+        }
+
+        let Some(raw) = token.text(command) else {
+            return Cow::Borrowed(command);
+        };
+        let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+            continue;
+        };
+        let word = decoded.as_ref();
+
+        if matches!(wrapper, NormalizeWrapper::CommandQuery) {
+            segment_has_command = true;
+            wrapper = NormalizeWrapper::None;
+            continue;
+        }
+        if wrapper.should_skip_token(word) {
+            wrapper = wrapper.advance(word);
+            continue;
+        }
+        if !matches!(wrapper, NormalizeWrapper::None) {
+            wrapper = NormalizeWrapper::None;
+        }
+        if let Some(next_wrapper) = NormalizeWrapper::from_command_word(word) {
+            wrapper = next_wrapper;
+            if word != raw {
+                replacements.push((token.byte_range.clone(), word.to_string()));
+            }
+            continue;
+        }
+        if is_env_assignment(word) {
+            continue;
+        }
+
+        segment_has_command = true;
+        if word != raw {
+            replacements.push((token.byte_range.clone(), word.to_string()));
+        }
+    }
+
+    if replacements.is_empty() {
+        return Cow::Borrowed(command);
+    }
+
+    let mut output = String::with_capacity(command.len());
+    let mut last = 0usize;
+    for (range, replacement) in replacements {
+        if range.start > last {
+            output.push_str(&command[last..range.start]);
+        }
+        output.push_str(&replacement);
+        last = range.end;
+    }
+    if last < command.len() {
+        output.push_str(&command[last..]);
+    }
+    Cow::Owned(output)
+}
+
 /// Try to normalize a command using path normalizers.
 ///
 /// Tries `PATH_NORMALIZER` first (for unquoted paths), then `QUOTED_PATH_NORMALIZER`
@@ -1748,41 +2920,54 @@ fn apply_path_normalizers(base: &str) -> Option<String> {
     None
 }
 
+fn normalize_decoded_command(command: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    let decoded = decode_segment_command_words_in_dialect(command, dialect);
+    match decoded {
+        Cow::Borrowed(base) => {
+            let dequoted = dequote_segment_command_words(base);
+            match &dequoted {
+                Cow::Borrowed(value) => {
+                    apply_path_normalizers(value).map_or_else(|| dequoted, Cow::Owned)
+                }
+                Cow::Owned(value) => {
+                    apply_path_normalizers(value).map_or_else(|| dequoted, Cow::Owned)
+                }
+            }
+        }
+        Cow::Owned(decoded) => {
+            let dequoted = dequote_segment_command_words(&decoded);
+            let base = dequoted.into_owned();
+            apply_path_normalizers(&base).map_or_else(|| Cow::Owned(base), Cow::Owned)
+        }
+    }
+}
+
+/// Normalize a command using a shell dialect proven by the caller.
+///
+/// Dialect-sensitive decoding is deliberately limited to executable command
+/// positions. Argument data retains its original bytes, while POSIX command
+/// names expressed with Bash ANSI-C quoting are decoded before keyword and
+/// destructive-pattern matching. An unknown dialect recognizes `$'...'` as a
+/// self-identifying POSIX syntax signal, which keeps direct CLI inspection in
+/// parity with hook evaluation without guessing about ordinary quote syntax.
+#[inline]
+#[must_use]
+pub fn normalize_command_in_dialect(cmd: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    let stripped = strip_wrapper_prefixes(cmd);
+    match stripped.normalized {
+        Cow::Borrowed(command) => normalize_decoded_command(command, dialect),
+        Cow::Owned(command) => {
+            Cow::Owned(normalize_decoded_command(&command, dialect).into_owned())
+        }
+    }
+}
+
 /// Normalize a command by stripping absolute paths from common binaries.
 ///
 /// Returns the original command unchanged if normalization fails (fail-open).
 #[inline]
 pub fn normalize_command(cmd: &str) -> Cow<'_, str> {
-    // 1. Strip wrappers (sudo, env, etc.)
-    let stripped = crate::normalize::strip_wrapper_prefixes(cmd);
-
-    match stripped.normalized {
-        Cow::Borrowed(original_slice) => {
-            // original_slice has lifetime 'a (from cmd)
-            let dequoted = dequote_segment_command_words(original_slice);
-            // dequoted has lifetime 'a.
-
-            // 3. Strip paths (try both normalizers)
-            match &dequoted {
-                Cow::Borrowed(base) => {
-                    apply_path_normalizers(base).map_or_else(|| dequoted, Cow::Owned)
-                }
-                Cow::Owned(base) => {
-                    apply_path_normalizers(base).map_or_else(|| dequoted, Cow::Owned)
-                }
-            }
-        }
-        Cow::Owned(local_string) => {
-            // local_string is local.
-            let dequoted = dequote_segment_command_words(&local_string);
-            // dequoted borrows from local_string.
-            // We MUST return Owned.
-            let base = dequoted.into_owned();
-
-            // 3. Strip paths (try both normalizers)
-            apply_path_normalizers(&base).map_or_else(|| Cow::Owned(base), Cow::Owned)
-        }
-    }
+    normalize_command_in_dialect(cmd, ShellDialect::Unknown)
 }
 
 /// Strip leading backslash from the first command token.
@@ -1828,6 +3013,24 @@ fn strip_leading_backslash(command: &str) -> Option<(String, StrippedWrapper)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn raw_token_snapshot(
+        command: &str,
+        dialect: ShellDialect,
+    ) -> Vec<(NormalizeTokenKind, String)> {
+        tokenize_for_shell_dialect(command, dialect)
+            .iter()
+            .map(|token| {
+                (
+                    token.kind,
+                    token
+                        .text(command)
+                        .expect("token range must slice its source command")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn test_sudo_simple() {
@@ -1876,6 +3079,504 @@ mod tests {
             .iter()
             .find(|tok| tok.kind == NormalizeTokenKind::Separator && tok.text(cmd) == Some("\n"));
         assert!(newline_token.is_some(), "Expected newline separator token");
+    }
+
+    #[test]
+    fn shell_decoder_preserves_unknown_syntax() {
+        let syntax_tokens = [r"g\it", r#""g\it""#, r"'g\it'", r"--d\elete"];
+
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::Unknown);
+        for token in syntax_tokens {
+            assert_eq!(
+                decoder.decode(token, ShellTokenRole::Syntax).as_deref(),
+                Some(token),
+                "unknown shell syntax must remain byte-preserving"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_decoder_handles_quote_concatenation_and_bash_ansi_c_options() {
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+        let cases = [
+            (r"g\it", "git"),
+            ("g'i't", "git"),
+            (r#""g"it"#, "git"),
+            ("$'-d'", "-d"),
+            ("-$'d'", "-d"),
+            ("$'--delete'", "--delete"),
+            ("--$'delete'", "--delete"),
+            ("g$'i't", "git"),
+            (r"$'\x2d\x64'", "-d"),
+            (r"$'\055d'", "-d"),
+            (r"$'\0123'", "\n3"),
+            (r"$'\u002d\u0064'", "-d"),
+            (r"$'\x72\x6d\x00ignored'", "rm"),
+            (r"$'\x72\x6d\c@ignored'", "rm"),
+            (r#"$"-d""#, "-d"),
+            (r#"$"--delete""#, "--delete"),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(
+                decoder.decode(raw, ShellTokenRole::Syntax).as_deref(),
+                Some(expected),
+                "POSIX syntax token {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_command_normalization_decodes_ansi_c_executables_but_not_data() {
+        let destructive = [
+            (r"$'\x72\x6d' -rf /", "rm -rf /"),
+            (r"$'\x72\x6d\0ignored' -rf /", "rm -rf /"),
+            (r"$'\162\155' -rf /", "rm -rf /"),
+            (r"$'\u0072\u006d' -rf /", "rm -rf /"),
+            (
+                r"$'\x64\x6f\x63\x6b\x65\x72' system prune -af",
+                "docker system prune -af",
+            ),
+            (
+                r"$'\x64\x6f\x63\x6b\x65\x72\x00ignored' system prune -af",
+                "docker system prune -af",
+            ),
+            (r"sudo $'\x72\x6d' -rf /", "rm -rf /"),
+            (r"echo ok; $'\x72\x6d' -rf /", "echo ok; rm -rf /"),
+        ];
+        for (raw, expected) in destructive {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                assert_eq!(
+                    normalize_command_in_dialect(raw, dialect),
+                    expected,
+                    "ANSI-C command syntax for {dialect:?}: {raw:?}"
+                );
+            }
+        }
+
+        let inert_data = r"echo $'\x72\x6d -rf /'";
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            assert_eq!(
+                normalize_command_in_dialect(inert_data, dialect),
+                inert_data,
+                "ANSI-C text passed as an argument must remain inert for {dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_decoder_preserves_data_and_unresolved_expansions() {
+        let data_tokens = [
+            "$'-d'",
+            "-$'d'",
+            "$'--delete'",
+            "--$'delete'",
+            "g$'i't",
+            r"$'\x2d\x64'",
+            r#"$"--delete""#,
+        ];
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+        for token in data_tokens {
+            assert_eq!(
+                decoder.decode(token, ShellTokenRole::Data).as_deref(),
+                Some(token),
+                "POSIX data token must remain byte-preserving"
+            );
+        }
+
+        for dynamic in [
+            "$branch",
+            "${branch}",
+            "$(printf -- -d)",
+            "`printf -- -d`",
+            r#"$"-$branch""#,
+        ] {
+            assert_eq!(
+                decoder.decode(dynamic, ShellTokenRole::Syntax).as_deref(),
+                Some(dynamic),
+                "unresolved expansion must fail open: {dynamic:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_dialect_tokenizer_delegates_posix_and_unknown_unchanged() {
+        let command = "git branch --format\\ -d && echo ok\nnext";
+        let baseline: Vec<_> = tokenize_for_normalization(command)
+            .iter()
+            .map(|token| {
+                (
+                    token.kind,
+                    token
+                        .text(command)
+                        .expect("baseline token must slice source")
+                        .to_string(),
+                )
+            })
+            .collect();
+
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            assert_eq!(raw_token_snapshot(command, dialect), baseline);
+        }
+    }
+
+    #[test]
+    fn powershell_raw_tokenizer_keeps_escaped_syntax_inside_words() {
+        let command = "g`it branch --de`\r\nlete feature` name foo`;bar ; echo";
+        assert_eq!(
+            raw_token_snapshot(command, ShellDialect::PowerShell),
+            vec![
+                (NormalizeTokenKind::Word, "g`it".to_string()),
+                (NormalizeTokenKind::Word, "branch".to_string()),
+                (NormalizeTokenKind::Word, "--de`\r\nlete".to_string()),
+                (NormalizeTokenKind::Word, "feature` name".to_string()),
+                (NormalizeTokenKind::Word, "foo`;bar".to_string()),
+                (NormalizeTokenKind::Separator, ";".to_string()),
+                (NormalizeTokenKind::Word, "echo".to_string()),
+            ]
+        );
+
+        let boundary_continuations = "& `\r\n $first; . `\n $second";
+        assert_eq!(
+            raw_token_snapshot(boundary_continuations, ShellDialect::PowerShell),
+            vec![
+                (NormalizeTokenKind::Separator, "&".to_string()),
+                (NormalizeTokenKind::Word, "$first".to_string()),
+                (NormalizeTokenKind::Separator, ";".to_string()),
+                (NormalizeTokenKind::Word, ".".to_string()),
+                (NormalizeTokenKind::Word, "$second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn powershell_here_strings_are_single_tokens_and_resume_after_terminator() {
+        let single_here_string =
+            "@'\u{00a0}\t\r\nIt's literal \u{2603}; Clear-Content hidden.txt\r\n'@";
+        let single_command =
+            format!("Write-Output {single_here_string}; Clear-Content visible.txt");
+        assert_eq!(
+            raw_token_snapshot(&single_command, ShellDialect::PowerShell),
+            vec![
+                (NormalizeTokenKind::Word, "Write-Output".to_string()),
+                (NormalizeTokenKind::Word, single_here_string.to_string()),
+                (NormalizeTokenKind::Separator, ";".to_string()),
+                (NormalizeTokenKind::Word, "Clear-Content".to_string()),
+                (NormalizeTokenKind::Word, "visible.txt".to_string()),
+            ]
+        );
+        assert_eq!(
+            crate::packs::split_command_segments_in_dialect(
+                &single_command,
+                ShellDialect::PowerShell,
+            ),
+            vec![
+                format!("Write-Output {single_here_string}"),
+                "Clear-Content visible.txt".to_string(),
+            ]
+        );
+
+        let double_here_string = "@\"\nA \"quoted\" body; git branch --delete hidden\n\"@";
+        let double_command = format!("Write-Output {double_here_string}; git branch -D visible");
+        assert_eq!(
+            raw_token_snapshot(&double_command, ShellDialect::PowerShell),
+            vec![
+                (NormalizeTokenKind::Word, "Write-Output".to_string()),
+                (NormalizeTokenKind::Word, double_here_string.to_string()),
+                (NormalizeTokenKind::Separator, ";".to_string()),
+                (NormalizeTokenKind::Word, "git".to_string()),
+                (NormalizeTokenKind::Word, "branch".to_string()),
+                (NormalizeTokenKind::Word, "-D".to_string()),
+                (NormalizeTokenKind::Word, "visible".to_string()),
+            ]
+        );
+        assert_eq!(
+            crate::packs::split_command_segments_in_dialect(
+                &double_command,
+                ShellDialect::PowerShell,
+            ),
+            vec![
+                format!("Write-Output {double_here_string}"),
+                "git branch -D visible".to_string(),
+            ]
+        );
+
+        let assigned_here_string = "@'\nvalue's apostrophe\n'@";
+        let assignment = format!("$value={assigned_here_string}; Clear-Content visible.txt");
+        assert_eq!(
+            raw_token_snapshot(&assignment, ShellDialect::PowerShell),
+            vec![
+                (
+                    NormalizeTokenKind::Word,
+                    format!("$value={assigned_here_string}"),
+                ),
+                (NormalizeTokenKind::Separator, ";".to_string()),
+                (NormalizeTokenKind::Word, "Clear-Content".to_string()),
+                (NormalizeTokenKind::Word, "visible.txt".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn powershell_malformed_here_strings_remain_opaque() {
+        let unterminated =
+            "Write-Output @'\nit's still body\n  '@; Clear-Content must-not-split.txt";
+        assert_eq!(
+            raw_token_snapshot(unterminated, ShellDialect::PowerShell),
+            vec![
+                (NormalizeTokenKind::Word, "Write-Output".to_string()),
+                (
+                    NormalizeTokenKind::Word,
+                    "@'\nit's still body\n  '@; Clear-Content must-not-split.txt".to_string(),
+                ),
+            ]
+        );
+        assert_eq!(
+            crate::packs::split_command_segments_in_dialect(unterminated, ShellDialect::PowerShell,),
+            vec![unterminated]
+        );
+    }
+
+    #[test]
+    fn powershell_here_string_detection_does_not_capture_other_at_forms() {
+        for command in [
+            "Write-Output @args; Clear-Content visible.txt",
+            "Write-Output @(1, 2); git branch -D visible",
+            "Write-Output @'same-line string'; Clear-Content visible.txt",
+        ] {
+            assert!(
+                raw_token_snapshot(command, ShellDialect::PowerShell)
+                    .iter()
+                    .any(|(kind, text)| *kind == NormalizeTokenKind::Separator && text == ";"),
+                "non-here-string @ form hid its following separator: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_raw_tokenizer_honors_stop_parsing_until_newline() {
+        let command = "git branch \"--%\" --delete \"feature name\" ; echo\r\nGet-Date; echo";
+        assert_eq!(
+            raw_token_snapshot(command, ShellDialect::PowerShell),
+            vec![
+                (NormalizeTokenKind::Word, "git".to_string()),
+                (NormalizeTokenKind::Word, "branch".to_string()),
+                (NormalizeTokenKind::Word, "\"--%\"".to_string()),
+                (NormalizeTokenKind::Word, "--delete".to_string()),
+                (NormalizeTokenKind::Word, "\"feature name\"".to_string()),
+                (NormalizeTokenKind::Word, ";".to_string()),
+                (NormalizeTokenKind::Word, "echo".to_string()),
+                (NormalizeTokenKind::Separator, "\r\n".to_string()),
+                (NormalizeTokenKind::Word, "Get-Date".to_string()),
+                (NormalizeTokenKind::Separator, ";".to_string()),
+                (NormalizeTokenKind::Word, "echo".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn powershell_stop_parsing_treats_semicolon_as_literal_and_pipe_as_boundary() {
+        for pipeline in ["|", "|&", "||"] {
+            let command = format!(
+                "git branch --% --delete \"feature;name|quoted\" ; literal {pipeline} echo ok"
+            );
+            assert_eq!(
+                raw_token_snapshot(&command, ShellDialect::PowerShell),
+                vec![
+                    (NormalizeTokenKind::Word, "git".to_string()),
+                    (NormalizeTokenKind::Word, "branch".to_string()),
+                    (NormalizeTokenKind::Word, "--%".to_string()),
+                    (NormalizeTokenKind::Word, "--delete".to_string()),
+                    (
+                        NormalizeTokenKind::Word,
+                        "\"feature;name|quoted\"".to_string()
+                    ),
+                    (NormalizeTokenKind::Word, ";".to_string()),
+                    (NormalizeTokenKind::Word, "literal".to_string()),
+                    (NormalizeTokenKind::Separator, pipeline.to_string()),
+                    (NormalizeTokenKind::Word, "echo".to_string()),
+                    (NormalizeTokenKind::Word, "ok".to_string()),
+                ],
+                "pipeline boundary {pipeline:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_raw_tokenizer_keeps_caret_escaped_bytes_inside_words() {
+        let command = "g^it branch -^d feature^ name foo^&bar & echo ^|literal g^\r\nit";
+        assert_eq!(
+            raw_token_snapshot(command, ShellDialect::Cmd),
+            vec![
+                (NormalizeTokenKind::Word, "g^it".to_string()),
+                (NormalizeTokenKind::Word, "branch".to_string()),
+                (NormalizeTokenKind::Word, "-^d".to_string()),
+                (NormalizeTokenKind::Word, "feature^ name".to_string()),
+                (NormalizeTokenKind::Word, "foo^&bar".to_string()),
+                (NormalizeTokenKind::Separator, "&".to_string()),
+                (NormalizeTokenKind::Word, "echo".to_string()),
+                (NormalizeTokenKind::Word, "^|literal".to_string()),
+                (NormalizeTokenKind::Word, "g^\r\nit".to_string()),
+            ]
+        );
+
+        let boundary_continuation = "& ^\r\n rd /s /q C:\\src";
+        assert_eq!(
+            raw_token_snapshot(boundary_continuation, ShellDialect::Cmd),
+            vec![
+                (NormalizeTokenKind::Separator, "&".to_string()),
+                (NormalizeTokenKind::Word, "rd".to_string()),
+                (NormalizeTokenKind::Word, "/s".to_string()),
+                (NormalizeTokenKind::Word, "/q".to_string()),
+                (NormalizeTokenKind::Word, "C:\\src".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn powershell_decoder_handles_bare_double_and_single_quoted_syntax() {
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+        let cases = [
+            ("git", "git"),
+            (r#""git""#, "git"),
+            ("'git'", "git"),
+            ("g`it", "git"),
+            (r#""g`it""#, "git"),
+            ("'g`it'", "g`it"),
+            ("--delete", "--delete"),
+            (r#""--delete""#, "--delete"),
+            ("'--delete'", "--delete"),
+            ("--d`elete", "--delete"),
+            (r#""--d`elete""#, "--delete"),
+            ("'--d`elete'", "--d`elete"),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(
+                decoder.decode(raw, ShellTokenRole::Syntax).as_deref(),
+                Some(expected),
+                "PowerShell syntax token {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_decoder_honors_continuations_and_stop_parsing() {
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+        assert_eq!(
+            decoder
+                .decode("g`\r\nit", ShellTokenRole::Syntax)
+                .as_deref(),
+            Some("git")
+        );
+        assert_eq!(
+            decoder
+                .decode("--de`\nlete", ShellTokenRole::Syntax)
+                .as_deref(),
+            Some("--delete")
+        );
+        assert_eq!(
+            decoder
+                .decode("'--de`\r\nlete'", ShellTokenRole::Syntax)
+                .as_deref(),
+            Some("--de`\r\nlete")
+        );
+
+        assert_eq!(decoder.decode("--%", ShellTokenRole::Syntax), None);
+        assert_eq!(
+            decoder
+                .decode("--delete", ShellTokenRole::Syntax)
+                .as_deref(),
+            Some("--delete"),
+            "exact options after --% must remain visible to Git"
+        );
+        assert_eq!(
+            decoder
+                .decode("--d`elete", ShellTokenRole::Syntax)
+                .as_deref(),
+            Some("--d`elete"),
+            "tokens after --% must remain literal"
+        );
+
+        for quoted_marker in [r#""--%""#, "'--%'"] {
+            let mut quoted_decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+            assert_eq!(
+                quoted_decoder.decode(quoted_marker, ShellTokenRole::Syntax),
+                None,
+                "PowerShell recognizes --% by decoded token value"
+            );
+            assert_eq!(
+                quoted_decoder
+                    .decode("g`it", ShellTokenRole::Syntax)
+                    .as_deref(),
+                Some("g`it"),
+                "quoted --% must arm literal mode just like bare --%"
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_decoder_removes_one_unquoted_caret_layer() {
+        let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+        let cases = [
+            ("git", "git"),
+            (r#""git""#, "git"),
+            ("'git'", "'git'"),
+            ("g^it", "git"),
+            (r#""g^it""#, "g^it"),
+            ("'g^it'", "'git'"),
+            ("--delete", "--delete"),
+            (r#""--delete""#, "--delete"),
+            ("'--delete'", "'--delete'"),
+            ("--d^elete", "--delete"),
+            (r#""--d^elete""#, "--d^elete"),
+            ("'--d^elete'", "'--delete'"),
+            ("g^^it", "g^it"),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(
+                decoder.decode(raw, ShellTokenRole::Syntax).as_deref(),
+                Some(expected),
+                "Cmd syntax token {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_decoder_never_changes_data_tokens_or_arms_stop_parsing() {
+        let data_tokens = [
+            "g`it",
+            r#""--d`elete""#,
+            "'--d`elete'",
+            "g^it",
+            r#""--d^elete""#,
+            "'--d^elete'",
+            "--%",
+        ];
+
+        for dialect in [
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+            ShellDialect::Unknown,
+        ] {
+            let mut decoder = ShellTokenDecoder::new(dialect);
+            for token in data_tokens {
+                assert_eq!(
+                    decoder.decode(token, ShellTokenRole::Data).as_deref(),
+                    Some(token),
+                    "{dialect:?} data token must be byte-preserving"
+                );
+            }
+            if dialect == ShellDialect::PowerShell {
+                assert_eq!(
+                    decoder.decode("g`it", ShellTokenRole::Syntax).as_deref(),
+                    Some("git"),
+                    "a data-role --% must not arm literal mode"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1975,6 +3676,45 @@ mod tests {
     fn test_backslash_git() {
         let result = strip_wrapper_prefixes("\\git reset --hard");
         assert_eq!(result.normalized, "git reset --hard");
+    }
+
+    #[test]
+    fn execution_wrappers_strip_only_unambiguous_command_forms() {
+        let cases = [
+            ("exec git reset --hard", "git reset --hard"),
+            ("exec -cl -a dcg git reset --hard", "git reset --hard"),
+            ("nohup -- git reset --hard", "git reset --hard"),
+            ("nohup git reset --hard", "git reset --hard"),
+            ("time -p git reset --hard", "git reset --hard"),
+            ("/usr/bin/time -v git reset --hard", "git reset --hard"),
+            (
+                "time --format=%E --output timing.txt git reset --hard",
+                "git reset --hard",
+            ),
+            (
+                "sudo env DCG=1 command exec nohup time git reset --hard",
+                "git reset --hard",
+            ),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(
+                strip_wrapper_prefixes(command).normalized,
+                expected,
+                "{command}"
+            );
+        }
+
+        for command in [
+            "exec -x git reset --hard",
+            "nohup --help git reset --hard",
+            "time --help git reset --hard",
+            "time --unknown git reset --hard",
+        ] {
+            assert!(
+                !strip_wrapper_prefixes(command).was_normalized(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

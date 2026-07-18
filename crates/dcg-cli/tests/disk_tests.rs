@@ -18,6 +18,10 @@ fn run_hook(command: &str) -> String {
 
     let mut child = Command::new(dcg_binary())
         .env("DCG_PACKS", "system.disk")
+        // Classification is the subject of these E2Es. Keep scheduler stalls
+        // on a saturated test host from exercising the separately unit-tested
+        // 200 ms fail-closed deadline policy instead.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

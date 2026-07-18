@@ -3,7 +3,7 @@
 //! This module defines explicit latency budgets for all dcg operations.
 //! These constants serve as the source of truth for:
 //! - CI benchmark enforcement (fail on regression)
-//! - Runtime fail-open thresholds (heredoc analysis)
+//! - Runtime bounded-evaluation thresholds (heredoc analysis)
 //! - Documentation and expectations
 //!
 //! # Budget Philosophy
@@ -11,7 +11,7 @@
 //! dcg runs on every Bash command, so performance is critical. We define:
 //! - **Target**: Expected p99 latency under normal conditions
 //! - **Warning**: Latency that triggers a CI warning
-//! - **Panic**: Latency that fails CI or triggers fail-open behavior
+//! - **Panic**: Latency that fails CI or triggers the bounded fallback policy
 //!
 //! # Performance Tiers
 //!
@@ -27,7 +27,8 @@
 //!
 //! # Absolute Maximum
 //!
-//! Any operation exceeding 200ms triggers fail-open behavior in hook mode.
+//! Hook evaluation exceeding 200ms returns an explicit indeterminate decision;
+//! it never turns incomplete analysis into a silent allow.
 //! This ensures dcg never blocks a user's workflow indefinitely.
 
 use std::time::{Duration, Instant};
@@ -39,7 +40,7 @@ pub struct Budget {
     pub target: Duration,
     /// Warning threshold (triggers CI warning).
     pub warning: Duration,
-    /// Panic threshold (fails CI, triggers fail-open).
+    /// Panic threshold for benchmark/CI budget assertions.
     pub panic: Duration,
 }
 
@@ -105,14 +106,15 @@ pub enum BudgetStatus {
 }
 
 // =============================================================================
-// Deadline Type (for fail-open budget enforcement)
+// Deadline Type (for bounded, conservative safety evaluation)
 // =============================================================================
 
-/// A deadline for operation completion, used for fail-open behavior.
+/// A deadline for bounded operation completion.
 ///
 /// The Deadline tracks when an operation started and how long it's allowed
-/// to run. When the deadline is exceeded, expensive operations should be
-/// skipped and the command allowed to proceed (fail-open).
+/// to run. Callers choose the policy for exhaustion. Hook evaluation must
+/// return an explicit indeterminate result so elapsed time is never mistaken
+/// for proof that a command is safe.
 ///
 /// # Example
 ///
@@ -123,7 +125,7 @@ pub enum BudgetStatus {
 /// let deadline = Deadline::new(Duration::from_millis(10));
 /// // ... perform operations ...
 /// if deadline.is_exceeded() {
-///     // Skip remaining analysis, fail-open
+///     // Stop remaining analysis and return the caller's bounded outcome.
 /// }
 /// ```
 #[derive(Debug, Clone, Copy)]
@@ -144,9 +146,9 @@ impl Deadline {
         }
     }
 
-    /// Create a deadline from the absolute maximum (fail-open threshold).
+    /// Create a deadline using the default absolute hook budget.
     #[must_use]
-    pub fn fail_open_default() -> Self {
+    pub fn hook_default() -> Self {
         Self::new(ABSOLUTE_MAX)
     }
 
@@ -268,27 +270,26 @@ pub const FULL_HEREDOC_PIPELINE: Budget = Budget::from_ms(
 );
 
 // =============================================================================
-// Absolute Maximum (Fail-Open Threshold)
+// Absolute Hook Evaluation Budget
 // =============================================================================
 
-/// Absolute maximum time before hook mode triggers fail-open.
-/// Any operation exceeding this duration allows the command to proceed.
-/// This ensures dcg never blocks a user's workflow indefinitely.
+/// Absolute maximum time available to hook safety evaluation.
+/// Exhaustion produces an explicit indeterminate result rather than an allow.
 pub const ABSOLUTE_MAX: Duration = Duration::from_millis(200);
 
 /// Hook evaluation time budget in milliseconds.
 ///
-/// This is the **fail-open** threshold for hook mode. Typical commands should
-/// complete in <10ms, but heredoc/inline-script analysis may take longer on
-/// pathological inputs; in those cases we fail open rather than break workflows.
+/// Typical commands should complete in <10ms, but heredoc/inline-script
+/// analysis may take longer on pathological inputs. Exhaustion is surfaced as
+/// indeterminate so clients can request review or block conservatively.
 pub const HOOK_EVALUATION_BUDGET_MS: u64 = 200;
 
 /// Hook evaluation time budget as a Duration.
 pub const HOOK_EVALUATION_BUDGET: Duration = Duration::from_millis(HOOK_EVALUATION_BUDGET_MS);
 
-/// Check if a duration should trigger fail-open behavior.
+/// Check whether a duration exceeds the absolute hook evaluation budget.
 #[must_use]
-pub fn should_fail_open(duration: Duration) -> bool {
+pub fn exceeds_absolute_budget(duration: Duration) -> bool {
     duration > ABSOLUTE_MAX
 }
 
@@ -300,21 +301,16 @@ pub fn should_fail_open(duration: Duration) -> bool {
 /// Commands exceeding this trigger CI failures.
 pub const FAST_PATH_BUDGET_US: u64 = 500;
 
-/// Hook-mode slow path fail-open budget in milliseconds.
+/// Hook-mode slow-path deadline in milliseconds.
 ///
 /// This mirrors the absolute hook deadline, not the Tier 6 benchmark panic
 /// threshold. Tier-specific heredoc budgets are defined above.
 pub const SLOW_PATH_BUDGET_MS: u64 = 200;
 
-/// Absolute maximum before fail-open (for documentation and config).
-pub const FAIL_OPEN_THRESHOLD_MS: u64 = 200;
-
 /// Minimum hook evaluation timeout in milliseconds.
 ///
-/// Prevents bypass via `hook_timeout_ms = 0` (or any absurdly small value)
-/// in config or `DCG_HOOK_TIMEOUT_MS=0` env var. A zero or near-zero timeout
-/// would cause `deadline_exceeded()` to immediately return true, allowing every
-/// command through without any safety checks.
+/// Prevents `hook_timeout_ms = 0` (or an absurdly small value) from forcing
+/// every request immediately into the indeterminate review/block path.
 ///
 /// 10ms is enough for the fast path (quick-reject + safe pattern matching)
 /// while being well below the default 200ms budget.
@@ -354,9 +350,9 @@ mod tests {
 
     #[test]
     fn fail_open_threshold() {
-        assert!(!should_fail_open(Duration::from_millis(199)));
-        assert!(!should_fail_open(Duration::from_millis(200)));
-        assert!(should_fail_open(Duration::from_millis(201)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(199)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(200)));
+        assert!(exceeds_absolute_budget(Duration::from_millis(201)));
     }
 
     #[test]
@@ -383,8 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn deadline_fail_open_default() {
-        let deadline = Deadline::fail_open_default();
+    fn deadline_hook_default() {
+        let deadline = Deadline::hook_default();
         assert_eq!(deadline.max_duration(), ABSOLUTE_MAX);
         assert!(!deadline.is_exceeded());
     }
@@ -457,7 +453,7 @@ mod tests {
             "- Pattern match: < 1ms panic",
             "- Heredoc extract: < 2ms panic",
             "- Full heredoc pipeline: < 20ms panic",
-            "- Hook fail-open deadline: 200ms",
+            "- Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
         ] {
             assert!(
                 agents.contains(expected),
@@ -467,7 +463,7 @@ mod tests {
 
         for expected in [
             "# - Full heredoc pipeline: 20ms panic",
-            "# - Hook fail-open deadline: 200ms",
+            "# - Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
             "Full heredoc pipeline benchmark exceeds 20ms budget",
         ] {
             assert!(

@@ -11,7 +11,7 @@
 //!   - **Virtualization / apps**: `Remove-VM`, `Remove-VMSnapshot`,
 //!     `Remove-AppxPackage`.
 //!
-//! Plain `Remove-Item -Recurse -Force` of files lives in `windows.filesystem`;
+//! Plain `Remove-Item -Recurse` (with or without `-Force`) lives in `windows.filesystem`;
 //! `Format-Volume`/`Clear-Disk`/etc. live in `windows.system`. This pack is
 //! OPT-IN (not default-on) — enable with `enabled = ["windows.powershell"]` or
 //! the `windows` category.

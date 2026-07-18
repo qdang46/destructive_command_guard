@@ -268,7 +268,7 @@ fn test_hook_output_stderr_includes_allowlist_add_hint() {
     );
 
     assert!(
-        stderr.contains("dcg allowlist add core.git:reset-hard --project"),
+        stderr.contains("dcg allowlist add core.git:reset-hard --user"),
         "stderr should include allowlist add hint for matched rule.\nstderr:\n{stderr}"
     );
 }

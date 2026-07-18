@@ -338,13 +338,33 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         vec![
             Suggestion::new(
                 SuggestionKind::PreviewFirst,
-                "Check if branch has unmerged commits with `git log branch --not main`",
-            ),
-            Suggestion::new(
-                SuggestionKind::SaferAlternative,
-                "Use `git branch -d` (lowercase) to only delete if merged",
+                "Review branch tips and upstream tracking state with `git branch -vv`",
             )
-            .with_command("git branch -d branch-name"),
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Compare Git's merged and unmerged branch classifications",
+            )
+            .with_command("git branch --merged && git branch --no-merged"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Ask the user for explicit approval before deleting or force-moving a branch ref",
+            ),
+        ],
+    );
+
+    m.insert(
+        "core.git:git-alias-semantic-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the effective alias definition before invoking it",
+            )
+            .with_command("git config --show-origin --get-regexp '^alias\\.'"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Invoke the intended built-in Git subcommand directly after reviewing the alias expansion",
+            ),
         ],
     );
 

@@ -124,6 +124,7 @@ pub struct HistoryWriter {
     handle: Option<thread::JoinHandle<()>>,
     redaction_mode: HistoryRedactionMode,
     session_id: String,
+    wait_for_worker_on_drop: bool,
 }
 
 impl HistoryWriter {
@@ -175,6 +176,7 @@ impl HistoryWriter {
             handle: Some(handle),
             redaction_mode: config.redaction_mode,
             session_id,
+            wait_for_worker_on_drop: true,
         }
     }
 
@@ -185,6 +187,7 @@ impl HistoryWriter {
             handle: None,
             redaction_mode: HistoryRedactionMode::Pattern,
             session_id: String::new(),
+            wait_for_worker_on_drop: true,
         }
     }
 
@@ -233,17 +236,32 @@ impl HistoryWriter {
             handle.flush_sync();
         }
     }
+
+    /// Queue normal worker shutdown without waiting for storage during drop.
+    ///
+    /// Deadline paths call this only after their protocol response has been
+    /// written and flushed. When the worker is still connected, its channel
+    /// retains every queued entry followed by `Shutdown`; a wedged database can
+    /// no longer keep the hook process alive after the safety budget is already
+    /// exhausted.
+    pub fn detach_worker_on_drop(&mut self) {
+        self.wait_for_worker_on_drop = false;
+    }
 }
 
 impl Drop for HistoryWriter {
     fn drop(&mut self) {
-        self.flush_sync();
+        if self.wait_for_worker_on_drop {
+            self.flush_sync();
+        }
 
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(HistoryMessage::Shutdown);
         }
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if self.wait_for_worker_on_drop {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -664,5 +682,38 @@ fn redact_for_history(command: &str, mode: HistoryRedactionMode) -> String {
             };
             crate::logging::redact_command(command, &config)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_drop_never_waits_for_history_worker() {
+        let (release_tx, release_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            // Bound a future regression: if Drop accidentally rejoins this
+            // worker, the test fails after two seconds instead of hanging the
+            // entire suite forever.
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        let mut writer = HistoryWriter {
+            sender: None,
+            handle: Some(handle),
+            redaction_mode: HistoryRedactionMode::Pattern,
+            session_id: String::new(),
+            wait_for_worker_on_drop: true,
+        };
+        writer.detach_worker_on_drop();
+
+        let started = Instant::now();
+        drop(writer);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "detached history drop waited for its worker"
+        );
+
+        let _ = release_tx.send(());
     }
 }

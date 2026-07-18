@@ -31,6 +31,7 @@ fn mock_deny_result(
         allowlist_override: None,
         effective_mode: Some(DecisionMode::Deny),
         skipped_due_to_budget: false,
+        quick_rejected: false,
         branch_context: None,
         session_occurrence: None,
         graduated_response: None,

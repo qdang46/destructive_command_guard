@@ -1048,6 +1048,24 @@ struct PendingSafeFlag<'a> {
     multi_value: bool,
 }
 
+/// Return whether an unquoted shell reserved word introduces the command that
+/// follows it within the current separator-delimited segment.
+///
+/// The sanitizer does not implement a full shell grammar, but it must not
+/// mistake control-flow words for executables. Otherwise, in
+/// `then printf '...';`, `then` occupies the command slot and `printf`'s
+/// data-only arguments remain visible to destructive regexes. Exact matching is
+/// intentional: quoted words and paths such as `'then'` or `/usr/bin/then` are
+/// ordinary executable spellings and must retain their arguments.
+#[inline]
+#[must_use]
+fn is_shell_command_prefix_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then" | "elif" | "else" | "while" | "until" | "do" | "{" | "!"
+    )
+}
+
 /// Create a sanitized view of `command` for regex-based pattern matching.
 ///
 /// This function replaces known-safe *string arguments* (commit messages, issue
@@ -1140,6 +1158,14 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         }
 
         if segment_cmd.is_none() {
+            // POSIX/Bash control-flow prefixes introduce a command but are not
+            // themselves executables. Only skip them when no explicit wrapper
+            // is active: `command then ...`, `env then ...`, and
+            // `sudo then ...` intentionally select an executable named `then`.
+            if wrapper == WrapperState::None && is_shell_command_prefix_reserved_word(token_text) {
+                continue;
+            }
+
             // Wrapper / prefix handling: allow stacked wrappers like `sudo env VAR=1 git ...`.
             if let Some(next_wrapper) = WrapperState::from_command_word(token_text) {
                 wrapper = next_wrapper;
@@ -3568,6 +3594,59 @@ mod tests {
         assert!(matches!(sanitized, std::borrow::Cow::Owned(_)));
         assert!(!sanitized.as_ref().contains("rm -rf"));
         assert!(sanitized.as_ref().contains("sudo git commit -m"));
+    }
+
+    #[test]
+    fn sanitize_tracks_data_commands_after_shell_control_prefixes() {
+        for cmd in [
+            r"if printf '%-50s -> %s\n' a b; then true; fi; mv x y",
+            r"if true; then printf '%-50s -> %s\n' a b; fi; mv x y",
+            r"if false; then true; elif printf '%-50s -> %s\n' a b; then true; fi; mv x y",
+            r"if false; then true; else printf '%-50s -> %s\n' a b; fi; mv x y",
+            r"while printf '%-50s -> %s\n' a b; do true; done; mv x y",
+            r"until printf '%-50s -> %s\n' a b; do true; done; mv x y",
+            r"while false; do printf '%-50s -> %s\n' a b; done; mv x y",
+            r"{ printf '%-50s -> %s\n' a b; }; mv x y",
+            r"! printf '%-50s -> %s\n' a b; mv x y",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                !sanitized.as_ref().contains("->"),
+                "printf format string leaked after shell control prefix: {cmd} -> {sanitized}"
+            );
+            assert!(
+                sanitized.as_ref().contains("mv x y"),
+                "later executable segment was unexpectedly masked: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_does_not_skip_reserved_spellings_selected_as_executables() {
+        for cmd in [
+            r"command then printf '%-50s -> %s\n' a b; mv x y",
+            r"env then printf '%-50s -> %s\n' a b; mv x y",
+            r"sudo then printf '%-50s -> %s\n' a b; mv x y",
+            r"/usr/bin/then printf '%-50s -> %s\n' a b; mv x y",
+            r"'then' printf '%-50s -> %s\n' a b; mv x y",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+            assert!(
+                sanitized.as_ref().contains("->"),
+                "arguments of an explicitly selected executable were masked: {cmd} -> {sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_real_redirect_after_shell_control_prefix_visible() {
+        let cmd = r#"if true; then printf '%s' x > "$SOMEDIR/x"; fi"#;
+        let sanitized = sanitize_for_pattern_matching(cmd);
+
+        assert!(
+            sanitized.as_ref().contains(r#"> "$SOMEDIR/x""#),
+            "real redirect target was masked: {cmd} -> {sanitized}"
+        );
     }
 
     #[test]

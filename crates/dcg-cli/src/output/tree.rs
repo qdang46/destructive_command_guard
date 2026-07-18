@@ -699,6 +699,7 @@ fn decision_node(trace: &ExplainTrace) -> TreeNode {
     let (decision, style) = match trace.decision {
         EvaluationDecision::Allow => ("ALLOW", "[bold green]"),
         EvaluationDecision::Deny => ("DENY", "[bold red]"),
+        EvaluationDecision::Indeterminate => ("INDETERMINATE", "[bold yellow]"),
     };
 
     TreeNode::new(format!("Decision: {decision}"))
@@ -950,14 +951,16 @@ fn trace_details_summary(details: &TraceDetails) -> String {
             decision,
             allowlisted,
         } => {
-            let decision = match decision {
+            let is_allow = *decision == EvaluationDecision::Allow;
+            let decision_label = match decision {
                 EvaluationDecision::Allow => "allow",
                 EvaluationDecision::Deny => "deny",
+                EvaluationDecision::Indeterminate => "indeterminate",
             };
-            if *allowlisted {
-                format!("{decision} via allowlist")
+            if *allowlisted && is_allow {
+                format!("{decision_label} via allowlist")
             } else {
-                decision.to_string()
+                decision_label.to_string()
             }
         }
     }
@@ -1601,6 +1604,40 @@ mod tests {
         assert!(output.contains("full_evaluation (1.00ms)"));
         assert!(output.contains("matched: core.git"));
         assert!(output.contains("Skipped (keyword gating): core.filesystem"));
+    }
+
+    #[test]
+    fn test_explain_trace_tree_renders_indeterminate_conservatively() {
+        let trace = ExplainTrace {
+            command: "complex command".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Indeterminate,
+            skipped_due_to_budget: true,
+            total_duration_us: 200_000,
+            steps: vec![TraceStep {
+                name: "policy_decision",
+                duration_us: 0,
+                details: TraceDetails::PolicyDecision {
+                    decision: EvaluationDecision::Indeterminate,
+                    allowlisted: false,
+                },
+            }],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let output = explain_trace_tree(&trace)
+            .guides(DcgTreeGuides::Ascii)
+            .render_plain()
+            .join("\n");
+
+        assert!(output.contains("Decision: INDETERMINATE"));
+        assert!(output.contains("indeterminate"));
+        assert!(output.contains("Skipped deeper analysis after budget exhaustion"));
+        assert!(!output.contains("Decision: ALLOW"));
+        assert!(!output.contains("via allowlist"));
     }
 
     #[test]
