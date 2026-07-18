@@ -4242,6 +4242,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 "Review the fully expanded Git executable, alias chain, shell-alias body, and appended arguments before allowing execution. Dynamic shell values, cycles, and commands beyond the semantic parser's bounds can hide destructive operations.",
             ),
             suggestions: &[],
+            effects: None,
         },
         // checkout -- discards uncommitted changes
         destructive_pattern!(

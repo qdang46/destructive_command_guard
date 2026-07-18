@@ -866,7 +866,11 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
         if let Some(args) = tool_call.args.as_ref() {
             if let Some(command) = args.get("CommandLine").and_then(|v| v.as_str()) {
                 if !command.is_empty() {
-                    return Some((command.to_string(), protocol));
+                    return Some(ExtractedHookCommand {
+                        command: command.to_string(),
+                        protocol,
+                        dialect: ShellDialect::Unknown,
+                    });
                 }
             }
         }

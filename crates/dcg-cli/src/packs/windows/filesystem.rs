@@ -1517,6 +1517,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 "Review the fully expanded Windows command before allowing execution. Dynamic or malformed shell syntax in the executable or recursive/forced option roles can conceal an irreversible filesystem operation.",
             ),
             suggestions: DEL_SUGGESTIONS,
+            effects: None,
         },
         // === cmd: recursive delete (del/erase /s) ===
         destructive_pattern!(

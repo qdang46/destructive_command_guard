@@ -736,6 +736,7 @@ impl ConfigLayer {
                     observe_until: None,
                     packs,
                     rules,
+                    tools: std::collections::HashMap::default(),
                 }
             })
         });
