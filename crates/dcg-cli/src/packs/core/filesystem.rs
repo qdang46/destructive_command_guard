@@ -11,6 +11,7 @@
 //! - Tier-A explicit tags via [`crate::packs::effects::tier_a_filesystem`]
 //!   add `Irreversible` for the catastrophic `rm -rf` / `find -delete` /
 //!   `dd` / `shred` / `truncate` general / root-home variants.
+//! - rm -rf in literal /tmp and /var/tmp subdirectories (allowed)
 
 use dcg_core::Effect;
 
@@ -21,10 +22,8 @@ use crate::{destructive_pattern, safe_pattern};
 /// Baseline effects for filesystem ops in this pack.
 const FS_PACK_DEFAULT_EFFECTS: &[Effect] = &[Effect::Write, Effect::Fs];
 
-// ============================================================================
-// Suggestion constants (must be 'static for the pattern struct)
-// ============================================================================
-
+// =====================================================================// Suggestion constants (must be 'static for the pattern struct)
+// =====================================================================
 /// Suggestions for `rm -rf` on root/home paths pattern.
 const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
@@ -84,10 +83,6 @@ const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -r -f /tmp/{subdir}",
         "Safe temp directory deletion (allowed without confirmation)",
-    ),
-    PatternSuggestion::new(
-        "rm -r -f $TMPDIR/{subdir}",
-        "Use system temp directory (allowed without confirmation)",
     ),
     PatternSuggestion::new(
         "find {path} -type f | head -20",
@@ -658,44 +653,65 @@ fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
 
 fn path_is_safe_unquoted(path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("/tmp/") {
-        return !has_dotdot_segment(rest);
+        return temp_path_suffix_is_static_unquoted(rest);
     }
     if let Some(rest) = path.strip_prefix("/var/tmp/") {
-        return !has_dotdot_segment(rest);
-    }
-    if let Some(rest) = path.strip_prefix("$TMPDIR/") {
-        return !has_dotdot_segment(rest);
-    }
-    if let Some(rest) = path.strip_prefix("${TMPDIR}/") {
-        return !has_dotdot_segment(rest);
-    }
-    // Handle shell default value syntax: ${TMPDIR:-/tmp} and ${TMPDIR:-/var/tmp}
-    // These always expand to a safe temp directory.
-    if let Some(rest) = path.strip_prefix("${TMPDIR:-/tmp}/") {
-        return !has_dotdot_segment(rest);
-    }
-    if let Some(rest) = path.strip_prefix("${TMPDIR:-/var/tmp}/") {
-        return !has_dotdot_segment(rest);
+        return temp_path_suffix_is_static_unquoted(rest);
     }
     false
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {
-    if let Some(rest) = path.strip_prefix("$TMPDIR/") {
-        return !has_dotdot_segment(rest);
+    // Double quotes do not change literal path text. Keep literal temporary
+    // directories in parity with the unquoted path classifier while retaining
+    // the same traversal and shell-expansion guards.
+    if let Some(rest) = path.strip_prefix("/tmp/") {
+        return temp_path_suffix_is_static_double_quoted(rest);
     }
-    if let Some(rest) = path.strip_prefix("${TMPDIR}/") {
-        return !has_dotdot_segment(rest);
-    }
-    // Handle shell default value syntax: ${TMPDIR:-/tmp} and ${TMPDIR:-/var/tmp}
-    // These always expand to a safe temp directory.
-    if let Some(rest) = path.strip_prefix("${TMPDIR:-/tmp}/") {
-        return !has_dotdot_segment(rest);
-    }
-    if let Some(rest) = path.strip_prefix("${TMPDIR:-/var/tmp}/") {
-        return !has_dotdot_segment(rest);
+    if let Some(rest) = path.strip_prefix("/var/tmp/") {
+        return temp_path_suffix_is_static_double_quoted(rest);
     }
     false
+}
+
+fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
+    !has_dotdot_segment(path)
+        && !path
+            .bytes()
+            .any(|byte| matches!(byte, b'$' | b'`' | b'{' | b'}' | b'\\' | b'\'' | b'"'))
+}
+
+fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
+    if has_dotdot_segment(path) {
+        return false;
+    }
+
+    let bytes = path.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            // These retain expansion semantics inside double quotes.
+            b'$' | b'`' => return false,
+            // An unescaped quote closes the quoted region; any following text
+            // is shell concatenation rather than part of the literal path.
+            b'"' => return false,
+            b'\\' => {
+                let Some(&escaped) = bytes.get(index + 1) else {
+                    return false;
+                };
+                if matches!(escaped, b'$' | b'`' | b'"' | b'\\') {
+                    // The shell consumes this escape and produces a literal
+                    // byte, so skip both bytes. A later unescaped expansion is
+                    // still examined normally.
+                    index += 2;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    true
 }
 
 fn has_dotdot_segment(path: &str) -> bool {
@@ -801,42 +817,6 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "rm-fr-var-tmp",
             r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
-        // rm -rf with $TMPDIR (combined flags)
-        safe_pattern!(
-            "rm-rf-tmpdir",
-            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        safe_pattern!(
-            "rm-fr-tmpdir",
-            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        // rm -rf with ${TMPDIR} (braced form)
-        safe_pattern!(
-            "rm-rf-tmpdir-brace",
-            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        safe_pattern!(
-            "rm-fr-tmpdir-brace",
-            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        // rm -rf with quoted $TMPDIR
-        safe_pattern!(
-            "rm-rf-tmpdir-quoted",
-            r#"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:"\$TMPDIR/(?!(?:[^"]*/)?\.\.(?:/|"))[^"]*"(?:\s+|$))+$"#
-        ),
-        safe_pattern!(
-            "rm-fr-tmpdir-quoted",
-            r#"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:"\$TMPDIR/(?!(?:[^"]*/)?\.\.(?:/|"))[^"]*"(?:\s+|$))+$"#
-        ),
-        // rm -rf with quoted ${TMPDIR}
-        safe_pattern!(
-            "rm-rf-tmpdir-brace-quoted",
-            r#"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:"\$\{TMPDIR\}/(?!(?:[^"]*/)?\.\.(?:/|"))[^"]*"(?:\s+|$))+$"#
-        ),
-        safe_pattern!(
-            "rm-fr-tmpdir-brace-quoted",
-            r#"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:"\$\{TMPDIR\}/(?!(?:[^"]*/)?\.\.(?:/|"))[^"]*"(?:\s+|$))+$"#
-        ),
         // rm -r -f (separate flags) in /tmp
         safe_pattern!(
             "rm-r-f-tmp",
@@ -855,24 +835,6 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "rm-f-r-var-tmp",
             r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
-        // rm -r -f (separate flags) with $TMPDIR
-        safe_pattern!(
-            "rm-r-f-tmpdir",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        safe_pattern!(
-            "rm-f-r-tmpdir",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        // rm -r -f (separate flags) with ${TMPDIR}
-        safe_pattern!(
-            "rm-r-f-tmpdir-brace",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        safe_pattern!(
-            "rm-f-r-tmpdir-brace",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
         // rm --recursive --force (long flags) in /tmp
         safe_pattern!(
             "rm-recursive-force-tmp",
@@ -890,24 +852,6 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!(
             "rm-force-recursive-var-tmp",
             r"^rm\s+.*--force.*--recursive\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        // rm --recursive --force (long flags) with $TMPDIR
-        safe_pattern!(
-            "rm-recursive-force-tmpdir",
-            r"^rm\s+.*--recursive.*--force\s+(?:\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        safe_pattern!(
-            "rm-force-recursive-tmpdir",
-            r"^rm\s+.*--force.*--recursive\s+(?:\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        // rm --recursive --force (long flags) with ${TMPDIR}
-        safe_pattern!(
-            "rm-recursive-force-tmpdir-brace",
-            r"^rm\s+.*--recursive.*--force\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
-        ),
-        safe_pattern!(
-            "rm-force-recursive-tmpdir-brace",
-            r"^rm\s+.*--force.*--recursive\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // -----------------------------------------------------------------
         // `find ... -delete` safe whitelist for temp directories.
@@ -947,19 +891,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "find-delete-tmp",
-            r"^find\s+/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         safe_pattern!(
             "find-delete-var-tmp",
-            r"^find\s+/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
-        ),
-        safe_pattern!(
-            "find-delete-tmpdir",
-            r"^find\s+\$TMPDIR(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:\$TMPDIR(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
-        ),
-        safe_pattern!(
-            "find-delete-tmpdir-brace",
-            r"^find\s+\$\{TMPDIR\}(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:\$\{TMPDIR\}(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
@@ -973,19 +909,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "unlink-tmp",
-            r"^unlink\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])unlink\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "unlink-var-tmp",
-            r"^unlink\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
-        ),
-        safe_pattern!(
-            "unlink-tmpdir",
-            r"^unlink\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
-        ),
-        safe_pattern!(
-            "unlink-tmpdir-brace",
-            r"^unlink\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])unlink\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // unlink invoked with --help / --version is read-only.
         safe_pattern!("unlink-help", r"^unlink\s+(?:--help|--version)\s*$"),
@@ -1016,19 +944,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Temp-directory truncate (any size).
         safe_pattern!(
             "truncate-tmp",
-            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "truncate-var-tmp",
-            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
-        ),
-        safe_pattern!(
-            "truncate-tmpdir",
-            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
-        ),
-        safe_pattern!(
-            "truncate-tmpdir-brace",
-            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // -r/--reference <ref-file> <file> uses the size of ref-file.
         // This is a copy-size, not a destruction primitive — allowed when
@@ -1050,19 +970,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("shred-help", r"^shred\s+(?:--help|--version)\s*$"),
         safe_pattern!(
             "shred-tmp",
-            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         safe_pattern!(
             "shred-var-tmp",
-            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
-        ),
-        safe_pattern!(
-            "shred-tmpdir",
-            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
-        ),
-        safe_pattern!(
-            "shred-tmpdir-brace",
-            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         // -----------------------------------------------------------------
         // `tar --remove-files` safe whitelist.
@@ -1088,19 +1000,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "tar-remove-files-tmp",
-            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         safe_pattern!(
             "tar-remove-files-var-tmp",
-            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
-        ),
-        safe_pattern!(
-            "tar-remove-files-tmpdir",
-            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
-        ),
-        safe_pattern!(
-            "tar-remove-files-tmpdir-brace",
-            r"^tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         // -----------------------------------------------------------------
         // `dd` safe whitelist.
@@ -1128,19 +1032,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "dd-tmp",
-            r#"^dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
+            r#"^(?![^|;&]*[\\$`])dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
         ),
         safe_pattern!(
             "dd-var-tmp",
-            r#"^dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
-        ),
-        safe_pattern!(
-            "dd-tmpdir",
-            r#"^dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
-        ),
-        safe_pattern!(
-            "dd-tmpdir-brace",
-            r#"^dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
+            r#"^(?![^|;&]*[\\$`])dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
         ),
         // dd invoked with --help / --version is read-only.
         safe_pattern!("dd-help", r"^dd\s+(?:--help|--version)\s*$"),
@@ -1154,9 +1050,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // various flag interleavings. False positives only happen for
         // /var/tmp (which contains the sensitive `/var` prefix); these
         // safe patterns rescue when ALL positional paths are under the
-        // matching tmp variant. Pure /tmp / $TMPDIR moves don't even
-        // reach the destructive rule (those prefixes aren't sensitive)
-        // but we whitelist them for symmetry and discoverability.
+        // matching literal tmp variant. Pure /tmp moves don't even reach
+        // the destructive rule (that prefix isn't sensitive), but the
+        // explicit whitelist documents the supported safe form. TMPDIR is
+        // caller-controlled and is handled by a fail-closed rule below.
         //
         // Pattern shape: anchored `^...$`, optional flags (each may take
         // a non-path-like value to swallow `-t target`-style args), then
@@ -1165,19 +1062,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-tmp",
-            r"^mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "mv-var-tmp",
-            r"^mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
-        ),
-        safe_pattern!(
-            "mv-tmpdir",
-            r"^mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
-        ),
-        safe_pattern!(
-            "mv-tmpdir-brace",
-            r"^mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // mv invoked with --help / --version is read-only.
         safe_pattern!("mv-help", r"^mv\s+(?:--help|--version)\s*$"),
@@ -1192,6 +1081,16 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // - Low: Log only
 
     let mut patterns = vec![
+        // Evaluated explicitly by the GNU sed semantic pass. The regex is
+        // intentionally unsatisfiable so ordinary command matching cannot
+        // manufacture this finding.
+        destructive_pattern!(
+            "sed-exec-unverified",
+            r"(?!)",
+            "GNU sed executes shell input that dcg cannot statically verify.",
+            High,
+            "Use a literal sed replacement or inspect the fully rendered shell command before allowing execution. Backreferences, '&', and an empty `e` command depend on runtime input."
+        ),
         // ----- cross-segment sensitive propagation before rm fallbacks -----
         //
         // These patterns must run before the general rm rules below. Otherwise
@@ -1308,7 +1207,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Safe alternatives:\n\
              - rm -ri: Interactive mode, confirms each file\n\
              - trash-cli: Moves files to trash instead of deleting\n\
-             - rm -rf in /tmp, /var/tmp, $TMPDIR: Allowed (safe temp directories)\n\n\
+             - rm -rf in literal /tmp or /var/tmp subdirectories: Allowed\n\
+             - Variable-rooted paths such as $TMPDIR: Reviewed because the environment may point anywhere\n\n\
              Preview what would be deleted:\n  \
              find /path/to/delete -type f | wc -l  # Count files\n  \
              ls -la /path/to/delete               # List contents",
@@ -1329,7 +1229,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              All carry the same risks as rm -rf: immediate, silent, irreversible deletion.\n\n\
              Safer approach for temporary directories:\n\
              - rm -r -f /tmp/mydir    # Allowed - temp directories are safe\n\
-             - rm -r -f $TMPDIR/mydir # Allowed - uses system temp dir\n\n\
+             - Resolve and inspect $TMPDIR before using it as a deletion root\n\n\
              For other paths, prefer:\n  \
              rm -ri /path  # Interactive confirmation",
             RM_R_F_SEPARATE_SUGGESTIONS
@@ -1402,8 +1302,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // ----- `find ... -delete` (High: any other target) -----
         //
         // The general rule fires after the safe-pattern whitelist (which
-        // allows `find /tmp/...`, `/var/tmp/...`, `$TMPDIR/...`, and
-        // `${TMPDIR}/...`). Any other `find ... -delete` is an
+        // allows only static paths under literal `/tmp/...` and
+        // `/var/tmp/...`). Any other `find ... -delete` is an
         // unscoped destructive operation that should require human
         // approval, exactly like the parallel `rm-rf-general` rule.
         destructive_pattern!(
@@ -1481,30 +1381,21 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use `mv <file> /tmp/quarantine-<file>` if you want a delayed delete.",
             UNLINK_SUGGESTIONS
         ),
-        // ----- `truncate -s 0|--size=0|-s -N` (Critical: root/home/system) -----
+        // ----- destructive `truncate -s/--size` (Critical: root/home/system) -----
         //
         // `truncate -s 0 <file>` zeros the file in place — equivalent to
         // deleting all content. With a sensitive target (`/etc/passwd`,
         // `/etc/shadow`, `/etc/sudoers`, `~/.ssh/...`, `$HOME/.aws/...`)
         // this is irrecoverable data destruction.
         //
-        // Variants caught by the regex (size operand may have leading `=`):
-        //   -s 0
-        //   -s -<N>      (shrink by N bytes — destructive)
-        //   --size=0
-        //   --size=-<N>
-        //
-        // Variants NOT caught (intentionally — non-destructive):
-        //   -s +<N>      (grow — pure append of zeros, no data loss)
-        //   -s <N>       (absolute size; could shrink, but the safe path
-        //                  is to whitelist via temp dir or restructure)
-        //
-        // The destructive size operand is `0`, `-<digits>...` (with unit
-        // suffix), or `--size=0`/`--size=-...`.
+        // Every absolute size can shrink an existing file, and therefore
+        // destroys data depending on runtime state. Only an explicit `+N`
+        // relative growth is provably non-destructive and is rescued by the
+        // `truncate-grow` safe pattern above.
         destructive_pattern!(
             "truncate-zero-root-home",
-            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?:0\b|-\d+)|\s--size=(?:0\b|-\d+))[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
-            "truncate -s 0|-N on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
+            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            "truncate with a potentially shrinking size on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
             Critical,
             "`truncate -s 0 <file>` zeros a file in place. `truncate -s -<N> <file>` \
              shrinks a file by N bytes (destroying the trailing data). On a sensitive \
@@ -1517,11 +1408,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - For temp scratch: `truncate -s 0 /tmp/<subdir>/scratch` is allowed.",
             TRUNCATE_SUGGESTIONS
         ),
-        // ----- `truncate -s 0|--size=0|-s -N` (High: any other target) -----
+        // ----- destructive `truncate -s/--size` (High: any other target) -----
         destructive_pattern!(
             "truncate-zero-general",
-            r"\btruncate\b[^|;&]*?(?:\s-s\s+(?:0\b|-\d+)|\s--size=(?:0\b|-\d+))",
-            "truncate -s 0|-N is destructive (zeroes or shrinks file content) and requires human approval.",
+            r"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)",
+            "truncate with an absolute or shrinking size can destroy file content and requires human approval.",
             High,
             "`truncate -s 0 <file>` zeros a file in place; `truncate -s -<N> <file>` \
              shrinks it by N bytes. Both destroy data without confirmation, without \
@@ -1743,8 +1634,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // /var/tmp false-positive trap: `/var` is in the sensitive set
         // so `mv /var/tmp/foo /var/tmp/bar` matches the destructive
         // regex. The `mv-var-tmp` safe pattern rescues. Same defense
-        // applies to /tmp / $TMPDIR moves (those don't even trip the
-        // destructive regex but are whitelisted for symmetry).
+        // applies to literal /tmp moves (which do not trip the destructive
+        // regex). Dynamic TMPDIR paths are reviewed separately.
         // The optional-quote group `(?:['"\\]|\$['"])?` extends the
         // historical single-char quote prefix to accept Bash's
         // ANSI-C-quoted (`$'...'`) and locale-translated (`$"..."`)
@@ -1769,6 +1660,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Soft-delete via in-place rename: `mv <file> <file>.deleted-YYYYMMDD` \
                (use `dcg allow-once` for the rename, then a follow-up `rm` after a soak period).\n\
              - Pure tmp-to-tmp moves: `mv /tmp/<a> /tmp/<b>` is allowed.",
+            MV_SENSITIVE_SUGGESTIONS
+        ),
+        // Any shell-expanded mv path can resolve to `/`, `/etc`, or another
+        // sensitive tree. `mv` intentionally has no broad general tier, so it
+        // needs an explicit fail-closed rule for variables, command
+        // substitutions, and backslash-obfuscated path traversal.
+        destructive_pattern!(
+            "mv-dynamic-path",
+            r"\bmv\b[^|;&]*[\\$`]",
+            "mv with a shell-expanded or escaped path cannot be verified before execution.",
+            High,
+            "Shell variables and command substitutions are controlled by the calling environment and may resolve to `/`, `/etc`, a home directory, or another persistent tree. Backslash escapes can also hide traversal from lexical path checks, so dcg cannot safely classify this move.\n\n\
+             Safer alternatives:\n\
+             - Resolve and inspect every path before moving it.\n\
+             - Use an explicit literal `/tmp/<subdir>` or `/var/tmp/<subdir>` path.\n\
+             - Use `dcg allow-once` only after verifying the resolved source and destination.",
             MV_SENSITIVE_SUGGESTIONS
         ),
         // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
@@ -1802,7 +1709,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // pain. File-level redirects to non-sensitive paths fall
         // through to default-allow.
         //
-        // /tmp / /var/tmp / $TMPDIR redirects: /tmp isn't in the
+        // /tmp / /var/tmp redirects: /tmp isn't in the
         // sensitive set so they don't fire the regex at all; /var/tmp
         // would match /var but we don't bother with a safe rescue
         // because the bead's allow-list is explicit (`> /tmp/scratch`,
@@ -1848,9 +1755,29 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     apply_tier_a_effects(&mut patterns, tier_a_filesystem);
 
     patterns
-}
+        // The shell expands redirect targets at runtime. A variable, command
+        // substitution, or backslash-obfuscated suffix can therefore resolve
+        // outside an apparent temp path before O_TRUNC opens the file.
+        destructive_pattern!(
+            "redirect-truncate-dynamic-path",
+            r"(?<![<>])(?:&>|>&|[12]?>\|?)\s*[^|;&\s]*[\\$`]",
+            "shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval.",
+            High,
+            "The redirect target is expanded by the shell at runtime, so dcg cannot prove where it points before the file is opened with O_TRUNC.\n\n\
+             Safer alternatives:\n\
+             - Resolve and inspect the target path first.\n\
+             - Use a literal `/tmp/<subdir>/scratch` path for disposable output.\n\
+             - Use append (`>>`) when preserving existing content is acceptable.",
+            REDIRECT_TRUNCATE_SUGGESTIONS
+        ),
+    ]
 
-#[cfg(test)]
+    // Apply Tier-A explicit effect tags. Untagged rules keep their pack-level
+    // default (`FS_PACK_DEFAULT_EFFECTS`).
+    apply_tier_a_effects(&mut patterns, tier_a_filesystem);
+
+    patterns
+}
 mod tests {
     use super::*;
     use crate::packs::Severity;
@@ -1937,10 +1864,6 @@ mod tests {
             "find /tmp/foo -name '*.log' -delete",
             "find /var/tmp -delete",
             "find /var/tmp/dir -type f -delete",
-            "find $TMPDIR -delete",
-            "find $TMPDIR/work -name '*.tmp' -delete",
-            "find ${TMPDIR} -delete",
-            "find ${TMPDIR}/work -delete",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }
@@ -2085,8 +2008,6 @@ mod tests {
             "find /tmp -name '*.log' -delete",
             "find /tmp/foo -name '*.tmp' -delete",
             "find /var/tmp -delete",
-            "find $TMPDIR -delete",
-            "find ${TMPDIR} -delete",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }
@@ -2147,8 +2068,6 @@ mod tests {
             "unlink /tmp/scratch",
             "unlink /tmp/foo/bar",
             "unlink /var/tmp/cache",
-            "unlink $TMPDIR/file",
-            "unlink ${TMPDIR}/file",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }
@@ -2238,6 +2157,8 @@ mod tests {
             "truncate -s 0 /etc/passwd",
             "truncate -s 0 /etc/shadow",
             "truncate -s 0 /etc/sudoers",
+            "truncate -s 1 /etc/passwd",
+            "truncate --size=1 /etc/shadow",
             "truncate -s 0 /usr/bin/sudo",
             "truncate -s 0 /boot/vmlinuz",
             "truncate -s 0 ~/.bashrc",
@@ -2268,6 +2189,8 @@ mod tests {
         let pack = create_pack();
         for cmd in [
             "truncate -s 0 ./important.db",
+            "truncate -s 1 ./important.db",
+            "truncate --size=1 build/output.bin",
             "truncate -s 0 build/output.bin",
             "truncate --size=0 secrets.txt",
             "truncate -s -100 ./large.log",
@@ -2285,8 +2208,6 @@ mod tests {
             "truncate -s 1G /tmp/sparse-file.bin",
             "truncate -s 0 /var/tmp/cache.bin",
             "truncate -s 100M /var/tmp/test.img",
-            "truncate -s 0 $TMPDIR/cache.bin",
-            "truncate --size=0 ${TMPDIR}/scratch",
             "truncate -s -100 /tmp/log.txt",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
@@ -2403,8 +2324,6 @@ mod tests {
             "shred -u /tmp/scratch.bin",
             "shred -fzu /tmp/foo/cache",
             "shred -u /var/tmp/cache.bin",
-            "shred -u $TMPDIR/file",
-            "shred -u ${TMPDIR}/file",
             "shred -n 1 -u /tmp/scratch",
             "shred /tmp/foo/output",
         ] {
@@ -2506,8 +2425,6 @@ mod tests {
             "tar --remove-files -cf out.tar /tmp/scratch",
             "tar -cf out.tar --remove-files /tmp/foo",
             "tar --remove-files -czf out.tar.gz /var/tmp/cache",
-            "tar --remove-files -cf out.tar $TMPDIR/scratch",
-            "tar --remove-files -cf out.tar ${TMPDIR}/scratch",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }
@@ -2696,13 +2613,22 @@ mod tests {
             "dd if=/dev/zero of=/tmp/scratch.bin bs=1M count=10",
             "dd if=/dev/urandom of=/tmp/random.bin bs=4096 count=1",
             "dd if=/dev/zero of=/var/tmp/cache.bin",
-            "dd if=/dev/zero of=$TMPDIR/cache.bin",
-            "dd if=/dev/zero of=${TMPDIR}/scratch",
             "dd of=/tmp/out.bin",
             "dd of=/tmp/out.bin if=/dev/zero",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }
+    }
+
+    #[test]
+    fn dd_only_the_final_output_operand_determines_safety() {
+        let pack = create_pack();
+        assert_blocks_with_severity(
+            &pack,
+            "dd if=/dev/zero of=/tmp/scratch of=/etc/passwd",
+            Severity::Critical,
+        );
+        assert_safe_pattern_matches(&pack, "dd if=/dev/zero of=/etc/passwd of=/tmp/scratch");
     }
 
     #[test]
@@ -2890,23 +2816,49 @@ mod tests {
     fn mv_under_tmp_is_allowed() {
         let pack = create_pack();
         // All tmp-family moves are rescued by the explicit safe patterns
-        // (mv-tmp / mv-var-tmp / mv-tmpdir / mv-tmpdir-brace). For /var/tmp
+        // (mv-tmp / mv-var-tmp). For /var/tmp
         // the safe pattern is load-bearing because /var is sensitive and
-        // would otherwise trip the destructive rule; for /tmp / $TMPDIR
-        // the safe pattern is whitelisted for symmetry/discoverability —
-        // those prefixes aren't sensitive so the destructive rule
-        // wouldn't fire either way, but the explicit allow makes the
-        // intent clearer to anyone reading explain output.
+        // would otherwise trip the destructive rule. Variable-rooted paths
+        // are deliberately excluded because TMPDIR is caller-controlled.
         for cmd in [
             "mv /tmp/foo /tmp/bar",
             "mv /tmp/foo /tmp/sub/bar",
             "mv -v /tmp/foo /tmp/bar",
             "mv /var/tmp/foo /var/tmp/bar",
             "mv /var/tmp/dir1 /var/tmp/dir2",
-            "mv $TMPDIR/foo $TMPDIR/bar",
-            "mv ${TMPDIR}/foo ${TMPDIR}/bar",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn ambient_tmpdir_roots_are_not_automatically_safe() {
+        let pack = create_pack();
+        for cmd in [
+            "find $TMPDIR -delete",
+            "find ${TMPDIR}/work -delete",
+            "unlink $TMPDIR/file",
+            "truncate -s 0 ${TMPDIR}/cache.bin",
+            "shred -u $TMPDIR/file",
+            "tar --remove-files -cf out.tar ${TMPDIR}/scratch",
+            "dd if=/dev/zero of=$TMPDIR/cache.bin",
+            "mv $TMPDIR/foo $TMPDIR/bar",
+            "mv ${TMPDIR}/foo ${TMPDIR}/bar",
+            "export TMPDIR=/; find $TMPDIR/etc -delete",
+            "TMPDIR=/etc; unlink $TMPDIR/passwd",
+            "find /tmp/$TARGET -delete",
+            "unlink /tmp/$TARGET",
+            "truncate -s 0 /tmp/$TARGET",
+            "shred -u /tmp/$TARGET",
+            "tar --remove-files -cf out.tar /tmp/$TARGET",
+            "dd if=/dev/zero of=/tmp/$TARGET",
+            "mv /tmp/$SOURCE /tmp/$DESTINATION",
+            r"unlink /tmp/.\./etc/passwd",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "dynamic temp-root command must be reviewed: {cmd}"
+            );
         }
     }
 
@@ -3039,14 +2991,28 @@ mod tests {
             "echo x > foo.log",
             "ls > files.txt",
             "command > /tmp/scratch",
-            "command > $TMPDIR/scratch",
-            "command > ${TMPDIR}/scratch",
             "echo x >| build.log",
             "echo x &> build.log",
             "echo x >& build.log",
             "echo x 2> err.log",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_to_dynamic_path_is_blocked() {
+        let pack = create_pack();
+        for cmd in [
+            "echo data > $TMPDIR/passwd",
+            "echo data > ${TMPDIR}/passwd",
+            "echo data > ${TMPDIR:-/tmp}/passwd",
+            "echo data > /tmp/$TARGET",
+            "echo data>$LOG_FILE",
+            r"echo data > /tmp/.\./etc/passwd",
+            "echo data 2> `dynamic-path`",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-dynamic-path");
         }
     }
 
@@ -3174,7 +3140,6 @@ mod tests {
             "echo data>build.log",
             "echo data>/tmp/scratch",
             "echo data>/dev/null",
-            "echo data>$LOG_FILE",
         ] {
             assert_no_match(&pack, cmd);
         }
@@ -3371,8 +3336,8 @@ mod tests {
         let pack = create_pack();
         assert_safe_pattern_matches(&pack, "rm -rf /tmp/test");
         assert_safe_pattern_matches(&pack, "rm -rf /var/tmp/stuff");
-        assert_safe_pattern_matches(&pack, "rm -rf $TMPDIR/junk");
-        assert_safe_pattern_matches(&pack, "rm -rf ${TMPDIR}/junk");
+        assert!(!pack.matches_safe("rm -rf $TMPDIR/junk"));
+        assert!(!pack.matches_safe("rm -rf ${TMPDIR}/junk"));
     }
 
     #[test]
@@ -3439,9 +3404,23 @@ mod tests {
     }
 
     #[test]
-    fn test_rm_parser_allows_tmpdir_quotes() {
-        assert_rm_parser_allows(r#"rm -rf "$TMPDIR/foo""#);
-        assert_rm_parser_allows(r#"rm -rf "${TMPDIR}/foo""#);
+    fn test_rm_parser_rejects_variable_tmpdir_roots() {
+        assert_rm_parser_denies(
+            r#"rm -rf "$TMPDIR/foo""#,
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+        assert_rm_parser_denies(
+            r#"rm -rf "${TMPDIR}/foo""#,
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+        assert_rm_parser_denies(r"rm -rf $TMPDIR/foo", RM_RF_GENERAL_NAME, Severity::High);
+        assert_rm_parser_denies(
+            r"rm -rf ${TMPDIR:-/tmp}/foo",
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
         assert_rm_parser_denies(r"rm -rf '$TMPDIR/foo'", RM_RF_GENERAL_NAME, Severity::High);
         assert_rm_parser_denies(
             r#"rm -r -f "$TMPDIR/foo""#,
@@ -3473,6 +3452,40 @@ mod tests {
             RM_RECURSIVE_FORCE_NAME,
             Severity::High,
         );
+        assert_rm_parser_denies(
+            r#"export TMPDIR=/; rm -rf "$TMPDIR/etc""#,
+            RM_RF_GENERAL_NAME,
+            Severity::High,
+        );
+    }
+
+    #[test]
+    fn test_rm_parser_allows_literal_tmp_double_quoted() {
+        assert_rm_parser_allows(r#"rm -rf "/tmp/foo""#);
+        assert_rm_parser_allows(r#"rm -rf "/tmp/build/artifacts""#);
+        assert_rm_parser_allows(r#"rm -rf "/var/tmp/cache""#);
+        assert_rm_parser_allows(r#"rm -rf "/tmp/{literal}""#);
+        assert_rm_parser_allows(r#"rm -rf "/tmp/O'Reilly""#);
+        assert_rm_parser_allows(r#"rm -rf "/tmp/.\./etc""#);
+
+        assert_rm_parser_denies(
+            r#"rm -rf "/tmp/../etc""#,
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+
+        for command in [
+            r#"rm -rf "/tmp/$TARGET""#,
+            r#"rm -rf "/tmp/$(printf ../etc)""#,
+            r"rm -rf /tmp/{cache,../etc}",
+            r"rm -rf /tmp/''../etc",
+            r"rm -rf /tmp/.\./etc",
+        ] {
+            assert!(
+                matches!(parse_rm_command(command), RmParseDecision::Deny(_)),
+                "expanded or quote-concatenated temp path must be denied: {command}"
+            );
+        }
     }
 
     #[test]

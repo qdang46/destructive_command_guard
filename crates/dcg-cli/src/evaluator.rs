@@ -56,10 +56,14 @@ use crate::packs::{
 };
 use crate::pending_exceptions::AllowOnceStore;
 use crate::perf::Deadline;
+use ast_grep_core::{AstGrep, Doc};
+use ast_grep_language::SupportLang;
 use chrono::Utc;
 use regex::RegexSet;
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -1585,6 +1589,41 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     project_path: Option<&Path>,
     deadline: Option<&Deadline>,
 ) -> EvaluationResult {
+    evaluate_command_with_pack_order_deadline_at_path_inner(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn evaluate_command_with_pack_order_deadline_at_path_inner(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    nested_command_depth: usize,
+) -> EvaluationResult {
+    if nested_command_depth > MAX_EMBEDDED_SHELL_DEPTH {
+        return EvaluationResult::denied_by_legacy(
+            "Embedded executable command nesting exceeds dcg's static-analysis limit",
+        );
+    }
     // Check deadline at entry - if already exceeded, fail-open immediately.
     if deadline_exceeded(deadline) {
         return EvaluationResult::allowed_due_to_budget();
@@ -1684,6 +1723,13 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed_due_to_budget();
     }
 
+    // GNU sed can execute shell commands through the `e` command and the
+    // `s///e` flag. False-positive filtering deliberately preserves those
+    // scripts, but ordinary regex matching still sees them as quoted data.
+    // Extract the executable payload now so the quick-reject paths below do
+    // not discard it before semantic evaluation.
+    let sed_shell_sources = collect_sed_shell_sources(command, project_path);
+
     // Step 4: Quick rejection - if no relevant keywords, allow immediately.
     //
     // Fast path: when an Aho-Corasick keyword index is available, a single-pass
@@ -1691,13 +1737,16 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     // keyword appears in the raw command, we can skip the more expensive
     // normalize+span-classify path in pack_aware_quick_reject entirely.
     if let Some(index) = keyword_index {
-        if !index.has_any_keyword(command) && !contains_shell_word_obfuscation(command) {
+        if sed_shell_sources.is_empty()
+            && !index.has_any_keyword(command)
+            && !contains_shell_word_obfuscation(command)
+        {
             if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
                 return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
             }
             return EvaluationResult::allowed();
         }
-    } else if pack_aware_quick_reject(command, enabled_keywords) {
+    } else if sed_shell_sources.is_empty() && pack_aware_quick_reject(command, enabled_keywords) {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
             return EvaluationResult::allowed_by_allowlist(matched, layer, reason);
         }
@@ -1721,7 +1770,8 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     // Use the optimized version that returns both decision and normalized form.
     let (quick_reject, normalized) =
         pack_aware_quick_reject_with_normalized(command_for_match, enabled_keywords);
-    if quick_reject
+    if sed_shell_sources.is_empty()
+        && quick_reject
         && !should_check_original_control_plane_payload_for_any_pack(
             command_for_match,
             command,
@@ -1788,6 +1838,21 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
+    if let Some(result) = evaluate_sed_shell_sources(
+        &sed_shell_sources,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        &mut heredoc_allowlist_hit,
+        nested_command_depth,
+    ) {
+        return result;
     // Built-in inspection-wrapper exemption (dcg#132).
     //
     // A small, hard-coded set of "inspection wrapper" prefixes
@@ -1819,7 +1884,13 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     let masked = crate::heredoc::mask_non_executing_heredocs(&normalized);
     let command_for_packs = masked.as_ref();
 
-    let result = evaluate_packs_with_allowlists(
+    let nested_context = NestedCommandEvaluationContext {
+        enabled_keywords,
+        compiled_overrides,
+        heredoc_settings,
+        allow_once_audit,
+    };
+    let result = evaluate_packs_with_allowlists_at_depth(
         command_for_packs,
         &normalized,
         command_for_match,
@@ -1827,8 +1898,10 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         ordered_packs,
         allowlists,
         keyword_index,
-        None,
+        deadline,
         project_path,
+        nested_command_depth,
+        Some(&nested_context),
     );
     if result.allowlist_override.is_none() {
         if let Some((matched, layer, reason)) = heredoc_allowlist_hit {
@@ -1837,6 +1910,5042 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
     }
 
     result
+}
+
+const MAX_INDIRECT_INPUT_BYTES: u64 = 256 * 1024;
+const MAX_INDIRECT_INPUT_FLOWS: usize = 32;
+const MAX_EMBEDDED_SHELL_DEPTH: usize = 8;
+const MAX_DATABASE_INCLUDE_DEPTH: usize = 8;
+const INDIRECT_INPUT_RULE: &str = "stdin-unverified";
+const SED_EXEC_UNVERIFIED_RULE: &str = "sed-exec-unverified";
+
+struct NestedCommandEvaluationContext<'a, 'audit> {
+    enabled_keywords: &'a [&'a str],
+    compiled_overrides: &'a crate::config::CompiledOverrides,
+    heredoc_settings: &'a crate::config::HeredocSettings,
+    allow_once_audit: Option<&'a crate::pending_exceptions::AllowOnceAuditConfig<'audit>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IndirectInputSource {
+    StaticProducer(String),
+    File(PathBuf),
+    PsqlStartupFile {
+        path: PathBuf,
+        required: bool,
+    },
+    Template {
+        value: String,
+        replacements: Vec<(String, IndirectInputSource)>,
+    },
+    Unverified(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndirectInputFlow {
+    pack_id: &'static str,
+    source: IndirectInputSource,
+    psql_interpolates_variables: bool,
+}
+
+#[derive(Debug)]
+enum RedirectInput {
+    Source {
+        command_end: usize,
+        source: IndirectInputSource,
+    },
+    HandledByHeredoc,
+}
+
+fn collect_indirect_input_flows(
+    command: &str,
+    segment_ranges: &[(usize, usize)],
+) -> Vec<IndirectInputFlow> {
+    collect_indirect_input_flows_at_depth(command, segment_ranges, 0)
+}
+
+fn collect_indirect_input_flows_at_depth(
+    command: &str,
+    segment_ranges: &[(usize, usize)],
+    shell_depth: usize,
+) -> Vec<IndirectInputFlow> {
+    if shell_depth > MAX_EMBEDDED_SHELL_DEPTH {
+        return vec![unverified_indirect_wildcard(format!(
+            "embedded shell nesting exceeds {MAX_EMBEDDED_SHELL_DEPTH} levels"
+        ))];
+    }
+    let has_shell_indirection = command
+        .bytes()
+        .any(|byte| matches!(byte, b'|' | b'<' | b'`' | b'$' | b'%' | b'!'));
+    if !has_shell_indirection && !has_database_cli_hint(command) {
+        return Vec::new();
+    }
+    if command.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+        return vec![unverified_indirect_wildcard(format!(
+            "command exceeds the indirect-analysis limit of {MAX_INDIRECT_INPUT_BYTES} bytes"
+        ))];
+    }
+    if has_database_executable_alias(command) {
+        return vec![unverified_indirect_wildcard(
+            "a database client executable is invoked through a shell variable alias".to_string(),
+        )];
+    }
+
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    if ast_contains_error(ast.root()) {
+        return vec![unverified_indirect_wildcard(
+            "shell syntax could not be parsed for indirect-input analysis".to_string(),
+        )];
+    }
+    let mut flows = Vec::new();
+    collect_indirect_input_flows_from_node(
+        ast.root(),
+        &mut flows,
+        segment_ranges,
+        false,
+        false,
+        shell_depth,
+    );
+    collect_direct_redirect_flows(command, &mut flows);
+    collect_inherited_exec_stdin_flows(command, &mut flows);
+    flows
+}
+
+fn has_database_executable_alias(command: &str) -> bool {
+    let mut aliases = HashMap::new();
+    for (start, end) in top_level_segment_ranges(command) {
+        let segment = command[start..end].trim();
+        let Ok(tokens) = shell_words::split(segment) else {
+            continue;
+        };
+        let mut token_index = 0usize;
+        while let Some(token) = tokens.get(token_index) {
+            let Some((name, value)) = token.split_once('=') else {
+                break;
+            };
+            let valid_name = name
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            if !valid_name {
+                break;
+            }
+            let executable = value
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(value)
+                .trim_end_matches(".exe")
+                .to_ascii_lowercase();
+            let is_database = matches!(
+                executable.as_str(),
+                "redis-cli"
+                    | "valkey-cli"
+                    | "keydb-cli"
+                    | "psql"
+                    | "mysql"
+                    | "mariadb"
+                    | "mongo"
+                    | "mongosh"
+                    | "sqlite3"
+            );
+            aliases.insert(name.to_string(), is_database);
+            token_index += 1;
+        }
+        let Some(executable) = tokens.get(token_index) else {
+            continue;
+        };
+        let variable = executable
+            .strip_prefix("${")
+            .and_then(|value| value.strip_suffix('}'))
+            .or_else(|| executable.strip_prefix('$'));
+        if variable.is_some_and(|name| aliases.get(name) == Some(&true)) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_direct_redirect_flows(command: &str, flows: &mut Vec<IndirectInputFlow>) {
+    for (position, (start, end)) in command_segment_ranges(command).into_iter().enumerate() {
+        let segment = command[start..end].trim();
+        let Some(RedirectInput::Source {
+            mut source,
+            command_end: _,
+        }) = input_redirect(segment)
+        else {
+            continue;
+        };
+        let Some(pack_id) = protected_consumer_pack(segment) else {
+            continue;
+        };
+        if position > 0 && matches!(source, IndirectInputSource::File(_)) {
+            source = IndirectInputSource::Unverified(
+                "a redirected file is consumed after an earlier command and could be modified after inspection"
+                    .to_string(),
+            );
+        }
+        push_indirect_flow(flows, indirect_flow_for_consumer(pack_id, source, segment));
+    }
+}
+
+fn collect_inherited_exec_stdin_flows(command: &str, flows: &mut Vec<IndirectInputFlow>) {
+    let mut inherited_redirect = false;
+    for (start, end) in command_segment_ranges(command) {
+        let segment = command[start..end].trim();
+        if raw_command_is_exec_builtin(segment)
+            && matches!(input_redirect(segment), Some(RedirectInput::Source { .. }))
+        {
+            inherited_redirect = true;
+            continue;
+        }
+        if inherited_redirect {
+            if let Some(pack_id) = protected_consumer_pack(segment) {
+                push_indirect_flow(
+                    flows,
+                    IndirectInputFlow {
+                        pack_id,
+                        source: IndirectInputSource::Unverified(
+                            "stdin is inherited from an earlier exec redirect".to_string(),
+                        ),
+                        psql_interpolates_variables: pack_id == "database.postgresql",
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn raw_command_is_exec_builtin(command: &str) -> bool {
+    shell_words::split(command).ok().is_some_and(|tokens| {
+        tokens
+            .iter()
+            .find(|token| !is_shell_assignment(token))
+            .and_then(|token| token.rsplit(['/', '\\']).next())
+            .is_some_and(|executable| executable.eq_ignore_ascii_case("exec"))
+    })
+}
+
+fn ast_contains_error<D: Doc>(root: ast_grep_core::Node<'_, D>) -> bool {
+    let mut pending = vec![root];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "ERROR" {
+            return true;
+        }
+        pending.extend(node.children());
+    }
+    false
+}
+
+fn unverified_indirect_wildcard(reason: String) -> IndirectInputFlow {
+    IndirectInputFlow {
+        pack_id: "*",
+        source: IndirectInputSource::Unverified(reason),
+        psql_interpolates_variables: false,
+    }
+}
+
+fn indirect_flow_for_consumer(
+    pack_id: &'static str,
+    source: IndirectInputSource,
+    _consumer: &str,
+) -> IndirectInputFlow {
+    IndirectInputFlow {
+        pack_id,
+        source,
+        psql_interpolates_variables: pack_id == "database.postgresql",
+    }
+}
+
+fn collect_indirect_input_flows_from_node<D: Doc>(
+    node: ast_grep_core::Node<'_, D>,
+    flows: &mut Vec<IndirectInputFlow>,
+    segment_ranges: &[(usize, usize)],
+    inside_redirected_statement: bool,
+    inside_heredoc_redirect: bool,
+    shell_depth: usize,
+) {
+    if flows.iter().any(|flow| flow.pack_id == "*") {
+        return;
+    }
+
+    match node.kind().as_ref() {
+        "pipeline" if !inside_heredoc_redirect => {
+            let stages: Vec<String> = node
+                .children()
+                // `Node::children` exposes unnamed CST punctuation as well as
+                // named AST nodes.  A Bash pipeline therefore contains the
+                // literal `|`/`|&` operator between command stages; treating
+                // that token as the producer makes every otherwise-static
+                // pipeline fail closed as `stdin-unverified`.
+                .filter(|child| !matches!(child.kind().as_ref(), "comment" | "|" | "|&"))
+                .map(|child| child.text().to_string())
+                .collect();
+
+            for consumer_index in 1..stages.len() {
+                let consumer = &stages[consumer_index];
+                if input_redirect(consumer).is_some() {
+                    // An explicit stdin redirect overrides the pipeline's stdin.
+                    // The redirected-statement pass below evaluates that source.
+                    continue;
+                }
+                let Some(pack_id) = protected_consumer_pack(consumer) else {
+                    continue;
+                };
+
+                let mut producer_index = consumer_index - 1;
+                while producer_index > 0 && is_literal_pipeline_passthrough(&stages[producer_index])
+                {
+                    producer_index -= 1;
+                }
+                push_indirect_flow(
+                    flows,
+                    indirect_flow_for_consumer(
+                        pack_id,
+                        static_producer_source(&stages[producer_index]),
+                        consumer,
+                    ),
+                );
+            }
+        }
+        "pipeline" => {}
+        "redirected_statement" if !inside_redirected_statement => {
+            let text = node.text().to_string();
+            if let Some(RedirectInput::Source {
+                command_end,
+                mut source,
+            }) = input_redirect(&text)
+            {
+                let node_start = node.range().start;
+                let target_range = top_level_segment_ranges(&text[..command_end])
+                    .into_iter()
+                    .max_by_key(|&(_, end)| end)
+                    .unwrap_or((0, command_end));
+                let has_prior_segment = segment_ranges
+                    .iter()
+                    .position(|&(start, end)| node_start >= start && node_start < end)
+                    .is_some_and(|position| position > 0)
+                    || !text[..target_range.0].trim().is_empty();
+                if has_prior_segment && matches!(source, IndirectInputSource::File(_)) {
+                    source = IndirectInputSource::Unverified(
+                        "a redirected file is consumed inside a compound command and could be modified after inspection"
+                            .to_string(),
+                    );
+                }
+                if let Some(pack_id) = protected_consumer_pack(&text) {
+                    push_indirect_flow(flows, indirect_flow_for_consumer(pack_id, source, &text));
+                }
+            } else if matches!(input_redirect(&text), Some(RedirectInput::HandledByHeredoc)) {
+                collect_heredoc_pipeline_flows(&text, flows);
+            }
+        }
+        "redirected_statement" => {}
+        "command" => {
+            let text = node.text().to_string();
+            for flow in command_argument_payloads(&text, segment_ranges.len() > 1) {
+                push_indirect_flow(flows, flow);
+            }
+            match shell_command_script(&text) {
+                Ok(Some(script)) => {
+                    let nested_ranges = command_segment_ranges(&script);
+                    for flow in collect_indirect_input_flows_at_depth(
+                        &script,
+                        &nested_ranges,
+                        shell_depth + 1,
+                    ) {
+                        push_indirect_flow(flows, flow);
+                    }
+                }
+                Err(reason) if has_database_cli_hint(&text) => {
+                    push_indirect_flow(flows, unverified_indirect_wildcard(reason));
+                }
+                Err(_) => {}
+                Ok(None) => {}
+            }
+        }
+        _ => {}
+    }
+
+    let descendants_are_redirected =
+        inside_redirected_statement || node.kind().as_ref() == "redirected_statement";
+    let descendants_are_heredoc = inside_heredoc_redirect
+        || (node.kind().as_ref() == "redirected_statement"
+            && matches!(
+                input_redirect(node.text().as_ref()),
+                Some(RedirectInput::HandledByHeredoc)
+            ));
+    for child in node.children() {
+        collect_indirect_input_flows_from_node(
+            child,
+            flows,
+            segment_ranges,
+            descendants_are_redirected,
+            descendants_are_heredoc,
+            shell_depth,
+        );
+        if flows.iter().any(|flow| flow.pack_id == "*") {
+            break;
+        }
+    }
+}
+
+fn has_database_cli_hint(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    [
+        "redis-cli",
+        "valkey-cli",
+        "keydb-cli",
+        "psql",
+        "mysql",
+        "mariadb",
+        "mongo",
+        "mongosh",
+        "sqlite3",
+    ]
+    .iter()
+    .any(|executable| lower.contains(executable))
+}
+
+fn collect_heredoc_pipeline_flows(command: &str, flows: &mut Vec<IndirectInputFlow>) {
+    let header = command.split_once('\n').map_or(command, |(line, _)| line);
+    let ranges = top_level_segment_ranges(header);
+    let Some(heredoc_index) = ranges
+        .iter()
+        .position(|&(start, end)| header[start..end].contains("<<"))
+    else {
+        return;
+    };
+    let mut source = literal_heredoc_producer_source(command).unwrap_or_else(|| {
+        IndirectInputSource::Unverified(
+            "heredoc pipeline producer could not be reconstructed".to_string(),
+        )
+    });
+
+    for index in heredoc_index + 1..ranges.len() {
+        let previous = ranges[index - 1];
+        let current = ranges[index];
+        let separator = header[previous.1..current.0].trim();
+        if !matches!(separator, "|" | "|&") {
+            break;
+        }
+
+        let consumer = header[current.0..current.1].trim();
+        if let Some(pack_id) = protected_consumer_pack(consumer) {
+            push_indirect_flow(
+                flows,
+                indirect_flow_for_consumer(pack_id, source.clone(), consumer),
+            );
+        }
+        if !is_literal_pipeline_passthrough(consumer) {
+            source = static_producer_source(consumer);
+        }
+    }
+}
+
+fn top_level_segment_ranges(command: &str) -> Vec<(usize, usize)> {
+    let mut ranges = command_segment_ranges(command);
+    ranges.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
+    let mut top_level = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if top_level
+            .iter()
+            .any(|&(start, end)| range.0 >= start && range.1 <= end)
+        {
+            continue;
+        }
+        top_level.push(range);
+    }
+    top_level
+}
+
+fn push_indirect_flow(flows: &mut Vec<IndirectInputFlow>, flow: IndirectInputFlow) {
+    if flows.contains(&flow) || flows.iter().any(|existing| existing.pack_id == "*") {
+        return;
+    }
+    if flows.len() < MAX_INDIRECT_INPUT_FLOWS {
+        flows.push(flow);
+    } else {
+        // Bounding the analysis must never become a bypass. Replace the final
+        // concrete flow with a wildcard fail-closed finding that applies to
+        // every protected indirect-input pack.
+        flows.pop();
+        flows.push(unverified_indirect_wildcard(format!(
+            "command exceeds the limit of {MAX_INDIRECT_INPUT_FLOWS} indirect input flows"
+        )));
+    }
+}
+
+fn command_tokens(command: &str) -> Option<(String, Vec<String>)> {
+    let stripped = strip_wrapper_prefixes(command);
+    let mut tokens = shell_words::split(stripped.normalized.as_ref()).ok()?;
+    while tokens
+        .first()
+        .is_some_and(|token| is_shell_assignment(token) || token == "&")
+    {
+        tokens.remove(0);
+    }
+    let executable = tokens
+        .first()?
+        .rsplit(['/', '\\'])
+        .next()?
+        .to_ascii_lowercase();
+    let mut executable = executable
+        .strip_suffix(".exe")
+        .unwrap_or(&executable)
+        .to_string();
+    tokens.remove(0);
+    let mut exec_depth = 0usize;
+    while executable == "exec" {
+        exec_depth += 1;
+        if exec_depth > MAX_EMBEDDED_SHELL_DEPTH {
+            return None;
+        }
+        let mut index = 0usize;
+        while index < tokens.len() {
+            match tokens[index].as_str() {
+                "--" => {
+                    index += 1;
+                    break;
+                }
+                "-a" => index += 2,
+                "-c" | "-l" => index += 1,
+                option if option.starts_with('-') => return None,
+                _ => break,
+            }
+        }
+        let nested = tokens.get(index)?;
+        executable = nested.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+        executable = executable
+            .strip_suffix(".exe")
+            .unwrap_or(&executable)
+            .to_string();
+        tokens.drain(..=index);
+    }
+    Some((executable, tokens))
+}
+
+fn shell_command_script(command: &str) -> Result<Option<String>, String> {
+    let masked = mask_command_substitutions(command);
+    let Some((mut executable, mut args)) = command_tokens(&masked.command) else {
+        return Ok(None);
+    };
+    if executable == "exec" {
+        let mut index = 0usize;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--" => {
+                    index += 1;
+                    break;
+                }
+                "-a" => index += 2,
+                "-c" | "-l" => index += 1,
+                arg if arg.starts_with('-') => return Ok(None),
+                _ => break,
+            }
+        }
+        let Some(nested_executable) = args.get(index) else {
+            return Ok(None);
+        };
+        executable = nested_executable
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(nested_executable)
+            .trim_end_matches(".exe")
+            .to_ascii_lowercase();
+        args = args[index + 1..].to_vec();
+    }
+    if !matches!(executable.as_str(), "sh" | "bash" | "zsh") {
+        return Ok(None);
+    }
+
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            return Ok(None);
+        }
+        if matches!(arg.as_str(), "-o" | "+o" | "-O" | "+O") {
+            index += 2;
+            continue;
+        }
+        if matches!(arg.as_str(), "--init-file" | "--rcfile") {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with("--init-file=") || arg.starts_with("--rcfile=") {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--debugger"
+                | "--dump-po-strings"
+                | "--dump-strings"
+                | "--help"
+                | "--login"
+                | "--noediting"
+                | "--noprofile"
+                | "--norc"
+                | "--posix"
+                | "--pretty-print"
+                | "--restricted"
+                | "--verbose"
+                | "--version"
+        ) {
+            index += 1;
+            continue;
+        }
+        let Some(flags) = arg
+            .strip_prefix('-')
+            .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
+        else {
+            break;
+        };
+        if flags.contains('c') {
+            let Some(script) = args.get(index + 1) else {
+                return Err(
+                    "an embedded shell -c option has no literal command operand".to_string()
+                );
+            };
+            if masked
+                .dynamic_markers
+                .iter()
+                .any(|marker| script.contains(marker))
+                || masked
+                    .substitutions
+                    .iter()
+                    .any(|(marker, _)| script.contains(marker))
+            {
+                return Err(
+                    "an embedded shell -c command contains expansion or substitution that dcg cannot statically resolve"
+                        .to_string(),
+                );
+            }
+            return Ok(Some(script.clone()));
+        }
+        index += 1;
+    }
+    Ok(None)
+}
+
+fn is_shell_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn pipe_consumer_pack(command: &str) -> Option<&'static str> {
+    let (executable, args) = command_tokens(command)?;
+    match executable.as_str() {
+        "redis-cli" | "valkey-cli" | "keydb-cli"
+            if analyze_redis_cli_args(&args).reads_stdin_as_code =>
+        {
+            Some("database.redis")
+        }
+        "psql" if analyze_psql_args(&args).reads_stdin_as_code => Some("database.postgresql"),
+        "mysql" | "mariadb" if analyze_mysql_cli_args(&args).reads_stdin_as_code => {
+            Some("database.mysql")
+        }
+        "mongo" | "mongosh" if analyze_mongo_cli_args(&args).reads_stdin_as_code => {
+            Some("database.mongodb")
+        }
+        "sqlite3" if analyze_sqlite_cli_args(&args).reads_stdin_as_code => Some("database.sqlite"),
+        _ => None,
+    }
+}
+
+fn protected_consumer_pack(command: &str) -> Option<&'static str> {
+    protected_consumer_pack_at_depth(command, 0)
+}
+
+fn protected_consumer_pack_at_depth(command: &str, shell_depth: usize) -> Option<&'static str> {
+    if shell_depth > MAX_EMBEDDED_SHELL_DEPTH {
+        return None;
+    }
+    if let Some(pack_id) = pipe_consumer_pack(command) {
+        return Some(pack_id);
+    }
+    if let Ok(Some(script)) = shell_command_script(command) {
+        if let Some(pack_id) = protected_consumer_pack_at_depth(&script, shell_depth + 1) {
+            return Some(pack_id);
+        }
+    }
+
+    let ast = AstGrep::new(command, SupportLang::Bash);
+    if ast_contains_error(ast.root()) {
+        return None;
+    }
+    let mut pending = vec![ast.root()];
+    while let Some(node) = pending.pop() {
+        if node.kind().as_ref() == "command" {
+            let text = node.text();
+            if text.as_ref() != command {
+                if let Some(pack_id) = pipe_consumer_pack(text.as_ref()) {
+                    return Some(pack_id);
+                }
+                if let Ok(Some(script)) = shell_command_script(text.as_ref()) {
+                    if let Some(pack_id) =
+                        protected_consumer_pack_at_depth(&script, shell_depth + 1)
+                    {
+                        return Some(pack_id);
+                    }
+                }
+            }
+        }
+        pending.extend(node.children());
+    }
+
+    for executable in [
+        "redis-cli",
+        "valkey-cli",
+        "keydb-cli",
+        "psql",
+        "mysql",
+        "mariadb",
+        "mongo",
+        "mongosh",
+        "sqlite3",
+    ] {
+        for (start, _) in command.match_indices(executable) {
+            let before_is_boundary = start == 0
+                || command[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| ch.is_ascii_whitespace() || matches!(ch, '(' | '{'));
+            let end = start + executable.len();
+            let after_is_boundary = end == command.len()
+                || command[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_whitespace() || matches!(ch, ';' | ')' | '}'));
+            if before_is_boundary && after_is_boundary {
+                if let Some(pack_id) = pipe_consumer_pack(command[start..].trim()) {
+                    return Some(pack_id);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Default)]
+struct RedisCliAnalysis<'a> {
+    code_values: Vec<&'a str>,
+    file_values: Vec<&'a str>,
+    reads_stdin_as_code: bool,
+}
+
+fn analyze_redis_cli_args(args: &[String]) -> RedisCliAnalysis<'_> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-h",
+        "-p",
+        "-t",
+        "-s",
+        "-a",
+        "-u",
+        "-r",
+        "-i",
+        "-n",
+        "-d",
+        "-D",
+        "-X",
+        "--user",
+        "--pass",
+        "--sni",
+        "--cacert",
+        "--cacertdir",
+        "--cert",
+        "--key",
+        "--tls-ciphers",
+        "--tls-ciphersuites",
+        "--show-pushes",
+        "--pipe-timeout",
+        "--pattern",
+        "--quoted-pattern",
+        "--memkeys-samples",
+        "--keystats-samples",
+        "--cursor",
+        "--top",
+        "--count",
+    ];
+    const FLAG_OPTIONS: &[&str] = &[
+        "-2",
+        "-3",
+        "-c",
+        "-e",
+        "-4",
+        "-6",
+        "--tls",
+        "--insecure",
+        "--raw",
+        "--no-raw",
+        "--quoted-input",
+        "--csv",
+        "--json",
+        "--quoted-json",
+        "--verbose",
+        "--no-auth-warning",
+    ];
+    const NON_REPL_FLAGS: &[&str] = &[
+        "--scan",
+        "--bigkeys",
+        "--memkeys",
+        "--keystats",
+        "--hotkeys",
+        "--stat",
+        "--latency",
+        "--latency-history",
+        "--latency-dist",
+        "--replica",
+        "--ldb",
+        "--ldb-sync-mode",
+    ];
+    const NON_REPL_VALUE_OPTIONS: &[&str] = &[
+        "--lru-test",
+        "--rdb",
+        "--functions-rdb",
+        "--intrinsic-latency",
+    ];
+
+    let mut index = 0usize;
+    let mut analysis = RedisCliAnalysis::default();
+    let mut positional_is_command = true;
+    let mut non_repl_mode = false;
+    let mut stdin_argument_mode = false;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            if positional_is_command {
+                if stdin_argument_mode {
+                    analysis
+                        .code_values
+                        .extend(args[index + 1..].iter().map(String::as_str));
+                } else if let Some(command) = args.get(index + 1) {
+                    analysis.code_values.push(command);
+                }
+            }
+            return analysis;
+        }
+        if matches!(arg.as_str(), "--help" | "--version") {
+            return RedisCliAnalysis::default();
+        }
+        if arg == "--pipe" {
+            analysis.reads_stdin_as_code = true;
+            positional_is_command = false;
+            index += 1;
+            continue;
+        }
+        if arg == "-x" {
+            // `-x` appends stdin as the final argument of an argv-supplied
+            // command (for example, `SET key <value>`). The bytes are data,
+            // not a second Redis command stream.
+            index += 1;
+            continue;
+        }
+        if arg == "-X" {
+            analysis.reads_stdin_as_code = true;
+            stdin_argument_mode = true;
+            if args.get(index + 1).is_none() {
+                return analysis;
+            }
+            index += 2;
+            continue;
+        }
+        if arg == "--askpass" {
+            // Authentication consumes one password from stdin. If no argv
+            // command follows, the normal end-of-parse REPL rule below still
+            // protects the remaining stream; with a command, stdin is data.
+            index += 1;
+            continue;
+        }
+        if arg == "--eval" {
+            // The script path can be /dev/stdin, a process substitution, or a
+            // symlink to fd 0. A pipeline feeding --eval therefore cannot be
+            // proven irrelevant from argv alone.
+            non_repl_mode = true;
+            positional_is_command = false;
+            let Some(script) = args.get(index + 1) else {
+                analysis.reads_stdin_as_code = true;
+                return analysis;
+            };
+            analysis.file_values.push(script);
+            analysis.reads_stdin_as_code |= file_path_may_read_stdin(script);
+            index += 2;
+            continue;
+        }
+        if arg == "--cluster" {
+            non_repl_mode = true;
+            positional_is_command = false;
+            index += 1;
+            continue;
+        }
+        if NON_REPL_VALUE_OPTIONS.contains(&arg.as_str()) {
+            non_repl_mode = true;
+            positional_is_command = false;
+            if args.get(index + 1).is_none() {
+                analysis.reads_stdin_as_code = true;
+                return analysis;
+            }
+            index += 2;
+            continue;
+        }
+        if NON_REPL_FLAGS.contains(&arg.as_str()) {
+            non_repl_mode = true;
+            positional_is_command = false;
+            index += 1;
+            continue;
+        }
+        if VALUE_OPTIONS.contains(&arg.as_str()) {
+            if args.get(index + 1).is_none() {
+                analysis.reads_stdin_as_code = true;
+                return analysis;
+            }
+            index += 2;
+            continue;
+        }
+        if FLAG_OPTIONS.contains(&arg.as_str()) {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            // Unknown/future options may consume one or more operands. Treat
+            // every remaining token as a potential code-bearing argument and
+            // keep stdin protected instead of guessing an arity.
+            analysis.reads_stdin_as_code = true;
+            analysis
+                .code_values
+                .extend(args[index..].iter().map(String::as_str));
+            return analysis;
+        }
+        if positional_is_command {
+            if stdin_argument_mode {
+                analysis
+                    .code_values
+                    .extend(args[index..].iter().map(String::as_str));
+            } else {
+                analysis.code_values.push(arg);
+                if arg.eq_ignore_ascii_case("EVAL") {
+                    if let Some(script) = args.get(index + 1) {
+                        analysis.code_values.push(script);
+                    }
+                } else if arg.eq_ignore_ascii_case("FUNCTION")
+                    && args
+                        .get(index + 1)
+                        .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("LOAD"))
+                {
+                    if let Some(library) = args.get(index + 2) {
+                        analysis.code_values.push(library);
+                    }
+                }
+            }
+        }
+        return analysis;
+    }
+    if !non_repl_mode && !stdin_argument_mode {
+        analysis.reads_stdin_as_code = true;
+    }
+    analysis
+}
+
+#[derive(Debug, Default)]
+struct PsqlCliAnalysis<'a> {
+    code_values: Vec<&'a str>,
+    file_values: Vec<&'a str>,
+    reads_stdin_as_code: bool,
+    has_unverified_file_source: bool,
+    no_psqlrc: bool,
+    skips_startup_files: bool,
+}
+
+fn analyze_psql_args(args: &[String]) -> PsqlCliAnalysis<'_> {
+    const LONG_VALUE_OPTIONS: &[&str] = &[
+        "command",
+        "dbname",
+        "file",
+        "set",
+        "variable",
+        "log-file",
+        "output",
+        "field-separator",
+        "pset",
+        "record-separator",
+        "table-attr",
+        "host",
+        "port",
+        "username",
+    ];
+    const LONG_FLAG_OPTIONS: &[&str] = &[
+        "no-psqlrc",
+        "single-transaction",
+        "echo-all",
+        "echo-errors",
+        "echo-queries",
+        "echo-hidden",
+        "no-readline",
+        "quiet",
+        "single-step",
+        "single-line",
+        "no-align",
+        "csv",
+        "html",
+        "tuples-only",
+        "expanded",
+        "field-separator-zero",
+        "record-separator-zero",
+        "no-password",
+        "password",
+    ];
+    const SHORT_VALUE_OPTIONS: &[char] = &[
+        'c', 'd', 'f', 'v', 'L', 'o', 'F', 'P', 'R', 'T', 'h', 'p', 'U',
+    ];
+    const SHORT_FLAG_OPTIONS: &[char] = &[
+        'X', '1', 'a', 'b', 'e', 'E', 'n', 'q', 's', 'S', 'A', 'H', 't', 'x', 'z', '0', 'w', 'W',
+    ];
+
+    let mut analysis = PsqlCliAnalysis::default();
+    let mut has_command = false;
+    let mut has_file = false;
+    let mut options_ended = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if !options_ended && arg == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if options_ended || !arg.starts_with('-') || arg == "-" {
+            index += 1;
+            continue;
+        }
+
+        if matches!(
+            arg.as_str(),
+            "-V" | "--version" | "-?" | "--help" | "-l" | "--list"
+        ) || arg.starts_with("--help=")
+        {
+            analysis.skips_startup_files = true;
+            return analysis;
+        }
+
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            if LONG_VALUE_OPTIONS.contains(&name) {
+                let value = if let Some(value) = attached {
+                    value
+                } else if let Some(value) = args.get(index + 1) {
+                    index += 1;
+                    value
+                } else {
+                    analysis.reads_stdin_as_code = true;
+                    return analysis;
+                };
+                match name {
+                    "command" => {
+                        has_command = true;
+                        analysis.code_values.push(value);
+                    }
+                    "file" => {
+                        has_file = true;
+                        analysis.file_values.push(value);
+                    }
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
+            if LONG_FLAG_OPTIONS.contains(&name) && attached.is_none() {
+                analysis.no_psqlrc |= name == "no-psqlrc";
+                index += 1;
+                continue;
+            }
+        } else if let Some(short) = arg.strip_prefix('-') {
+            let mut chars = short.chars();
+            let option = chars.next().unwrap_or_default();
+            let attached = chars.as_str();
+            if SHORT_VALUE_OPTIONS.contains(&option) {
+                let value = if attached.is_empty() {
+                    if let Some(value) = args.get(index + 1) {
+                        index += 1;
+                        value.as_str()
+                    } else {
+                        analysis.reads_stdin_as_code = true;
+                        return analysis;
+                    }
+                } else {
+                    attached.strip_prefix('=').unwrap_or(attached)
+                };
+                match option {
+                    'c' => {
+                        has_command = true;
+                        analysis.code_values.push(value);
+                    }
+                    'f' => {
+                        has_file = true;
+                        analysis.file_values.push(value);
+                    }
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
+            if short.chars().all(|flag| SHORT_FLAG_OPTIONS.contains(&flag)) {
+                analysis.no_psqlrc |= short.contains('X');
+                index += 1;
+                continue;
+            }
+        }
+
+        // Unknown/future option arity is ambiguous. It might consume a token
+        // that looks like -c/-f, so never infer that stdin is disabled.
+        analysis.reads_stdin_as_code = true;
+        analysis
+            .code_values
+            .extend(args[index..].iter().map(String::as_str));
+        return analysis;
+    }
+
+    for &command in &analysis.code_values {
+        for include in psql_code_file_references(command) {
+            match include {
+                CommandFileOperand::Path(path) => analysis.file_values.push(path),
+                CommandFileOperand::Missing => analysis.has_unverified_file_source = true,
+            }
+        }
+    }
+    analysis.reads_stdin_as_code = (!has_command && !has_file)
+        || analysis
+            .file_values
+            .iter()
+            .any(|path| file_path_may_read_stdin(path));
+    analysis
+}
+
+fn psql_code_file_references(command: &str) -> Vec<CommandFileOperand<'_>> {
+    command
+        .lines()
+        .filter_map(|line| {
+            command_file_operand(line, &["\\i", "\\ir", "\\include", "\\include_relative"])
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandFileOperand<'a> {
+    Path(&'a str),
+    Missing,
+}
+
+fn command_file_operand<'a>(line: &'a str, commands: &[&str]) -> Option<CommandFileOperand<'a>> {
+    let trimmed = line.trim_start();
+    let command_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    let command = &trimmed[..command_end];
+    if !commands.contains(&command) {
+        return None;
+    }
+
+    let remainder = trimmed[command_end..].trim();
+    if remainder.is_empty() {
+        return Some(CommandFileOperand::Missing);
+    }
+    let operand = match remainder.as_bytes().first().copied() {
+        Some(quote @ (b'\'' | b'"')) => remainder[1..]
+            .find(char::from(quote))
+            .map(|end| &remainder[1..=end]),
+        _ => remainder
+            .find(char::is_whitespace)
+            .map_or(Some(remainder), |end| Some(&remainder[..end])),
+    };
+    Some(
+        operand
+            .filter(|value| !value.is_empty())
+            .map_or(CommandFileOperand::Missing, CommandFileOperand::Path),
+    )
+}
+
+fn file_path_may_read_stdin(path: &str) -> bool {
+    let normalized = path.trim().trim_matches(['\'', '"']);
+    matches!(
+        normalized,
+        "-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0"
+    ) || normalized.starts_with("/dev/fd/0/")
+        || normalized.starts_with("/proc/self/fd/0/")
+}
+
+#[derive(Debug, Default)]
+struct MysqlCliAnalysis<'a> {
+    code_values: Vec<&'a str>,
+    file_values: Vec<&'a str>,
+    reads_stdin_as_code: bool,
+    has_unverified_file_source: bool,
+}
+
+fn analyze_mysql_cli_args(args: &[String]) -> MysqlCliAnalysis<'_> {
+    const LONG_VALUE_OPTIONS: &[&str] = &[
+        "authentication-oci-client-config-profile",
+        "bind-address",
+        "character-sets-dir",
+        "compression-algorithms",
+        "connect-timeout",
+        "database",
+        "default-auth",
+        "default-character-set",
+        "defaults-extra-file",
+        "defaults-file",
+        "defaults-group-suffix",
+        "delimiter",
+        "dns-srv-name",
+        "histignore",
+        "host",
+        "load-data-local-dir",
+        "login-path",
+        "max-allowed-packet",
+        "max-join-size",
+        "net-buffer-length",
+        "network-namespace",
+        "oci-config-file",
+        "otel_bsp_max_export_batch_size",
+        "otel_bsp_max_queue_size",
+        "otel_bsp_schedule_delay",
+        "otel_exporter_otlp_traces_certificates",
+        "otel_exporter_otlp_traces_client_certificates",
+        "otel_exporter_otlp_traces_client_key",
+        "otel_exporter_otlp_traces_compression",
+        "otel_exporter_otlp_traces_endpoint",
+        "otel_exporter_otlp_traces_headers",
+        "otel_exporter_otlp_traces_protocol",
+        "otel_exporter_otlp_traces_timeout",
+        "otel_log_level",
+        "otel_resource_attributes",
+        "plugin-authentication-kerberos-client-mode",
+        "plugin-dir",
+        "port",
+        "prompt",
+        "protocol",
+        "register-factor",
+        "select-limit",
+        "server-public-key-path",
+        "shared-memory-base-name",
+        "socket",
+        "ssl-ca",
+        "ssl-capath",
+        "ssl-cert",
+        "ssl-cipher",
+        "ssl-crl",
+        "ssl-crlpath",
+        "ssl-fips-mode",
+        "ssl-key",
+        "ssl-mode",
+        "ssl-session-data",
+        "tee",
+        "tls-ciphersuites",
+        "tls-sni-servername",
+        "tls-version",
+        "user",
+        "zstd-compression-level",
+    ];
+    const LONG_FLAG_OPTIONS: &[&str] = &[
+        "auto-rehash",
+        "auto-vertical-output",
+        "batch",
+        "binary-as-hex",
+        "binary-mode",
+        "column-names",
+        "column-type-info",
+        "commands",
+        "comments",
+        "compress",
+        "connect-expired-password",
+        "debug",
+        "debug-check",
+        "debug-info",
+        "disable-auto-rehash",
+        "disable-named-commands",
+        "enable-cleartext-plugin",
+        "force",
+        "get-server-public-key",
+        "html",
+        "i-am-a-dummy",
+        "ignore-spaces",
+        "line-numbers",
+        "local-infile",
+        "named-commands",
+        "no-auto-rehash",
+        "no-beep",
+        "no-defaults",
+        "no-login-paths",
+        "one-database",
+        "pager",
+        "plugin-authentication-webauthn-client-preserve-privacy",
+        "pipe",
+        "quick",
+        "raw",
+        "reconnect",
+        "safe-updates",
+        "show-warnings",
+        "sigint-ignore",
+        "silent",
+        "ssl",
+        "ssl-session-data-continue-on-failed-reuse",
+        "syslog",
+        "system-command",
+        "table",
+        "telemetry_client",
+        "unbuffered",
+        "verbose",
+        "vertical",
+        "wait",
+        "xml",
+    ];
+    const SHORT_VALUE_OPTIONS: &[char] = &['D', 'h', 'P', 'S', 'u'];
+    const SHORT_FLAG_OPTIONS: &[char] = &[
+        'A', 'B', 'C', 'E', 'f', 'G', 'H', 'i', 'n', 'N', 'q', 'r', 's', 't', 'U', 'v', 'w', 'X',
+    ];
+
+    let mut analysis = MysqlCliAnalysis::default();
+    let mut has_execute = false;
+    let mut options_ended = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if !options_ended && arg == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if options_ended || !arg.starts_with('-') || arg == "-" {
+            index += 1;
+            continue;
+        }
+        if matches!(arg.as_str(), "-?" | "--help" | "-V" | "--version")
+            || matches!(arg.as_str(), "--print-defaults" | "--otel-help")
+        {
+            return MysqlCliAnalysis::default();
+        }
+
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            if matches!(name, "execute" | "init-command" | "init-command-add") {
+                let value = if let Some(value) = attached {
+                    value
+                } else if let Some(value) = args.get(index + 1) {
+                    index += 1;
+                    value
+                } else {
+                    analysis.reads_stdin_as_code = true;
+                    return analysis;
+                };
+                analysis.code_values.push(value);
+                has_execute |= name == "execute";
+                index += 1;
+                continue;
+            }
+            if LONG_VALUE_OPTIONS.contains(&name) {
+                let value = attached.or_else(|| args.get(index + 1).map(String::as_str));
+                if attached.is_none() {
+                    if args.get(index + 1).is_none() {
+                        analysis.reads_stdin_as_code = true;
+                        return analysis;
+                    }
+                    index += 1;
+                }
+                if matches!(name, "defaults-file" | "defaults-extra-file") {
+                    analysis
+                        .file_values
+                        .push(value.expect("required option value was checked"));
+                }
+                index += 1;
+                continue;
+            }
+            if matches!(name, "password" | "password1" | "password2" | "password3")
+                || LONG_FLAG_OPTIONS.contains(&name)
+                || (name.starts_with("skip-") && attached.is_none())
+            {
+                index += 1;
+                continue;
+            }
+        } else if let Some(short) = arg.strip_prefix('-') {
+            let mut chars = short.chars();
+            let option = chars.next().unwrap_or_default();
+            let attached = chars.as_str();
+            if option == 'e' {
+                let value = if attached.is_empty() {
+                    if let Some(value) = args.get(index + 1) {
+                        index += 1;
+                        value.as_str()
+                    } else {
+                        analysis.reads_stdin_as_code = true;
+                        return analysis;
+                    }
+                } else {
+                    attached.strip_prefix('=').unwrap_or(attached)
+                };
+                analysis.code_values.push(value);
+                has_execute = true;
+                index += 1;
+                continue;
+            }
+            if SHORT_VALUE_OPTIONS.contains(&option) {
+                if attached.is_empty() {
+                    if args.get(index + 1).is_none() {
+                        analysis.reads_stdin_as_code = true;
+                        return analysis;
+                    }
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+            if option == 'p' || (SHORT_FLAG_OPTIONS.contains(&option) && attached.is_empty()) {
+                index += 1;
+                continue;
+            }
+        }
+
+        analysis.reads_stdin_as_code = true;
+        analysis
+            .code_values
+            .extend(args[index..].iter().map(String::as_str));
+        return analysis;
+    }
+
+    for &code in &analysis.code_values {
+        for include in mysql_code_file_references(code) {
+            match include {
+                CommandFileOperand::Path(path) => analysis.file_values.push(path),
+                CommandFileOperand::Missing => analysis.has_unverified_file_source = true,
+            }
+        }
+    }
+    analysis.reads_stdin_as_code = !has_execute
+        || analysis
+            .file_values
+            .iter()
+            .any(|path| file_path_may_read_stdin(path));
+    analysis
+}
+
+fn mysql_code_file_references(code: &str) -> Vec<CommandFileOperand<'_>> {
+    code.lines()
+        .flat_map(|line| line.split(';'))
+        .filter_map(|statement| command_file_operand(statement, &["source", "\\."]))
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct MongoCliAnalysis<'a> {
+    code_values: Vec<&'a str>,
+    file_values: Vec<&'a str>,
+    reads_stdin_as_code: bool,
+    has_unverified_file_source: bool,
+}
+
+fn analyze_mongo_cli_args(args: &[String]) -> MongoCliAnalysis<'_> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "apiVersion",
+        "authenticationDatabase",
+        "authenticationMechanism",
+        "awsAccessKeyId",
+        "awsSecretAccessKey",
+        "awsSessionToken",
+        "browser",
+        "cryptSharedLibPath",
+        "gssapiServiceName",
+        "host",
+        "keyVaultNamespace",
+        "port",
+        "sspiHostnameCanonicalization",
+        "tlsCAFile",
+        "tlsCRLFile",
+        "tlsCertificateKeyFile",
+        "tlsCertificateKeyFilePassword",
+        "tlsCertificateSelector",
+        "tlsDisabledProtocols",
+        "username",
+    ];
+    const FLAG_OPTIONS: &[&str] = &[
+        "apiDeprecationErrors",
+        "apiStrict",
+        "nodb",
+        "no-browser",
+        "no-quiet",
+        "norc",
+        "oidcDumpTokens",
+        "oidcIdTokenAsAccessToken",
+        "oidcNoNonce",
+        "oidcTrustedEndpoint",
+        "quiet",
+        "retryWrites",
+        "skipStartupWarnings",
+        "tls",
+        "tlsAllowInvalidCertificates",
+        "tlsAllowInvalidHostnames",
+        "tlsUseSystemCA",
+        "verbose",
+    ];
+
+    let mut analysis = MongoCliAnalysis::default();
+    let mut positionals = Vec::new();
+    let mut shell_after_program = false;
+    let mut options_ended = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if !options_ended && arg == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if options_ended || !arg.starts_with('-') || arg == "-" {
+            positionals.push(arg.as_str());
+            index += 1;
+            continue;
+        }
+        if matches!(arg.as_str(), "--help" | "-h" | "--version" | "--build-info") {
+            return MongoCliAnalysis::default();
+        }
+        if arg == "--shell" {
+            shell_after_program = true;
+            index += 1;
+            continue;
+        }
+
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            if matches!(name, "eval" | "file") {
+                let value = if let Some(value) = attached {
+                    value
+                } else if let Some(value) = args.get(index + 1) {
+                    index += 1;
+                    value
+                } else {
+                    analysis.reads_stdin_as_code = true;
+                    return analysis;
+                };
+                if name == "eval" {
+                    analysis.code_values.push(value);
+                } else {
+                    analysis.file_values.push(value);
+                }
+                index += 1;
+                continue;
+            }
+            if matches!(name, "json" | "oidcFlows" | "oidcRedirectUri") {
+                // These options accept attached values (`--json=relaxed`) but
+                // their bare forms do not consume a following option.
+                index += 1;
+                continue;
+            }
+            if name == "password" {
+                if attached.is_none()
+                    && args
+                        .get(index + 1)
+                        .is_some_and(|value| !value.starts_with('-'))
+                {
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+            if VALUE_OPTIONS.contains(&name) {
+                if attached.is_none() {
+                    if args.get(index + 1).is_none() {
+                        analysis.reads_stdin_as_code = true;
+                        return analysis;
+                    }
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+            if FLAG_OPTIONS.contains(&name) {
+                index += 1;
+                continue;
+            }
+        } else if let Some(short) = arg.strip_prefix('-') {
+            let mut chars = short.chars();
+            let option = chars.next().unwrap_or_default();
+            let attached = chars.as_str();
+            if option == 'f' {
+                let value = if attached.is_empty() {
+                    if let Some(value) = args.get(index + 1) {
+                        index += 1;
+                        value.as_str()
+                    } else {
+                        analysis.reads_stdin_as_code = true;
+                        return analysis;
+                    }
+                } else {
+                    attached.strip_prefix('=').unwrap_or(attached)
+                };
+                analysis.file_values.push(value);
+                index += 1;
+                continue;
+            }
+            if matches!(option, 'p' | 'u') {
+                if attached.is_empty()
+                    && args
+                        .get(index + 1)
+                        .is_some_and(|value| !value.starts_with('-'))
+                {
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+        }
+
+        analysis.reads_stdin_as_code = true;
+        analysis
+            .code_values
+            .extend(args[index..].iter().map(String::as_str));
+        return analysis;
+    }
+
+    let positional_index = usize::from(positionals.first().is_some_and(|value| {
+        value.starts_with("mongodb://")
+            || value.starts_with("mongodb+srv://")
+            || !looks_like_javascript_file(value)
+    }));
+    analysis
+        .file_values
+        .extend(positionals[positional_index..].iter().copied());
+    for &code in &analysis.code_values {
+        for include in mongo_load_file_references(code) {
+            match include {
+                Some(path) => analysis.file_values.push(path),
+                None => analysis.has_unverified_file_source = true,
+            }
+        }
+    }
+    let has_program = !analysis.code_values.is_empty() || !analysis.file_values.is_empty();
+    analysis.reads_stdin_as_code = shell_after_program
+        || !has_program
+        || analysis
+            .file_values
+            .iter()
+            .any(|path| file_path_may_read_stdin(path));
+    analysis
+}
+
+fn looks_like_javascript_file(value: &str) -> bool {
+    Path::new(value).extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("js")
+            || extension.eq_ignore_ascii_case("mjs")
+            || extension.eq_ignore_ascii_case("cjs")
+            || extension.eq_ignore_ascii_case("mongodb")
+    })
+}
+
+fn mongo_load_file_references(code: &str) -> Vec<Option<&str>> {
+    let mut references = Vec::new();
+    if (code.contains("globalThis[") || code.contains("this[")) && code.contains("load") {
+        references.push(None);
+    }
+    let bytes = code.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            index = javascript_line_comment_end(code, index + 2);
+            continue;
+        }
+        if bytes[index] == b'/'
+            && bytes.get(index + 1) != Some(&b'*')
+            && javascript_regex_can_start(code, index)
+        {
+            let Some(end) = skip_javascript_regex(code, index) else {
+                references.push(None);
+                break;
+            };
+            index = end;
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            let body_start = index + 2;
+            match code[body_start..].find("*/") {
+                Some(offset) => {
+                    index = body_start + offset + 2;
+                }
+                None => {
+                    index = bytes.len();
+                }
+            }
+            continue;
+        }
+        if matches!(bytes[index], b'\'' | b'"' | b'`') {
+            let start = index;
+            index = skip_javascript_string(code, index).unwrap_or(bytes.len());
+            if bytes[start] == b'`'
+                && code[start..index].contains("${")
+                && ["load", "\\u", "eval", "Function", "globalThis", "this["]
+                    .iter()
+                    .any(|marker| code[start..index].contains(marker))
+            {
+                references.push(None);
+            }
+            continue;
+        }
+        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'u') {
+            references.push(None);
+            index += 2;
+            continue;
+        }
+        if bytes[index].is_ascii_alphabetic() || matches!(bytes[index], b'_' | b'$') {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+            {
+                index += 1;
+            }
+            let identifier = &code[start..index];
+            if matches!(identifier, "eval" | "Function") {
+                if skip_javascript_trivia(code, index)
+                    .is_some_and(|open| bytes.get(open) == Some(&b'('))
+                {
+                    references.push(None);
+                }
+                continue;
+            }
+            if identifier != "load" {
+                continue;
+            }
+            let Some(open) = skip_javascript_trivia(code, index) else {
+                references.push(None);
+                break;
+            };
+            if bytes.get(open) != Some(&b'(') {
+                references.push(None);
+                index = open.saturating_add(1);
+                continue;
+            }
+            let Some(value_start) = skip_javascript_trivia(code, open + 1) else {
+                references.push(None);
+                break;
+            };
+            let Some(quote @ (b'\'' | b'"')) = bytes.get(value_start).copied() else {
+                references.push(None);
+                index = open + 1;
+                continue;
+            };
+            let content_start = value_start + 1;
+            let mut cursor = content_start;
+            let mut escaped = false;
+            while cursor < bytes.len() && bytes[cursor] != quote {
+                if bytes[cursor] == b'\\' {
+                    escaped = true;
+                    let Some(next) = code[cursor + 1..].chars().next() else {
+                        references.push(None);
+                        return references;
+                    };
+                    cursor += 1 + next.len_utf8();
+                } else {
+                    let Some(ch) = code[cursor..].chars().next() else {
+                        break;
+                    };
+                    cursor += ch.len_utf8();
+                }
+            }
+            if cursor >= bytes.len() {
+                references.push(None);
+                break;
+            }
+            let Some(close) = skip_javascript_trivia(code, cursor + 1) else {
+                references.push(None);
+                break;
+            };
+            if escaped || bytes.get(close) != Some(&b')') {
+                references.push(None);
+            } else {
+                references.push(Some(&code[content_start..cursor]));
+            }
+            index = close.saturating_add(1);
+            continue;
+        }
+        let Some(ch) = code[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+    }
+    references
+}
+
+fn skip_javascript_string(code: &str, start: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let quote = *bytes.get(start)?;
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let next = code[index + 1..].chars().next()?;
+            index += 1 + next.len_utf8();
+            continue;
+        }
+        if bytes[index] == quote {
+            return Some(index + 1);
+        }
+        let ch = code[index..].chars().next()?;
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn javascript_regex_can_start(code: &str, slash: usize) -> bool {
+    let prefix = code[..slash].trim_end();
+    let Some(last) = prefix.chars().next_back() else {
+        return true;
+    };
+    if matches!(
+        last,
+        '(' | '['
+            | '{'
+            | '='
+            | ','
+            | ':'
+            | ';'
+            | '!'
+            | '&'
+            | '|'
+            | '?'
+            | '+'
+            | '-'
+            | '*'
+            | '%'
+            | '^'
+            | '~'
+            | '<'
+            | '>'
+    ) {
+        return true;
+    }
+    let word_start = prefix
+        .rfind(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '$'))
+        .map_or(0, |index| index + 1);
+    matches!(
+        &prefix[word_start..],
+        "return"
+            | "throw"
+            | "case"
+            | "delete"
+            | "void"
+            | "typeof"
+            | "yield"
+            | "await"
+            | "else"
+            | "do"
+            | "in"
+            | "instanceof"
+            | "new"
+    )
+}
+
+fn skip_javascript_regex(code: &str, start: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    let mut index = start + 1;
+    let mut in_class = false;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let next = code[index + 1..].chars().next()?;
+            index += 1 + next.len_utf8();
+            continue;
+        }
+        if bytes[index] == b'[' {
+            in_class = true;
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b']' {
+            in_class = false;
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'/' && !in_class {
+            index += 1;
+            while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+                index += 1;
+            }
+            return Some(index);
+        }
+        if matches!(bytes[index], b'\n' | b'\r') {
+            return None;
+        }
+        let ch = code[index..].chars().next()?;
+        if matches!(ch, '\u{2028}' | '\u{2029}') {
+            return None;
+        }
+        index += ch.len_utf8();
+    }
+    None
+}
+
+fn skip_javascript_trivia(code: &str, mut index: usize) -> Option<usize> {
+    let bytes = code.as_bytes();
+    loop {
+        while let Some(ch) = code[index..].chars().next() {
+            if !ch.is_whitespace() && ch != '\u{feff}' {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'/') {
+            index = javascript_line_comment_end(code, index + 2);
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            let end = code[index + 2..].find("*/")?;
+            index += 2 + end + 2;
+            continue;
+        }
+        return Some(index);
+    }
+}
+
+fn javascript_line_comment_end(code: &str, start: usize) -> usize {
+    code[start..]
+        .char_indices()
+        .find(|(_, ch)| matches!(ch, '\n' | '\r' | '\u{2028}' | '\u{2029}'))
+        .map_or(code.len(), |(offset, ch)| start + offset + ch.len_utf8())
+}
+
+#[derive(Debug, Default)]
+struct SqliteCliAnalysis<'a> {
+    code_values: Vec<&'a str>,
+    file_values: Vec<&'a str>,
+    reads_stdin_as_code: bool,
+    has_unverified_file_source: bool,
+}
+
+fn analyze_sqlite_cli_args(args: &[String]) -> SqliteCliAnalysis<'_> {
+    const ONE_VALUE_OPTIONS: &[&str] = &[
+        "cmd",
+        "escape",
+        "heap",
+        "init",
+        "maxsize",
+        "mmap",
+        "newline",
+        "nonce",
+        "nullvalue",
+        "separator",
+        "vfs",
+    ];
+    const TWO_VALUE_OPTIONS: &[&str] = &["lookaside", "pagecache"];
+    const FLAG_OPTIONS: &[&str] = &[
+        "append",
+        "ascii",
+        "bail",
+        "batch",
+        "box",
+        "column",
+        "csv",
+        "deserialize",
+        "echo",
+        "header",
+        "noheader",
+        "html",
+        "ifexists",
+        "interactive",
+        "json",
+        "line",
+        "list",
+        "markdown",
+        "memtrace",
+        "nofollow",
+        "no-rowid-in-view",
+        "pcachetrace",
+        "quote",
+        "readonly",
+        "safe",
+        "stats",
+        "table",
+        "tabs",
+        "unsafe-testing",
+        "vfstrace",
+        "zip",
+        "no-utf8",
+        "utf8",
+    ];
+
+    let mut analysis = SqliteCliAnalysis::default();
+    let mut positionals = Vec::new();
+    let mut options_ended = false;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if !options_ended && arg == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if options_ended || !arg.starts_with('-') {
+            positionals.push(arg.as_str());
+            index += 1;
+            continue;
+        }
+
+        if arg == "-A" || arg.starts_with("-A") || arg == "--A" {
+            return SqliteCliAnalysis::default();
+        }
+        let option = arg
+            .strip_prefix("--")
+            .or_else(|| arg.strip_prefix('-'))
+            .unwrap_or_default();
+        if matches!(option, "help" | "version") {
+            return SqliteCliAnalysis::default();
+        }
+        if ONE_VALUE_OPTIONS.contains(&option) {
+            let Some(value) = args.get(index + 1) else {
+                analysis.reads_stdin_as_code = true;
+                return analysis;
+            };
+            match option {
+                "cmd" => analysis.code_values.push(value),
+                "init" => analysis.file_values.push(value),
+                _ => {}
+            }
+            index += 2;
+            continue;
+        }
+        if TWO_VALUE_OPTIONS.contains(&option) {
+            if args.get(index + 2).is_none() {
+                analysis.reads_stdin_as_code = true;
+                return analysis;
+            }
+            index += 3;
+            continue;
+        }
+        if FLAG_OPTIONS.contains(&option) {
+            index += 1;
+            continue;
+        }
+
+        // Unknown/future option arity is ambiguous. Preserve every remaining
+        // token as a possible code-bearing operand and fail closed for stdin.
+        analysis.reads_stdin_as_code = true;
+        analysis
+            .code_values
+            .extend(args[index..].iter().map(String::as_str));
+        return analysis;
+    }
+
+    analysis
+        .code_values
+        .extend(positionals.iter().skip(1).copied());
+    for &code in &analysis.code_values {
+        for include in sqlite_code_file_references(code) {
+            match include {
+                CommandFileOperand::Path(path) => analysis.file_values.push(path),
+                CommandFileOperand::Missing => analysis.has_unverified_file_source = true,
+            }
+        }
+    }
+    analysis.reads_stdin_as_code = positionals.len() <= 1
+        || analysis
+            .file_values
+            .iter()
+            .any(|path| file_path_may_read_stdin(path));
+    analysis
+}
+
+fn sqlite_code_file_references(code: &str) -> Vec<CommandFileOperand<'_>> {
+    code.lines()
+        .filter_map(|line| command_file_operand(line, &[".rea", ".read"]))
+        .collect()
+}
+
+fn is_literal_pipeline_passthrough(command: &str) -> bool {
+    command_tokens(command).is_some_and(|(executable, args)| executable == "cat" && args.is_empty())
+}
+
+fn static_producer_source(command: &str) -> IndirectInputSource {
+    if command.contains("<<") {
+        if let Some(source) = literal_heredoc_producer_source(command) {
+            return source;
+        }
+    }
+
+    if contains_dynamic_shell_output(command) {
+        return IndirectInputSource::Unverified(
+            "producer contains shell expansion, substitution, or globbing".to_string(),
+        );
+    }
+
+    if command_segment_ranges(command).len() != 1 {
+        return IndirectInputSource::Unverified(
+            "producer contains multiple shell commands or pipeline stages".to_string(),
+        );
+    }
+
+    let Some((executable, mut args)) = command_tokens(command) else {
+        return IndirectInputSource::Unverified("producer could not be tokenized".to_string());
+    };
+
+    match executable.as_str() {
+        "echo" => {
+            let mut decode_escapes = false;
+            while let Some(option) = args.first() {
+                let Some(flags) = option.strip_prefix('-') else {
+                    break;
+                };
+                if flags.is_empty() || !flags.chars().all(|flag| matches!(flag, 'n' | 'e' | 'E')) {
+                    break;
+                }
+                for flag in flags.chars() {
+                    match flag {
+                        'e' => decode_escapes = true,
+                        'E' => decode_escapes = false,
+                        'n' => {}
+                        _ => unreachable!("echo flags were validated above"),
+                    }
+                }
+                args.remove(0);
+            }
+            let output = args.join(" ");
+            if decode_escapes {
+                decode_backslash_escapes(&output).map_or_else(
+                    || IndirectInputSource::Unverified("echo uses unsupported escapes".to_string()),
+                    IndirectInputSource::StaticProducer,
+                )
+            } else {
+                IndirectInputSource::StaticProducer(output)
+            }
+        }
+        "printf" => {
+            while args.first().is_some_and(|arg| arg == "--") {
+                args.remove(0);
+            }
+            render_literal_printf(&args).map_or_else(
+                || {
+                    IndirectInputSource::Unverified(
+                        "printf format is not statically renderable".to_string(),
+                    )
+                },
+                IndirectInputSource::StaticProducer,
+            )
+        }
+        "write-output" | "write-host" => IndirectInputSource::StaticProducer(args.join(" ")),
+        "cat" | "get-content" | "gc" => {
+            let files: Vec<_> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
+            if files.len() == 1 {
+                IndirectInputSource::File(PathBuf::from(files[0]))
+            } else {
+                IndirectInputSource::Unverified(
+                    "file producer must name exactly one literal file".to_string(),
+                )
+            }
+        }
+        _ => IndirectInputSource::Unverified(format!(
+            "producer {executable:?} is not a statically modeled literal source"
+        )),
+    }
+}
+
+fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource> {
+    let extracted = match extract_content(command, &crate::heredoc::ExtractionLimits::default()) {
+        ExtractionResult::Extracted(contents) => contents,
+        ExtractionResult::Partial { .. }
+        | ExtractionResult::Skipped(_)
+        | ExtractionResult::Failed(_) => {
+            return Some(IndirectInputSource::Unverified(
+                "heredoc input could not be extracted completely".to_string(),
+            ));
+        }
+        ExtractionResult::NoContent => return None,
+    };
+    let mut cat_inputs = extracted.into_iter().filter(|content| {
+        content.heredoc_type.is_some()
+            && content
+                .target_command
+                .as_deref()
+                .is_some_and(|target| target.eq_ignore_ascii_case("cat"))
+    });
+    let content = cat_inputs.next()?;
+    if cat_inputs.next().is_some() {
+        return Some(IndirectInputSource::Unverified(
+            "pipeline producer contains multiple heredoc inputs".to_string(),
+        ));
+    }
+    if !content.quoted && contains_dynamic_shell_output(&content.content) {
+        return Some(IndirectInputSource::Unverified(
+            "unquoted heredoc input contains shell expansion or globbing".to_string(),
+        ));
+    }
+    Some(IndirectInputSource::StaticProducer(content.content))
+}
+
+fn contains_dynamic_shell_output(command: &str) -> bool {
+    if contains_windows_variable_expansion(command) {
+        return true;
+    }
+
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if !in_single
+            && (matches!(byte, b'$' | b'`')
+                || (!in_double && matches!(byte, b'*' | b'?' | b'[' | b'{' | b'~')))
+        {
+            return true;
+        }
+        index += 1;
+    }
+    in_single || in_double
+}
+
+fn contains_windows_variable_expansion(command: &str) -> bool {
+    if !windows_variable_expansion_active(command) {
+        return false;
+    }
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'^' && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        match bytes[index] {
+            b'%' => {
+                if bytes
+                    .get(index + 1)
+                    .is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'*' | b'~'))
+                {
+                    return true;
+                }
+                if let Some(relative_end) = command[index + 1..].find('%') {
+                    let name = &command[index + 1..index + 1 + relative_end];
+                    if !name.is_empty()
+                        && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+                        && name
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                    {
+                        return true;
+                    }
+                }
+            }
+            b'!' => {
+                if let Some(relative_end) = command[index + 1..].find('!') {
+                    let name = &command[index + 1..index + 1 + relative_end];
+                    if !name.is_empty()
+                        && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+                        && name
+                            .as_bytes()
+                            .first()
+                            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn windows_variable_expansion_active(command: &str) -> bool {
+    if cfg!(windows) {
+        return true;
+    }
+    let lower = command.trim_start().to_ascii_lowercase();
+    lower.starts_with("cmd /c ")
+        || lower.starts_with("cmd /s /c ")
+        || lower.starts_with("cmd.exe /c ")
+        || lower.starts_with("cmd.exe /s /c ")
+}
+
+fn render_literal_printf(args: &[String]) -> Option<String> {
+    let format = args.first()?;
+    let decoded_format = decode_backslash_escapes(format)?;
+    let values = &args[1..];
+    let mut output = String::new();
+    let mut value_index = 0usize;
+    loop {
+        let pass_start = value_index;
+        let mut chars = decoded_format.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            if ch != '%' {
+                output.push(ch);
+                continue;
+            }
+            if chars.peek() == Some(&'%') {
+                chars.next();
+                output.push('%');
+                continue;
+            }
+
+            while chars.peek().is_some_and(|next| {
+                matches!(next, '-' | '+' | ' ' | '#' | '0') || next.is_ascii_digit() || *next == '.'
+            }) {
+                chars.next();
+            }
+            let conversion = chars.next()?;
+            let value = values.get(value_index).map_or("", String::as_str);
+            value_index = value_index.saturating_add(1);
+            match conversion {
+                's' => output.push_str(value),
+                'b' => output.push_str(&decode_backslash_escapes(value)?),
+                'c' => output.push(value.chars().next().unwrap_or('\0')),
+                'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' => {
+                    if !value.chars().all(|value_ch| {
+                        value_ch.is_ascii_hexdigit() || matches!(value_ch, '+' | '-' | '.')
+                    }) {
+                        return None;
+                    }
+                    output.push_str(value);
+                }
+                _ => return None,
+            }
+            if output.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+                return None;
+            }
+        }
+
+        if value_index >= values.len() || value_index == pass_start {
+            break;
+        }
+    }
+    Some(output)
+}
+
+fn decode_backslash_escapes(value: &str) -> Option<String> {
+    let chars: Vec<char> = value.chars().collect();
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0usize;
+    while index < chars.len() {
+        if chars[index] != '\\' {
+            output.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let escaped = *chars.get(index)?;
+        match escaped {
+            'a' => output.push('\x07'),
+            'b' => output.push('\x08'),
+            'c' => break,
+            'e' | 'E' => output.push('\x1b'),
+            'f' => output.push('\x0c'),
+            'n' => output.push('\n'),
+            'r' => output.push('\r'),
+            't' => output.push('\t'),
+            'v' => output.push('\x0b'),
+            '\\' => output.push('\\'),
+            'x' => {
+                let first = *chars.get(index + 1)?;
+                let second = *chars.get(index + 2)?;
+                let byte = u8::from_str_radix(&format!("{first}{second}"), 16).ok()?;
+                output.push(char::from(byte));
+                index += 2;
+            }
+            '0'..='7' => {
+                let mut octal = String::new();
+                octal.push(escaped);
+                for _ in 0..2 {
+                    if chars
+                        .get(index + 1)
+                        .is_some_and(|next| matches!(next, '0'..='7'))
+                    {
+                        index += 1;
+                        octal.push(chars[index]);
+                    } else {
+                        break;
+                    }
+                }
+                let byte = u8::from_str_radix(&octal, 8).ok()?;
+                output.push(char::from(byte));
+            }
+            other => output.push(other),
+        }
+        index += 1;
+    }
+    Some(output)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SedShellSource {
+    Static(String),
+    Unverified(String),
+}
+
+fn collect_sed_shell_sources(command: &str, project_path: Option<&Path>) -> Vec<SedShellSource> {
+    if !command
+        .as_bytes()
+        .windows(3)
+        .any(|window| window.eq_ignore_ascii_case(b"sed"))
+    {
+        return Vec::new();
+    }
+
+    let mut sources = Vec::new();
+    let segment_ranges = command_segment_ranges(command);
+    let compound_command = segment_ranges.len() > 1;
+    for (start, end) in segment_ranges {
+        let Some((executable, args)) = command_tokens(&command[start..end]) else {
+            continue;
+        };
+        if executable != "sed" || sed_sandbox_option_is_active(&args) {
+            continue;
+        }
+        for script in sed_expression_scripts(&args) {
+            sources.extend(sed_script_shell_sources(&script));
+        }
+        for path in sed_program_files(&args) {
+            if compound_command {
+                sources.push(SedShellSource::Unverified(
+                    "sed program file is consumed in a compound command and could be modified after inspection"
+                        .to_string(),
+                ));
+                continue;
+            }
+            match read_indirect_input_file(&path, project_path) {
+                Ok(script) => sources.extend(sed_script_shell_sources(&script)),
+                Err(detail) => sources.push(SedShellSource::Unverified(format!(
+                    "sed program file cannot be safely inspected: {detail}"
+                ))),
+            }
+        }
+    }
+    sources
+}
+
+fn sed_sandbox_option_is_active(args: &[String]) -> bool {
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            return false;
+        }
+        if arg == "--sandbox" {
+            return true;
+        }
+        if matches!(
+            arg.as_str(),
+            "-e" | "--expression" | "-f" | "--file" | "-l" | "--line-length"
+        ) {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with("--expression=")
+            || arg.starts_with("--file=")
+            || arg.starts_with("--line-length=")
+            || arg
+                .strip_prefix("-e")
+                .is_some_and(|value| !value.is_empty())
+            || arg
+                .strip_prefix("-f")
+                .is_some_and(|value| !value.is_empty())
+            || arg
+                .strip_prefix("-l")
+                .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        if let Some(flags) = arg
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+        {
+            if flags.contains('e') || flags.contains('f') || flags.contains('l') {
+                let consumes_next = flags
+                    .char_indices()
+                    .find(|(_, flag)| matches!(flag, 'e' | 'f' | 'l'))
+                    .is_some_and(|(position, _)| position + 1 == flags.len());
+                index = index.saturating_add(if consumes_next { 2 } else { 1 });
+                continue;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_sed_shell_sources(
+    sources: &[SedShellSource],
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    nested_command_depth: usize,
+) -> Option<EvaluationResult> {
+    let filesystem_enabled = ordered_packs
+        .iter()
+        .any(|pack_id| pack_id == "core.filesystem");
+
+    for source in sources {
+        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
+            return Some(EvaluationResult::allowed_due_to_budget());
+        }
+
+        match source {
+            SedShellSource::Static(shell_command) => {
+                let mut result = evaluate_command_with_pack_order_deadline_at_path_inner(
+                    shell_command,
+                    enabled_keywords,
+                    ordered_packs,
+                    keyword_index,
+                    compiled_overrides,
+                    allowlists,
+                    heredoc_settings,
+                    allow_once_audit,
+                    project_path,
+                    deadline,
+                    nested_command_depth + 1,
+                );
+                if result.skipped_due_to_budget {
+                    return Some(result);
+                }
+                if result.is_denied() {
+                    if let Some(info) = result.pattern_info.as_mut() {
+                        info.reason = format!(
+                            "GNU sed executes an embedded shell command: {}",
+                            info.reason
+                        );
+                        // The nested evaluator's byte offsets are relative to
+                        // the extracted command, not the outer sed invocation.
+                        info.matched_span = None;
+                    }
+                    return Some(result);
+                }
+            }
+            SedShellSource::Unverified(detail) if filesystem_enabled => {
+                let reason = format!(
+                    "GNU sed executes shell input that dcg cannot statically verify: {detail}."
+                );
+                if let Some(hit) = allowlists.match_rule_at_path(
+                    "core.filesystem",
+                    SED_EXEC_UNVERIFIED_RULE,
+                    project_path,
+                ) {
+                    if first_allowlist_hit.is_none() {
+                        *first_allowlist_hit = Some((
+                            PatternMatch {
+                                pack_id: Some("core.filesystem".to_string()),
+                                pattern_name: Some(SED_EXEC_UNVERIFIED_RULE.to_string()),
+                                severity: Some(crate::packs::Severity::High),
+                                reason,
+                                source: MatchSource::Pack,
+                                matched_span: None,
+                                matched_text_preview: None,
+                                explanation: Some(
+                                    "Use a literal sed replacement or inspect the fully rendered shell command before allowing execution. Backreferences, '&', and an empty `e` command depend on runtime input."
+                                        .to_string(),
+                                ),
+                                suggestions: &[],
+                            },
+                            hit.layer,
+                            hit.entry.reason.clone(),
+                        ));
+                    }
+                    continue;
+                }
+                return Some(EvaluationResult::denied_by_pack_pattern(
+                    "core.filesystem",
+                    SED_EXEC_UNVERIFIED_RULE,
+                    &reason,
+                    Some(
+                        "Use a literal sed replacement or inspect the fully rendered shell command before allowing execution. Backreferences, '&', and an empty `e` command depend on runtime input.",
+                    ),
+                    crate::packs::Severity::High,
+                    &[],
+                ));
+            }
+            SedShellSource::Unverified(_) => {}
+        }
+    }
+    None
+}
+
+fn sed_expression_scripts(args: &[String]) -> Vec<String> {
+    let mut scripts = Vec::new();
+    let mut explicit_expression = false;
+    let mut index = 0usize;
+    let mut options_ended = false;
+    while index < args.len() {
+        let arg = &args[index];
+        if !options_ended && arg == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
+        if !options_ended && matches!(arg.as_str(), "-e" | "--expression") {
+            explicit_expression = true;
+            if let Some(script) = args.get(index + 1) {
+                scripts.push(script.clone());
+            }
+            index = index.saturating_add(2);
+            continue;
+        }
+        if !options_ended {
+            if let Some(script) = arg.strip_prefix("--expression=") {
+                explicit_expression = true;
+                scripts.push(script.to_string());
+                index += 1;
+                continue;
+            }
+            if let Some(script) = arg.strip_prefix("-e").filter(|script| !script.is_empty()) {
+                explicit_expression = true;
+                scripts.push(script.to_string());
+                index += 1;
+                continue;
+            }
+            if matches!(arg.as_str(), "-l" | "--line-length") {
+                index = index.saturating_add(2);
+                continue;
+            }
+            if arg.starts_with("--line-length=")
+                || arg
+                    .strip_prefix("-l")
+                    .is_some_and(|value| !value.is_empty())
+            {
+                index += 1;
+                continue;
+            }
+            if arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('e') {
+                explicit_expression = true;
+                let e_index = arg[1..].find('e').unwrap_or(0) + 2;
+                if let Some(script) = arg.get(e_index..).filter(|script| !script.is_empty()) {
+                    scripts.push(script.to_string());
+                    index += 1;
+                } else {
+                    if let Some(script) = args.get(index + 1) {
+                        scripts.push(script.clone());
+                    }
+                    index = index.saturating_add(2);
+                }
+                continue;
+            }
+            if matches!(arg.as_str(), "-f" | "--file") {
+                explicit_expression = true;
+                index = index.saturating_add(2);
+                continue;
+            }
+            if arg.starts_with("--file=") {
+                explicit_expression = true;
+                index += 1;
+                continue;
+            }
+            if let Some(flags) = arg
+                .strip_prefix('-')
+                .filter(|flags| !flags.starts_with('-'))
+            {
+                if let Some(file_index) = flags.find('f') {
+                    explicit_expression = true;
+                    index = if file_index + 1 < flags.len() {
+                        index + 1
+                    } else {
+                        index.saturating_add(2)
+                    };
+                    continue;
+                }
+            }
+            if arg.starts_with('-') {
+                index += 1;
+                continue;
+            }
+        }
+
+        if !explicit_expression {
+            scripts.push(arg.clone());
+        }
+        break;
+    }
+    scripts
+}
+
+fn sed_program_files(args: &[String]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+        if matches!(arg.as_str(), "-e" | "--expression" | "-l" | "--line-length") {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if arg.starts_with("--expression=")
+            || arg.starts_with("--line-length=")
+            || arg
+                .strip_prefix("-e")
+                .is_some_and(|value| !value.is_empty())
+            || arg
+                .strip_prefix("-l")
+                .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        if matches!(arg.as_str(), "-f" | "--file") {
+            if let Some(path) = args.get(index + 1) {
+                files.push(PathBuf::from(path));
+            }
+            index = index.saturating_add(2);
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("--file=") {
+            if !path.is_empty() {
+                files.push(PathBuf::from(path));
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(flags) = arg
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+        {
+            if let Some((option_index, option)) = flags
+                .char_indices()
+                .find(|(_, flag)| matches!(flag, 'e' | 'f' | 'l'))
+            {
+                let attached = &flags[option_index + 1..];
+                if option == 'f' {
+                    if attached.is_empty() {
+                        if let Some(path) = args.get(index + 1) {
+                            files.push(PathBuf::from(path));
+                        }
+                    } else {
+                        files.push(PathBuf::from(attached));
+                    }
+                }
+                index = index.saturating_add(if attached.is_empty() { 2 } else { 1 });
+                continue;
+            }
+        }
+        index += 1;
+    }
+    files
+}
+
+fn sed_script_shell_sources(script: &str) -> Vec<SedShellSource> {
+    let bytes = script.as_bytes();
+    let mut sources = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && (bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b';')
+        {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
+            break;
+        }
+
+        let mut command_start = skip_sed_addresses(bytes, cursor);
+        while bytes.get(command_start) == Some(&b'{') {
+            command_start += 1;
+            command_start = skip_sed_addresses(bytes, command_start);
+        }
+        let Some(&command) = bytes.get(command_start) else {
+            break;
+        };
+        if command == b'}' {
+            cursor = command_start + 1;
+            continue;
+        }
+        if command == b'e' {
+            let line_end = sed_line_end(bytes, command_start + 1);
+            let shell = script[command_start + 1..line_end].trim();
+            if shell.is_empty() {
+                sources.push(SedShellSource::Unverified(
+                    "sed's e command executes the dynamic pattern space".to_string(),
+                ));
+            } else if !sed_shell_command_is_static(shell) {
+                sources.push(SedShellSource::Unverified(
+                    "sed's e command contains runtime shell expansion".to_string(),
+                ));
+            } else {
+                sources.push(SedShellSource::Static(shell.to_string()));
+            }
+            cursor = line_end.saturating_add(1);
+            continue;
+        }
+
+        if command == b's' {
+            match parse_sed_substitution_shell_source(script, command_start) {
+                Some((source, next)) => {
+                    if let Some(source) = source {
+                        sources.push(source);
+                    }
+                    cursor = next;
+                    continue;
+                }
+                None => {
+                    cursor = next_sed_statement(bytes, command_start + 1);
+                    continue;
+                }
+            }
+        }
+        if matches!(
+            command,
+            b'#' | b'a' | b'c' | b'i' | b'r' | b'R' | b'w' | b'W'
+        ) {
+            cursor = sed_line_end(bytes, command_start + 1).saturating_add(1);
+            continue;
+        }
+        cursor = next_sed_statement(bytes, command_start + 1);
+    }
+    sources
+}
+
+fn skip_sed_addresses(bytes: &[u8], mut index: usize) -> usize {
+    for _ in 0..2 {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        let start = index;
+        if bytes.get(index) == Some(&b'/') {
+            if let Some(end) = find_unescaped_byte(bytes, index + 1, b'/') {
+                index = end + 1;
+            }
+        } else if bytes.get(index) == Some(&b'\\') {
+            if let Some(&delimiter) = bytes.get(index + 1) {
+                if let Some(end) = find_unescaped_byte(bytes, index + 2, delimiter) {
+                    index = end + 1;
+                }
+            }
+        } else {
+            if matches!(bytes.get(index), Some(b'+') | Some(b'-')) {
+                index += 1;
+            }
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'$' || *byte == b'~')
+            {
+                index += 1;
+            }
+        }
+        if index == start {
+            break;
+        }
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b',') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index) == Some(&b'!') {
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+    }
+    index
+}
+
+fn parse_sed_substitution_shell_source(
+    script: &str,
+    command_start: usize,
+) -> Option<(Option<SedShellSource>, usize)> {
+    let bytes = script.as_bytes();
+    let delimiter = *bytes.get(command_start + 1)?;
+    if matches!(delimiter, b'\\' | b'\n' | b'\r') {
+        return None;
+    }
+    let pattern_end = find_unescaped_byte(bytes, command_start + 2, delimiter)?;
+    let replacement_end = find_unescaped_byte(bytes, pattern_end + 1, delimiter)?;
+    let line_end = sed_line_end(bytes, replacement_end + 1);
+    let (executes, writes_file) =
+        parse_sed_substitution_flags(&script[replacement_end + 1..line_end]);
+    let statement_end = if writes_file {
+        line_end.saturating_add(1)
+    } else {
+        next_sed_statement(bytes, replacement_end + 1)
+    };
+    if !executes {
+        return Some((None, statement_end));
+    }
+
+    let replacement = &script[pattern_end + 1..replacement_end];
+    let source = decode_static_sed_replacement(replacement, delimiter).map_or_else(
+        || {
+            SedShellSource::Unverified(
+                "sed's s///e replacement depends on matched input".to_string(),
+            )
+        },
+        |shell| {
+            if sed_shell_command_is_static(&shell) {
+                SedShellSource::Static(shell)
+            } else {
+                SedShellSource::Unverified(
+                    "sed's s///e replacement contains runtime shell expansion".to_string(),
+                )
+            }
+        },
+    );
+    Some((Some(source), statement_end))
+}
+
+fn sed_shell_command_is_static(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single => {
+                if index + 1 >= bytes.len() {
+                    return false;
+                }
+                index += 2;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'$' | b'`' if !in_single => return false,
+            _ => {}
+        }
+        index += 1;
+    }
+    !in_single && !in_double
+}
+
+fn decode_static_sed_replacement(replacement: &str, delimiter: u8) -> Option<String> {
+    let bytes = replacement.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'&' => return None,
+            b'\\' => {
+                let escaped = *bytes.get(index + 1)?;
+                if escaped.is_ascii_digit() || matches!(escaped, b'L' | b'l' | b'U' | b'u' | b'E') {
+                    return None;
+                }
+                match escaped {
+                    b'&' => output.push(b'&'),
+                    b'\\' => output.push(b'\\'),
+                    b'n' => output.push(b'\n'),
+                    escaped if escaped == delimiter => output.push(delimiter),
+                    _ => return None,
+                }
+                index += 2;
+            }
+            byte => {
+                output.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(output).ok()
+}
+
+fn parse_sed_substitution_flags(flags_and_tail: &str) -> (bool, bool) {
+    let mut executes = false;
+    let mut chars = flags_and_tail.trim_start().chars().peekable();
+    while let Some(flag) = chars.next() {
+        match flag {
+            'e' => executes = true,
+            'g' | 'p' | 'i' | 'I' | 'm' | 'M' => {}
+            '0'..='9' => {
+                while chars.peek().is_some_and(char::is_ascii_digit) {
+                    chars.next();
+                }
+            }
+            'w' | 'W' => return (executes, true),
+            ';' | '\n' | '\r' => break,
+            flag if flag.is_ascii_whitespace() => break,
+            _ => break,
+        }
+    }
+    (executes, false)
+}
+
+fn find_unescaped_byte(bytes: &[u8], mut index: usize, target: u8) -> Option<usize> {
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = index.saturating_add(2);
+        } else if bytes[index] == target {
+            return Some(index);
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn next_sed_statement(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index = index.saturating_add(2);
+        } else if matches!(bytes[index], b';' | b'\n' | b'\r') {
+            return index + 1;
+        } else {
+            index += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn sed_line_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
+        index += 1;
+    }
+    index
+}
+
+fn input_redirect(command: &str) -> Option<RedirectInput> {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut first_command_end = None;
+    let mut selected_source = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if in_single || in_double || byte != b'<' {
+            index += 1;
+            continue;
+        }
+
+        let mut command_end = index;
+        while command_end > 0 && bytes[command_end - 1].is_ascii_digit() {
+            command_end -= 1;
+        }
+        if command_end < index {
+            let has_fd_boundary = command_end == 0
+                || bytes[command_end - 1].is_ascii_whitespace()
+                || matches!(bytes[command_end - 1], b';' | b'&' | b'|');
+            if !has_fd_boundary {
+                command_end = index;
+            } else if &command[command_end..index] != "0" {
+                // `N<file` redirects descriptor N. Only descriptor 0 replaces
+                // the protected process's stdin; e.g. `3<safe` must not hide a
+                // dangerous pipeline producer.
+                index += 1;
+                continue;
+            }
+        }
+        let command_end = *first_command_end.get_or_insert(command_end);
+        match bytes.get(index + 1) {
+            Some(b'<') => {
+                // Heredocs/here-strings are reconstructed by the existing
+                // inline-script scanner. Mixing one with another stdin
+                // redirect is difficult to order without executing the shell,
+                // so fail closed rather than guessing which source wins.
+                let line_end = command[index + 2..]
+                    .find('\n')
+                    .map_or(command.len(), |offset| index + 2 + offset);
+                if selected_source.is_some() || command[index + 2..line_end].contains('<') {
+                    return Some(RedirectInput::Source {
+                        command_end,
+                        source: IndirectInputSource::Unverified(
+                            "stdin combines a heredoc/here-string with another redirect"
+                                .to_string(),
+                        ),
+                    });
+                }
+                return Some(RedirectInput::HandledByHeredoc);
+            }
+            Some(b'(') => {
+                selected_source = Some(IndirectInputSource::Unverified(
+                    "stdin comes from a process substitution".to_string(),
+                ));
+                index += 2;
+                continue;
+            }
+            Some(b'&') => {
+                selected_source = Some(IndirectInputSource::Unverified(
+                    "stdin is duplicated from another file descriptor".to_string(),
+                ));
+                index += 2;
+                continue;
+            }
+            Some(b'>') => {
+                selected_source = Some(IndirectInputSource::Unverified(
+                    "stdin uses a read-write redirect that is not statically modeled".to_string(),
+                ));
+                index += 2;
+                continue;
+            }
+            _ => {}
+        }
+
+        let tail = command[index + 1..].trim_start();
+        let raw_path = first_shell_word(tail)?;
+        let path = parse_redirect_path(raw_path)?;
+        selected_source = Some(if contains_dynamic_shell_output(raw_path) {
+            IndirectInputSource::Unverified(
+                "stdin redirect path contains dynamic shell expansion".to_string(),
+            )
+        } else {
+            IndirectInputSource::File(path)
+        });
+        index += 1;
+    }
+    selected_source.map(|source| RedirectInput::Source {
+        command_end: first_command_end.unwrap_or(0),
+        source,
+    })
+}
+
+fn parse_redirect_path(raw_path: &str) -> Option<PathBuf> {
+    let unquoted = if raw_path.len() >= 2 {
+        let bytes = raw_path.as_bytes();
+        if matches!(
+            (bytes.first(), bytes.last()),
+            (Some(b'\''), Some(b'\'')) | (Some(b'"'), Some(b'"'))
+        ) {
+            &raw_path[1..raw_path.len() - 1]
+        } else {
+            raw_path
+        }
+    } else {
+        raw_path
+    };
+
+    let looks_like_windows_path = unquoted.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+        && unquoted
+            .as_bytes()
+            .get(2)
+            .is_some_and(|byte| matches!(byte, b'\\' | b'/'))
+        || unquoted.starts_with("\\\\");
+    if looks_like_windows_path || unquoted != raw_path {
+        return (!unquoted.is_empty()).then(|| PathBuf::from(unquoted));
+    }
+
+    shell_words::split(raw_path)
+        .ok()?
+        .into_iter()
+        .next()
+        .map(PathBuf::from)
+}
+
+fn first_shell_word(input: &str) -> Option<&str> {
+    let bytes = input.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single && index + 1 < bytes.len() => index += 2,
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                index += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                index += 1;
+            }
+            byte if byte.is_ascii_whitespace() && !in_single && !in_double => {
+                return (index > 0).then(|| &input[..index]);
+            }
+            _ => index += 1,
+        }
+    }
+    (index > 0 && !in_single && !in_double).then_some(input)
+}
+
+fn command_argument_payloads(command: &str, compound_command: bool) -> Vec<IndirectInputFlow> {
+    let masked = mask_command_substitutions(command);
+    let Some((executable, args)) = command_tokens(&masked.command) else {
+        return Vec::new();
+    };
+
+    let mut flows = Vec::new();
+    for (pack_id, value) in code_argument_slots(&executable, &args) {
+        let replacements: Vec<_> = masked
+            .substitutions
+            .iter()
+            .filter(|(marker, _)| value.contains(marker))
+            .map(|(marker, body)| (marker.clone(), static_producer_source(body)))
+            .collect();
+
+        let mut residual = value.to_string();
+        for (marker, _) in &replacements {
+            residual = residual.replace(marker, "");
+        }
+        let source = if masked
+            .dynamic_markers
+            .iter()
+            .any(|marker| residual.contains(marker))
+        {
+            IndirectInputSource::Unverified(
+                "a protected command argument contains unresolved shell expansion".to_string(),
+            )
+        } else if replacements.is_empty() {
+            IndirectInputSource::StaticProducer(value.to_string())
+        } else {
+            IndirectInputSource::Template {
+                value: value.to_string(),
+                replacements,
+            }
+        };
+        flows.push(IndirectInputFlow {
+            pack_id,
+            source,
+            psql_interpolates_variables: false,
+        });
+    }
+    for (pack_id, value) in file_argument_slots(&executable, &args) {
+        let contains_substitution = masked
+            .substitutions
+            .iter()
+            .any(|(marker, _)| value.contains(marker));
+        let dynamic = contains_substitution
+            || masked
+                .dynamic_markers
+                .iter()
+                .any(|marker| value.contains(marker));
+        if file_path_may_read_stdin(value) && !dynamic {
+            // Visible pipelines and redirects are reconstructed separately.
+            // With no visible source, an interactive stdin alias has no
+            // payload for dcg to inspect, just like the client's default REPL.
+            continue;
+        }
+        let source = if dynamic {
+            IndirectInputSource::Unverified(
+                "an executable database file path contains shell expansion or substitution"
+                    .to_string(),
+            )
+        } else if compound_command {
+            IndirectInputSource::Unverified(
+                "an executable database file is consumed in a compound command and could be modified after inspection"
+                    .to_string(),
+            )
+        } else {
+            IndirectInputSource::File(PathBuf::from(value))
+        };
+        flows.push(IndirectInputFlow {
+            pack_id,
+            source,
+            psql_interpolates_variables: pack_id == "database.postgresql",
+        });
+    }
+    let psql_analysis = (executable == "psql").then(|| analyze_psql_args(&args));
+    if psql_analysis
+        .as_ref()
+        .is_some_and(|analysis| !analysis.no_psqlrc && !analysis.skips_startup_files)
+    {
+        let inline_value = env_split_string_assignment(&masked.command, "PSQLRC", "psql")
+            .or_else(|| shell_assignment_value_before_executable(&masked.command, "PSQLRC", "psql"))
+            .filter(|value| !value.is_empty());
+        let inherited_value = std::env::var_os("PSQLRC")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let startup_path_is_required = inline_value.is_some() || inherited_value.is_some();
+        let startup_path = inline_value
+            .as_ref()
+            .map(PathBuf::from)
+            .or(inherited_value)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".psqlrc")));
+        if let Some(value) = startup_path {
+            let dynamic = masked
+                .dynamic_markers
+                .iter()
+                .any(|marker| value.to_string_lossy().contains(marker))
+                || masked
+                    .substitutions
+                    .iter()
+                    .any(|(marker, _)| value.to_string_lossy().contains(marker));
+            let source = if dynamic {
+                IndirectInputSource::Unverified(
+                    "PSQLRC names a dynamically resolved startup script".to_string(),
+                )
+            } else if compound_command && (startup_path_is_required || value.exists()) {
+                IndirectInputSource::Unverified(
+                    "PSQLRC is consumed in a compound command and could be modified before psql starts"
+                        .to_string(),
+                )
+            } else {
+                IndirectInputSource::PsqlStartupFile {
+                    path: value,
+                    required: startup_path_is_required,
+                }
+            };
+            flows.push(IndirectInputFlow {
+                pack_id: "database.postgresql",
+                source,
+                psql_interpolates_variables: true,
+            });
+        }
+    }
+    if unverified_embedded_file_source(&executable, &args) {
+        let pack_id = match executable.as_str() {
+            "psql" => "database.postgresql",
+            "mysql" | "mariadb" => "database.mysql",
+            "mongo" | "mongosh" => "database.mongodb",
+            "sqlite3" => "database.sqlite",
+            _ => return flows,
+        };
+        flows.push(IndirectInputFlow {
+            pack_id,
+            source: IndirectInputSource::Unverified(
+                "an executable database include/load command has no static file operand"
+                    .to_string(),
+            ),
+            psql_interpolates_variables: pack_id == "database.postgresql",
+        });
+    }
+    flows
+}
+
+fn shell_assignment_value_before_executable(
+    command: &str,
+    requested_name: &str,
+    requested_executable: &str,
+) -> Option<String> {
+    let tokens = shell_words::split(command).ok()?;
+    let mut effective = None;
+    let mut index = 0usize;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if let Some((name, value)) = token.split_once('=') {
+            let valid_name = name
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            if valid_name {
+                if name == requested_name {
+                    effective = Some(value.to_string());
+                }
+                index += 1;
+                continue;
+            }
+        }
+        let executable = token
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(token)
+            .trim_end_matches(".exe");
+        if executable.eq_ignore_ascii_case(requested_executable) {
+            break;
+        }
+        match executable {
+            "env" | "command" => {
+                index += 1;
+                while index < tokens.len() && tokens[index].starts_with('-') {
+                    let consumes_value = matches!(
+                        tokens[index].as_str(),
+                        "-u" | "--unset" | "-C" | "--chdir" | "-S" | "--split-string"
+                    );
+                    index += if consumes_value { 2 } else { 1 };
+                }
+            }
+            "sudo" => {
+                index += 1;
+                while index < tokens.len() && tokens[index].starts_with('-') {
+                    let option = tokens[index].as_str();
+                    let consumes_value = matches!(
+                        option,
+                        "-u" | "--user"
+                            | "-g"
+                            | "--group"
+                            | "-h"
+                            | "--host"
+                            | "-p"
+                            | "--prompt"
+                            | "-C"
+                            | "--close-from"
+                            | "-r"
+                            | "--role"
+                            | "-U"
+                            | "--other-user"
+                            | "-D"
+                            | "--chdir"
+                            | "-t"
+                            | "--type"
+                            | "-a"
+                            | "--auth-type"
+                            | "-T"
+                            | "--command-timeout"
+                    );
+                    index += if consumes_value { 2 } else { 1 };
+                }
+            }
+            _ => return None,
+        }
+    }
+    effective
+}
+
+fn env_split_string_assignment(
+    command: &str,
+    requested_name: &str,
+    requested_executable: &str,
+) -> Option<String> {
+    let tokens = shell_words::split(command).ok()?;
+    let env_index = tokens.iter().position(|token| {
+        token
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("env"))
+    })?;
+    let mut index = env_index + 1;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        let split = if matches!(token.as_str(), "-S" | "--split-string") {
+            tokens.get(index + 1).map(String::as_str)
+        } else {
+            token
+                .strip_prefix("--split-string=")
+                .or_else(|| token.strip_prefix("-S").filter(|value| !value.is_empty()))
+        };
+        if let Some(split) = split {
+            return shell_assignment_value_before_executable(
+                split,
+                requested_name,
+                requested_executable,
+            );
+        }
+        index += 1;
+    }
+    None
+}
+
+fn code_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'static str, &'a str)> {
+    match executable {
+        "redis-cli" | "valkey-cli" | "keydb-cli" => analyze_redis_cli_args(args)
+            .code_values
+            .into_iter()
+            .map(|value| ("database.redis", value))
+            .collect(),
+        "psql" => analyze_psql_args(args)
+            .code_values
+            .into_iter()
+            .map(|value| ("database.postgresql", value))
+            .collect(),
+        "mysql" | "mariadb" => analyze_mysql_cli_args(args)
+            .code_values
+            .into_iter()
+            .map(|value| ("database.mysql", value))
+            .collect(),
+        "mongo" | "mongosh" => analyze_mongo_cli_args(args)
+            .code_values
+            .into_iter()
+            .map(|value| ("database.mongodb", value))
+            .collect(),
+        "sqlite3" => analyze_sqlite_cli_args(args)
+            .code_values
+            .into_iter()
+            .map(|value| ("database.sqlite", value))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn file_argument_slots<'a>(executable: &str, args: &'a [String]) -> Vec<(&'static str, &'a str)> {
+    match executable {
+        "redis-cli" | "valkey-cli" | "keydb-cli" => analyze_redis_cli_args(args)
+            .file_values
+            .into_iter()
+            .map(|value| ("database.redis", value))
+            .collect(),
+        "psql" => analyze_psql_args(args)
+            .file_values
+            .into_iter()
+            .map(|value| ("database.postgresql", value))
+            .collect(),
+        "mysql" | "mariadb" => analyze_mysql_cli_args(args)
+            .file_values
+            .into_iter()
+            .map(|value| ("database.mysql", value))
+            .collect(),
+        "mongo" | "mongosh" => analyze_mongo_cli_args(args)
+            .file_values
+            .into_iter()
+            .map(|value| ("database.mongodb", value))
+            .collect(),
+        "sqlite3" => analyze_sqlite_cli_args(args)
+            .file_values
+            .into_iter()
+            .map(|value| ("database.sqlite", value))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn unverified_embedded_file_source(executable: &str, args: &[String]) -> bool {
+    match executable {
+        "psql" => analyze_psql_args(args).has_unverified_file_source,
+        "mysql" | "mariadb" => analyze_mysql_cli_args(args).has_unverified_file_source,
+        "mongo" | "mongosh" => analyze_mongo_cli_args(args).has_unverified_file_source,
+        "sqlite3" => analyze_sqlite_cli_args(args).has_unverified_file_source,
+        _ => false,
+    }
+}
+
+struct MaskedCommand {
+    command: String,
+    substitutions: Vec<(String, String)>,
+    dynamic_markers: Vec<String>,
+}
+
+fn mask_command_substitutions(command: &str) -> MaskedCommand {
+    let bytes = command.as_bytes();
+    let mut masked = String::with_capacity(command.len());
+    let mut substitutions = Vec::new();
+    let mut dynamic_markers = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let windows_expansions = windows_variable_expansion_active(command);
+    while index < bytes.len() {
+        if windows_expansions && bytes[index] == b'^' && index + 1 < bytes.len() {
+            let Some(escaped) = command[index + 1..].chars().next() else {
+                break;
+            };
+            masked.push('^');
+            masked.push(escaped);
+            index += 1 + escaped.len_utf8();
+            continue;
+        }
+        if bytes[index] == b'\\' && !in_single && index + 1 < bytes.len() {
+            let Some(escaped) = command[index + 1..].chars().next() else {
+                break;
+            };
+            masked.push('\\');
+            masked.push(escaped);
+            index += 1 + escaped.len_utf8();
+            continue;
+        }
+        if bytes[index] == b'\'' && !in_double {
+            in_single = !in_single;
+            masked.push('\'');
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'"' && !in_single {
+            in_double = !in_double;
+            masked.push('"');
+            index += 1;
+            continue;
+        }
+        if !in_single && bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            if bytes.get(index + 2) == Some(&b'(') {
+                let marker = unique_internal_marker(command, "ARITH", dynamic_markers.len());
+                masked.push_str(&marker);
+                dynamic_markers.push(marker);
+                index += 2;
+                continue;
+            }
+            let Some(close) = find_substitution_close(command, index + 2) else {
+                let marker = unique_internal_marker(command, "UNCLOSED", dynamic_markers.len());
+                masked.push_str(&marker);
+                dynamic_markers.push(marker);
+                break;
+            };
+            let marker = unique_substitution_marker(command, substitutions.len());
+            masked.push_str(&marker);
+            substitutions.push((marker, command[index + 2..close].to_string()));
+            index = close + 1;
+            continue;
+        }
+        if !in_single && bytes[index] == b'`' {
+            let Some(relative_close) = command[index + 1..].find('`') else {
+                let marker = unique_internal_marker(command, "UNCLOSED", dynamic_markers.len());
+                masked.push_str(&marker);
+                dynamic_markers.push(marker);
+                break;
+            };
+            let close = index + 1 + relative_close;
+            let marker = unique_substitution_marker(command, substitutions.len());
+            masked.push_str(&marker);
+            substitutions.push((marker, command[index + 1..close].to_string()));
+            index = close + 1;
+            continue;
+        }
+        if !in_single && bytes[index] == b'$' {
+            let consumed = shell_parameter_expansion_len(&command[index..]);
+            if consumed > 1 {
+                let marker = unique_internal_marker(command, "PARAM", dynamic_markers.len());
+                masked.push_str(&marker);
+                dynamic_markers.push(marker);
+                index += consumed;
+                continue;
+            }
+        }
+        if windows_expansions && matches!(bytes[index], b'%' | b'!') {
+            let delimiter = bytes[index];
+            if let Some(relative_end) = bytes[index + 1..]
+                .iter()
+                .position(|candidate| *candidate == delimiter)
+            {
+                let end = index + 1 + relative_end;
+                let name = &command[index + 1..end];
+                if !name.is_empty()
+                    && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+                    && name
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    let marker = unique_internal_marker(command, "WINPARAM", dynamic_markers.len());
+                    masked.push_str(&marker);
+                    dynamic_markers.push(marker);
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        if !in_single && !in_double && matches!(bytes[index], b'*' | b'?' | b'[' | b'{' | b'~') {
+            let marker = unique_internal_marker(command, "GLOB", dynamic_markers.len());
+            masked.push_str(&marker);
+            dynamic_markers.push(marker);
+            index += 1;
+            continue;
+        }
+        let Some(ch) = command[index..].chars().next() else {
+            break;
+        };
+        masked.push(ch);
+        index += ch.len_utf8();
+    }
+    MaskedCommand {
+        command: masked,
+        substitutions,
+        dynamic_markers,
+    }
+}
+
+fn unique_internal_marker(command: &str, kind: &str, index: usize) -> String {
+    let mut marker = format!("__DCG_{kind}_{index}__");
+    while command.contains(&marker) {
+        marker.push('_');
+    }
+    marker
+}
+
+fn shell_parameter_expansion_len(input: &str) -> usize {
+    let bytes = input.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return 0;
+    }
+    match bytes.get(1).copied() {
+        Some(b'{') => input[2..]
+            .find('}')
+            .map_or(input.len(), |relative_end| relative_end + 3),
+        Some(byte) if byte.is_ascii_alphabetic() || byte == b'_' => {
+            2 + bytes[2..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                .count()
+        }
+        Some(byte)
+            if byte.is_ascii_digit()
+                || matches!(byte, b'@' | b'*' | b'#' | b'?' | b'-' | b'$' | b'!') =>
+        {
+            2
+        }
+        _ => 1,
+    }
+}
+
+fn unique_substitution_marker(command: &str, index: usize) -> String {
+    let mut marker = format!("__DCG_SUB_{index}__");
+    while command.contains(&marker) {
+        marker.push('_');
+    }
+    marker
+}
+
+fn find_substitution_close(command: &str, start: usize) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut depth = 1usize;
+    let mut index = start;
+    let mut in_single = false;
+    let mut in_double = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if in_single {
+            index += 1;
+            continue;
+        }
+        if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            depth += 1;
+            index += 2;
+            continue;
+        }
+        if byte == b')' && !in_double {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+#[derive(Debug)]
+struct ResolvedIndirectInput {
+    payload: String,
+    origin: Option<PathBuf>,
+}
+
+fn resolve_indirect_input(
+    source: &IndirectInputSource,
+    project_path: Option<&Path>,
+) -> Result<ResolvedIndirectInput, String> {
+    match source {
+        IndirectInputSource::StaticProducer(payload) => {
+            if payload.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+                Err(format!(
+                    "static stdin payload exceeds {MAX_INDIRECT_INPUT_BYTES} bytes"
+                ))
+            } else {
+                Ok(ResolvedIndirectInput {
+                    payload: payload.clone(),
+                    origin: None,
+                })
+            }
+        }
+        IndirectInputSource::File(path) => read_indirect_input_file_with_origin(path, project_path),
+        IndirectInputSource::PsqlStartupFile { .. } => Err(
+            "internal error: a psql startup file was resolved without version-candidate expansion"
+                .to_string(),
+        ),
+        IndirectInputSource::Template {
+            value,
+            replacements,
+        } => {
+            let mut rendered = value.clone();
+            for (marker, replacement_source) in replacements {
+                let replacement = resolve_indirect_input(replacement_source, project_path)?;
+                // POSIX command substitution removes trailing newlines from
+                // captured stdout before inserting it into the argument.
+                rendered = rendered.replace(marker, replacement.payload.trim_end_matches('\n'));
+                if rendered.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+                    return Err(format!(
+                        "reconstructed argument exceeds {MAX_INDIRECT_INPUT_BYTES} bytes"
+                    ));
+                }
+            }
+            Ok(ResolvedIndirectInput {
+                payload: rendered,
+                origin: None,
+            })
+        }
+        IndirectInputSource::Unverified(reason) => Err(reason.clone()),
+    }
+}
+
+fn resolve_indirect_inputs(
+    source: &IndirectInputSource,
+    project_path: Option<&Path>,
+) -> Result<Vec<ResolvedIndirectInput>, String> {
+    let IndirectInputSource::PsqlStartupFile { path, required } = source else {
+        return resolve_indirect_input(source, project_path).map(|resolved| vec![resolved]);
+    };
+
+    let base = resolve_indirect_input_path(path, project_path);
+    let parent = base.parent().unwrap_or_else(|| Path::new("."));
+    let base_name = base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "PSQLRC does not have a UTF-8 file name".to_string())?;
+    let version_prefix = format!("{base_name}-");
+    let mut version_specific_candidates = Vec::new();
+    let entries = fs::read_dir(parent).map_err(|error| {
+        format!(
+            "cannot inspect version-specific PSQLRC candidates in {}: {error}",
+            parent.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "cannot inspect a version-specific PSQLRC candidate in {}: {error}",
+                parent.display()
+            )
+        })?;
+        if let Some(suffix) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix(&version_prefix))
+        {
+            if !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                && suffix.split('.').all(|part| !part.is_empty())
+            {
+                version_specific_candidates.push(entry.path());
+            }
+        }
+    }
+    if !version_specific_candidates.is_empty() {
+        version_specific_candidates.sort();
+        return Err(format!(
+            "PSQLRC has version-specific candidates ({}) but the invoked psql version cannot be proven without executing it",
+            version_specific_candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if fs::symlink_metadata(&base).is_err() {
+        if !required {
+            return Ok(Vec::new());
+        }
+        return Err(format!("cannot find PSQLRC base file {}", base.display()));
+    }
+    read_indirect_input_file_with_origin(&base, None).map(|resolved| vec![resolved])
+}
+
+fn read_indirect_input_file(path: &Path, project_path: Option<&Path>) -> Result<String, String> {
+    read_indirect_input_file_with_origin(path, project_path).map(|resolved| resolved.payload)
+}
+
+fn read_indirect_input_file_with_origin(
+    path: &Path,
+    base_path: Option<&Path>,
+) -> Result<ResolvedIndirectInput, String> {
+    let resolved = resolve_indirect_input_path(path, base_path);
+    let path_metadata = fs::symlink_metadata(&resolved)
+        .map_err(|error| format!("cannot stat stdin source {}: {error}", resolved.display()))?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        return Err(format!(
+            "stdin source {} is not a non-symlink regular file",
+            resolved.display()
+        ));
+    }
+
+    let mut file = open_indirect_input_file(&resolved)
+        .map_err(|error| format!("cannot open stdin source {}: {error}", resolved.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot stat stdin source {}: {error}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "stdin source {} is not a regular file",
+            resolved.display()
+        ));
+    }
+    if metadata.len() > MAX_INDIRECT_INPUT_BYTES {
+        return Err(format!(
+            "stdin source {} exceeds {MAX_INDIRECT_INPUT_BYTES} bytes",
+            resolved.display()
+        ));
+    }
+
+    let mut payload = String::new();
+    file.by_ref()
+        .take(MAX_INDIRECT_INPUT_BYTES + 1)
+        .read_to_string(&mut payload)
+        .map_err(|error| format!("stdin source {} is not UTF-8: {error}", resolved.display()))?;
+    if payload.len() as u64 > MAX_INDIRECT_INPUT_BYTES {
+        return Err(format!(
+            "stdin source {} exceeds {MAX_INDIRECT_INPUT_BYTES} bytes",
+            resolved.display()
+        ));
+    }
+    Ok(ResolvedIndirectInput {
+        payload,
+        origin: Some(resolved),
+    })
+}
+
+fn resolve_indirect_input_path(path: &Path, base_path: Option<&Path>) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_path
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default()
+            .join(path)
+    }
+}
+
+fn open_indirect_input_file(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+#[derive(Debug)]
+struct NestedDatabaseFile {
+    path: PathBuf,
+    relative_to_parent: bool,
+}
+
+fn database_nested_file_references(
+    pack_id: &str,
+    payload: &str,
+) -> Result<Vec<NestedDatabaseFile>, String> {
+    let mut references = Vec::new();
+    match pack_id {
+        "database.postgresql" => {
+            let mut changed_directory = false;
+            for trimmed in
+                database_backslash_meta_fragments(payload, DatabaseMetaDialect::PostgreSql)
+            {
+                if command_file_operand(trimmed, &["\\cd"]).is_some() {
+                    changed_directory = true;
+                    continue;
+                }
+                let candidates = [
+                    ("\\ir", true),
+                    ("\\include_relative", true),
+                    ("\\i", false),
+                    ("\\include", false),
+                ];
+                for (command, relative_to_parent) in candidates {
+                    let Some(operand) = command_file_operand(trimmed, &[command]) else {
+                        continue;
+                    };
+                    let path = database_include_operand(pack_id, operand)?;
+                    if changed_directory && path.is_relative() {
+                        return Err(
+                            "a psql include follows \\cd, so its effective directory cannot be proven statically"
+                                .to_string(),
+                        );
+                    }
+                    references.push(NestedDatabaseFile {
+                        path,
+                        relative_to_parent,
+                    });
+                    break;
+                }
+            }
+        }
+        "database.mysql" => {
+            let statements = payload.lines().flat_map(|line| line.split(';')).chain(
+                database_backslash_meta_fragments(payload, DatabaseMetaDialect::MySql),
+            );
+            for statement in statements {
+                if let Some(operand) = command_file_operand(statement, &["source", "\\."]) {
+                    references.push(NestedDatabaseFile {
+                        path: database_include_operand(pack_id, operand)?,
+                        relative_to_parent: false,
+                    });
+                }
+            }
+        }
+        "database.mongodb" => {
+            for reference in mongo_load_file_references(payload) {
+                let Some(path) = reference else {
+                    return Err(
+                        "a MongoDB load() call does not contain one static quoted path".to_string(),
+                    );
+                };
+                references.push(NestedDatabaseFile {
+                    path: PathBuf::from(path),
+                    relative_to_parent: false,
+                });
+            }
+        }
+        "database.sqlite" => {
+            for line in payload.lines() {
+                if let Some(operand) = command_file_operand(line, &[".rea", ".read"]) {
+                    references.push(NestedDatabaseFile {
+                        path: database_include_operand(pack_id, operand)?,
+                        relative_to_parent: false,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(references)
+}
+
+fn database_include_operand(
+    pack_id: &str,
+    operand: CommandFileOperand<'_>,
+) -> Result<PathBuf, String> {
+    let CommandFileOperand::Path(path) = operand else {
+        return Err("an executable database include has no file operand".to_string());
+    };
+    let path = path.trim().trim_matches(['\'', '"']);
+    let dynamic = path.is_empty()
+        || contains_dynamic_shell_output(path)
+        || (pack_id == "database.postgresql" && path.contains(':'));
+    if dynamic {
+        return Err(format!(
+            "an executable {pack_id} include uses a dynamic file path"
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn psql_payload_has_runtime_interpolation(payload: &str) -> bool {
+    let bytes = payload.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            index = sql_line_comment_end(payload, index + 2);
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_postgres_block_comment(payload, index + 2);
+            continue;
+        }
+        if bytes[index] == b'\'' {
+            let escape_string = index > 0
+                && matches!(bytes[index - 1], b'e' | b'E')
+                && (index == 1
+                    || !bytes[index - 2].is_ascii_alphanumeric() && bytes[index - 2] != b'_');
+            index =
+                skip_postgres_quoted(payload, index, b'\'', escape_string).unwrap_or(bytes.len());
+            continue;
+        }
+        if bytes[index] == b'"' {
+            index = skip_postgres_quoted(payload, index, b'"', false).unwrap_or(bytes.len());
+            continue;
+        }
+        if bytes[index] == b'$' {
+            if let Some(end) = skip_postgres_dollar_quote(payload, index) {
+                index = end;
+                continue;
+            }
+        }
+        if bytes[index] == b':' {
+            if bytes.get(index.wrapping_sub(1)) == Some(&b':')
+                || bytes.get(index + 1) == Some(&b':')
+            {
+                index += 1;
+                continue;
+            }
+            let rest = &payload[index + 1..];
+            if let Some(first) = rest.as_bytes().first() {
+                if matches!(first, b'\'' | b'"') {
+                    let quote = *first;
+                    let body = &rest[1..];
+                    if let Some(end) = body.find(char::from(quote)) {
+                        let name = &body[..end];
+                        if !name.is_empty()
+                            && name
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        {
+                            return true;
+                        }
+                    }
+                } else if *first == b'{' {
+                    if let Some(end) = rest[1..].find('}') {
+                        let raw_name = &rest[1..=end];
+                        let name = raw_name.strip_prefix('?').unwrap_or(raw_name);
+                        if !name.is_empty()
+                            && name
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        {
+                            return true;
+                        }
+                    }
+                } else if first.is_ascii_alphabetic() || *first == b'_' {
+                    return true;
+                }
+            }
+        }
+        let Some(ch) = payload[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+    }
+    false
+}
+
+fn database_shell_commands(pack_id: &str, payload: &str) -> Result<Vec<String>, String> {
+    let mut commands = if pack_id == "database.postgresql" {
+        postgres_copy_program_commands(payload)?
+    } else {
+        Vec::new()
+    };
+    let candidates: Vec<&str> = match pack_id {
+        "database.postgresql" => {
+            database_backslash_meta_fragments(payload, DatabaseMetaDialect::PostgreSql)
+        }
+        "database.mysql" => payload
+            .lines()
+            .map(str::trim_start)
+            .chain(database_backslash_meta_fragments(
+                payload,
+                DatabaseMetaDialect::MySql,
+            ))
+            .collect(),
+        "database.sqlite" => payload.lines().map(str::trim_start).collect(),
+        _ => Vec::new(),
+    };
+    for candidate in candidates {
+        let command = match pack_id {
+            "database.postgresql" => psql_shell_meta_command(candidate)?,
+            "database.mysql" => mysql_shell_meta_command(candidate),
+            "database.sqlite" => sqlite_shell_meta_command(candidate)?,
+            _ => None,
+        };
+        if let Some(command) = command {
+            if command.is_empty() || contains_dynamic_shell_output(&command) {
+                return Err(format!(
+                    "an executable {pack_id} shell meta-command is empty or dynamically resolved"
+                ));
+            }
+            commands.push(command);
+        }
+    }
+    Ok(commands)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseMetaDialect {
+    PostgreSql,
+    MySql,
+}
+
+fn database_backslash_meta_fragments(payload: &str, dialect: DatabaseMetaDialect) -> Vec<&str> {
+    let bytes = payload.as_bytes();
+    let mut fragments = Vec::new();
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut quote_backslash_escapes = false;
+    let mut block_comment = false;
+    while index < bytes.len() {
+        if block_comment {
+            if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                block_comment = false;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if quote_backslash_escapes && bytes[index] == b'\\' {
+                let Some(next) = payload[index + 1..].chars().next() else {
+                    index = bytes.len();
+                    continue;
+                };
+                index += 1 + next.len_utf8();
+                continue;
+            }
+            if bytes[index] == active_quote {
+                if bytes.get(index + 1) == Some(&active_quote) {
+                    index += 2;
+                } else {
+                    quote = None;
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            index = sql_line_comment_end(payload, index + 2);
+            continue;
+        }
+        if dialect == DatabaseMetaDialect::MySql && bytes[index] == b'#' {
+            index = sql_line_comment_end(payload, index + 1);
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            block_comment = true;
+            index += 2;
+            continue;
+        }
+        if matches!(bytes[index], b'\'' | b'"')
+            || (dialect == DatabaseMetaDialect::MySql && bytes[index] == b'`')
+        {
+            quote = Some(bytes[index]);
+            let postgres_escape_string = dialect == DatabaseMetaDialect::PostgreSql
+                && bytes[index] == b'\''
+                && index > 0
+                && matches!(bytes[index - 1], b'e' | b'E')
+                && (index == 1
+                    || !bytes[index - 2].is_ascii_alphanumeric() && bytes[index - 2] != b'_');
+            quote_backslash_escapes =
+                dialect == DatabaseMetaDialect::MySql || postgres_escape_string;
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'\\' {
+            let end = payload[index..]
+                .find('\n')
+                .map_or(bytes.len(), |offset| index + offset);
+            fragments.push(payload[index..end].trim_start());
+            index += 1;
+            continue;
+        }
+        index += 1;
+    }
+    fragments
+}
+
+fn psql_shell_meta_command(line: &str) -> Result<Option<String>, String> {
+    if meta_command_remainder(line, "\\gexec").is_some() {
+        return Err(
+            "psql \\gexec executes generated SQL that cannot be proven statically".to_string(),
+        );
+    }
+    if let Some(command) = punctuation_meta_remainder(line, "\\!") {
+        return Ok(Some(command.to_string()));
+    }
+    for meta in ["\\gx", "\\g"] {
+        if let Some(remainder) = pipe_meta_remainder(line, meta) {
+            if let Some(command) = psql_pipe_after_options(remainder)? {
+                return Ok(Some(command));
+            }
+        }
+    }
+    for meta in ["\\o", "\\out", "\\w"] {
+        if let Some(remainder) = pipe_meta_remainder(line, meta) {
+            if let Some(command) = remainder.trim_start().strip_prefix('|') {
+                return Ok(Some(command.trim().to_string()));
+            }
+        }
+    }
+    if meta_command_remainder(line, "\\copy").is_some()
+        && find_ascii_word_case_insensitive(line, "program").is_some()
+    {
+        return extract_program_clause(line).map(Some);
+    }
+    Ok(None)
+}
+
+fn psql_pipe_after_options(remainder: &str) -> Result<Option<String>, String> {
+    let mut remainder = remainder.trim_start();
+    if remainder.starts_with('(') {
+        let bytes = remainder.as_bytes();
+        let mut index = 1usize;
+        let mut depth = 1usize;
+        let mut quote = None;
+        while index < bytes.len() {
+            if let Some(active_quote) = quote {
+                if bytes[index] == b'\\' {
+                    let Some(next) = remainder[index + 1..].chars().next() else {
+                        return Err("psql \\g options end in an escape".to_string());
+                    };
+                    index += 1 + next.len_utf8();
+                    continue;
+                }
+                if bytes[index] == active_quote {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            match bytes[index] {
+                b'\'' | b'"' => {
+                    quote = Some(bytes[index]);
+                    index += 1;
+                }
+                b'(' => {
+                    depth += 1;
+                    index += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    index += 1;
+                    if depth == 0 {
+                        remainder = remainder[index..].trim_start();
+                        break;
+                    }
+                }
+                _ => {
+                    let Some(ch) = remainder[index..].chars().next() else {
+                        break;
+                    };
+                    index += ch.len_utf8();
+                }
+            }
+        }
+        if depth != 0 || quote.is_some() {
+            return Err("psql \\g options are not statically balanced".to_string());
+        }
+    }
+    Ok(remainder
+        .strip_prefix('|')
+        .map(|command| command.trim().to_string()))
+}
+
+fn postgres_copy_program_commands(payload: &str) -> Result<Vec<String>, String> {
+    let bytes = payload.as_bytes();
+    let mut commands = Vec::new();
+    let mut index = 0usize;
+    let mut copy_seen = false;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'-' && bytes.get(index + 1) == Some(&b'-') {
+            index = sql_line_comment_end(payload, index + 2);
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_postgres_block_comment(payload, index + 2);
+            continue;
+        }
+        if bytes[index] == b';' {
+            copy_seen = false;
+            index += 1;
+            continue;
+        }
+        if bytes[index] == b'\'' {
+            index = skip_postgres_quoted(payload, index, b'\'', false).unwrap_or(bytes.len());
+            continue;
+        }
+        if bytes[index] == b'"' {
+            index = skip_postgres_quoted(payload, index, b'"', false).unwrap_or(bytes.len());
+            continue;
+        }
+        if bytes[index] == b'$' {
+            if let Some(end) = skip_postgres_dollar_quote(payload, index) {
+                index = end;
+                continue;
+            }
+        }
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                index += 1;
+            }
+            let word = &payload[start..index];
+            if word.eq_ignore_ascii_case("copy") {
+                copy_seen = true;
+                continue;
+            }
+            if copy_seen && word.eq_ignore_ascii_case("program") {
+                index = skip_postgres_sql_trivia(payload, index);
+                let Some((command, end)) = parse_postgres_program_operand(payload, index)? else {
+                    return Err(
+                        "a PostgreSQL COPY PROGRAM command must use one static quoted operand"
+                            .to_string(),
+                    );
+                };
+                commands.push(command);
+                index = end;
+                continue;
+            }
+            continue;
+        }
+        let Some(ch) = payload[index..].chars().next() else {
+            break;
+        };
+        index += ch.len_utf8();
+    }
+    Ok(commands)
+}
+
+fn skip_postgres_sql_trivia(payload: &str, mut index: usize) -> usize {
+    let bytes = payload.as_bytes();
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'-') && bytes.get(index + 1) == Some(&b'-') {
+            index = sql_line_comment_end(payload, index + 2);
+            continue;
+        }
+        if bytes.get(index) == Some(&b'/') && bytes.get(index + 1) == Some(&b'*') {
+            index = skip_postgres_block_comment(payload, index + 2);
+            continue;
+        }
+        return index;
+    }
+}
+
+fn sql_line_comment_end(payload: &str, start: usize) -> usize {
+    payload[start..]
+        .find(['\n', '\r'])
+        .map_or(payload.len(), |offset| start + offset + 1)
+}
+
+fn skip_postgres_block_comment(payload: &str, mut index: usize) -> usize {
+    let bytes = payload.as_bytes();
+    let mut depth = 1usize;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            depth += 1;
+            index += 2;
+        } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                break;
+            }
+        } else {
+            let Some(ch) = payload[index..].chars().next() else {
+                break;
+            };
+            index += ch.len_utf8();
+        }
+    }
+    index
+}
+
+fn skip_postgres_quoted(
+    payload: &str,
+    start: usize,
+    quote: u8,
+    backslash_escapes: bool,
+) -> Option<usize> {
+    let bytes = payload.as_bytes();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        if backslash_escapes && bytes[index] == b'\\' {
+            let next = payload[index + 1..].chars().next()?;
+            index += 1 + next.len_utf8();
+        } else if bytes[index] == quote {
+            if bytes.get(index + 1) == Some(&quote) {
+                index += 2;
+            } else {
+                return Some(index + 1);
+            }
+        } else {
+            let ch = payload[index..].chars().next()?;
+            index += ch.len_utf8();
+        }
+    }
+    None
+}
+
+fn skip_postgres_dollar_quote(payload: &str, start: usize) -> Option<usize> {
+    let rest = payload.get(start + 1..)?;
+    let tag_end = rest.find('$')?;
+    let tag = &rest[..tag_end];
+    if !tag
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || tag.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let delimiter_end = start + tag_end + 2;
+    let delimiter = &payload[start..delimiter_end];
+    payload[delimiter_end..]
+        .find(delimiter)
+        .map(|offset| delimiter_end + offset + delimiter.len())
+}
+
+fn parse_postgres_program_operand(
+    payload: &str,
+    start: usize,
+) -> Result<Option<(String, usize)>, String> {
+    let bytes = payload.as_bytes();
+    if bytes.get(start) != Some(&b'\'') {
+        return Ok(None);
+    }
+    let mut command = String::new();
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                return Err(
+                    "a PostgreSQL COPY PROGRAM command contains ambiguous backslash escaping"
+                        .to_string(),
+                );
+            }
+            b'\'' if bytes.get(index + 1) == Some(&b'\'') => {
+                command.push('\'');
+                index += 2;
+            }
+            b'\'' => return Ok(Some((command, index + 1))),
+            _ => {
+                let Some(ch) = payload[index..].chars().next() else {
+                    break;
+                };
+                command.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+    Err("a PostgreSQL COPY PROGRAM command has an unterminated operand".to_string())
+}
+
+fn mysql_shell_meta_command(line: &str) -> Option<String> {
+    for meta in ["\\!", "\\P"] {
+        if let Some(command) = punctuation_meta_remainder(line, meta) {
+            return Some(command.trim().to_string());
+        }
+    }
+    for meta in ["system", "pager"] {
+        if let Some(command) = meta_command_remainder(line, meta) {
+            return Some(command.trim().to_string());
+        }
+    }
+    None
+}
+
+fn sqlite_shell_meta_command(line: &str) -> Result<Option<String>, String> {
+    for meta in [".shell", ".system"] {
+        if let Some(command) = meta_command_remainder(line, meta) {
+            return Ok(Some(command.trim().to_string()));
+        }
+    }
+    for meta in [".once", ".output"] {
+        if let Some(remainder) = meta_command_remainder(line, meta) {
+            if let Some(command) = remainder.trim_start().strip_prefix('|') {
+                return Ok(Some(command.trim().to_string()));
+            }
+        }
+    }
+    if let Some(remainder) = meta_command_remainder(line, ".import") {
+        let words = shell_words::split(remainder)
+            .map_err(|_| "a SQLite .import command cannot be tokenized safely".to_string())?;
+        if let Some(command) = words.first().and_then(|word| word.strip_prefix('|')) {
+            return Ok(Some(command.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+fn meta_command_remainder<'a>(line: &'a str, command: &str) -> Option<&'a str> {
+    let remainder = line.strip_prefix(command)?;
+    (remainder.is_empty() || remainder.chars().next().is_some_and(char::is_whitespace))
+        .then(|| remainder.trim_start())
+}
+
+fn punctuation_meta_remainder<'a>(line: &'a str, command: &str) -> Option<&'a str> {
+    line.strip_prefix(command).map(str::trim_start)
+}
+
+fn pipe_meta_remainder<'a>(line: &'a str, command: &str) -> Option<&'a str> {
+    let remainder = line.strip_prefix(command)?;
+    (remainder.is_empty()
+        || remainder.starts_with('|')
+        || remainder.chars().next().is_some_and(char::is_whitespace))
+    .then(|| remainder.trim_start())
+}
+
+fn find_ascii_word_case_insensitive(input: &str, word: &str) -> Option<usize> {
+    let lower = input.to_ascii_lowercase();
+    for (index, _) in lower.match_indices(word) {
+        let before_is_boundary = index == 0
+            || !lower.as_bytes()[index - 1].is_ascii_alphanumeric()
+                && lower.as_bytes()[index - 1] != b'_';
+        let end = index + word.len();
+        let after_is_boundary = end == lower.len()
+            || !lower.as_bytes()[end].is_ascii_alphanumeric() && lower.as_bytes()[end] != b'_';
+        if before_is_boundary && after_is_boundary {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn extract_program_clause(line: &str) -> Result<String, String> {
+    let Some(index) = find_ascii_word_case_insensitive(line, "program") else {
+        return Err("a psql PROGRAM clause cannot be located".to_string());
+    };
+    let remainder = line[index + "program".len()..].trim_start();
+    let Some('\'') = remainder.chars().next() else {
+        return Err("a psql PROGRAM command must use one static quoted operand".to_string());
+    };
+    let body = &remainder[1..];
+    let bytes = body.as_bytes();
+    let mut index = 0usize;
+    let mut command = String::new();
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                return Err(
+                    "a psql PROGRAM command contains ambiguous backslash escaping".to_string(),
+                );
+            }
+            b'\'' if bytes.get(index + 1) == Some(&b'\'') => {
+                command.push('\'');
+                index += 2;
+            }
+            b'\'' => {
+                if !body[index + 1..].trim().is_empty() {
+                    return Err(
+                        "a psql PROGRAM command has trailing syntax after its quoted operand"
+                            .to_string(),
+                    );
+                }
+                return Ok(command);
+            }
+            _ => {
+                let Some(ch) = body[index..].chars().next() else {
+                    break;
+                };
+                command.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+    Err("a psql PROGRAM command has an unterminated quoted operand".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_indirect_inputs_for_pack(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    flows: &[IndirectInputFlow],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    deadline: Option<&Deadline>,
+    embedded_shell_depth: usize,
+    nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
+) -> Option<EvaluationResult> {
+    'flow: for flow in flows
+        .iter()
+        .filter(|flow| flow.pack_id == pack_id || flow.pack_id == "*")
+    {
+        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
+            return Some(EvaluationResult::allowed_due_to_budget());
+        }
+
+        let resolved_roots = match resolve_indirect_inputs(&flow.source, project_path) {
+            Ok(resolved) => resolved,
+            Err(detail) => {
+                if let Some(result) = unverified_indirect_input_result(
+                    pack_id,
+                    &detail,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                ) {
+                    return Some(result);
+                }
+                continue;
+            }
+        };
+
+        #[derive(Debug)]
+        struct PayloadWork {
+            payload: String,
+            origin: Option<PathBuf>,
+            depth: usize,
+            ancestry: HashSet<PathBuf>,
+        }
+
+        let mut total_bytes = 0u64;
+        let mut included_files = resolved_roots.len().saturating_sub(1);
+        let mut queue = VecDeque::new();
+        for resolved in resolved_roots {
+            total_bytes = total_bytes.saturating_add(resolved.payload.len() as u64);
+            let mut ancestry = HashSet::new();
+            if let Some(origin) = &resolved.origin {
+                ancestry.insert(fs::canonicalize(origin).unwrap_or_else(|_| origin.clone()));
+            }
+            queue.push_back(PayloadWork {
+                payload: resolved.payload,
+                origin: resolved.origin,
+                depth: 0,
+                ancestry,
+            });
+        }
+        if total_bytes > MAX_INDIRECT_INPUT_BYTES {
+            let detail = format!("database script roots exceed {MAX_INDIRECT_INPUT_BYTES} bytes");
+            if let Some(result) = unverified_indirect_input_result(
+                pack_id,
+                &detail,
+                allowlists,
+                project_path,
+                first_allowlist_hit,
+            ) {
+                return Some(result);
+            }
+            continue;
+        }
+
+        while let Some(work) = queue.pop_front() {
+            if flow.psql_interpolates_variables
+                && psql_payload_has_runtime_interpolation(&work.payload)
+            {
+                let detail = "a psql stream uses runtime variable interpolation that cannot be proven statically";
+                if let Some(result) = unverified_indirect_input_result(
+                    pack_id,
+                    detail,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                ) {
+                    return Some(result);
+                }
+                continue 'flow;
+            }
+            if let Some(result) = evaluate_indirect_payload_patterns(
+                pack_id,
+                pack,
+                &work.payload,
+                allowlists,
+                project_path,
+                first_allowlist_hit,
+                deadline,
+            ) {
+                return Some(result);
+            }
+
+            let shell_commands = match database_shell_commands(pack_id, &work.payload) {
+                Ok(commands) => commands,
+                Err(detail) => {
+                    if let Some(result) = unverified_indirect_input_result(
+                        pack_id,
+                        &detail,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(result);
+                    }
+                    continue 'flow;
+                }
+            };
+            for command in shell_commands {
+                if embedded_shell_depth >= MAX_EMBEDDED_SHELL_DEPTH {
+                    let detail = format!(
+                        "embedded shell execution exceeds {MAX_EMBEDDED_SHELL_DEPTH} levels"
+                    );
+                    if let Some(result) = unverified_indirect_input_result(
+                        pack_id,
+                        &detail,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(result);
+                    }
+                    continue 'flow;
+                }
+                let result = nested_context.map_or_else(
+                    || {
+                        evaluate_packs_with_allowlists_at_depth(
+                            &command,
+                            &command,
+                            &command,
+                            &command,
+                            ordered_packs,
+                            allowlists,
+                            keyword_index,
+                            deadline,
+                            project_path,
+                            embedded_shell_depth + 1,
+                            None,
+                        )
+                    },
+                    |context| {
+                        evaluate_command_with_pack_order_deadline_at_path_inner(
+                            &command,
+                            context.enabled_keywords,
+                            ordered_packs,
+                            keyword_index,
+                            context.compiled_overrides,
+                            allowlists,
+                            context.heredoc_settings,
+                            context.allow_once_audit,
+                            project_path,
+                            deadline,
+                            embedded_shell_depth + 1,
+                        )
+                    },
+                );
+                if result.is_denied() || result.skipped_due_to_budget {
+                    return Some(result);
+                }
+            }
+
+            let references = match database_nested_file_references(pack_id, &work.payload) {
+                Ok(references) => references,
+                Err(detail) => {
+                    if let Some(result) = unverified_indirect_input_result(
+                        pack_id,
+                        &detail,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(result);
+                    }
+                    continue 'flow;
+                }
+            };
+            if !references.is_empty() && work.depth >= MAX_DATABASE_INCLUDE_DEPTH {
+                let detail =
+                    format!("database include nesting exceeds {MAX_DATABASE_INCLUDE_DEPTH} levels");
+                if let Some(result) = unverified_indirect_input_result(
+                    pack_id,
+                    &detail,
+                    allowlists,
+                    project_path,
+                    first_allowlist_hit,
+                ) {
+                    return Some(result);
+                }
+                continue 'flow;
+            }
+            for reference in references {
+                included_files += 1;
+                if included_files > MAX_INDIRECT_INPUT_FLOWS {
+                    let detail = format!(
+                        "database script includes more than {MAX_INDIRECT_INPUT_FLOWS} files"
+                    );
+                    if let Some(result) = unverified_indirect_input_result(
+                        pack_id,
+                        &detail,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(result);
+                    }
+                    continue 'flow;
+                }
+                let base = if reference.relative_to_parent {
+                    let Some(parent) = work.origin.as_deref().and_then(Path::parent) else {
+                        let detail =
+                            "a relative-to-script database include has no static parent directory";
+                        if let Some(result) = unverified_indirect_input_result(
+                            pack_id,
+                            detail,
+                            allowlists,
+                            project_path,
+                            first_allowlist_hit,
+                        ) {
+                            return Some(result);
+                        }
+                        continue 'flow;
+                    };
+                    Some(parent)
+                } else {
+                    project_path
+                };
+                let nested = match read_indirect_input_file_with_origin(&reference.path, base) {
+                    Ok(nested) => nested,
+                    Err(detail) => {
+                        if let Some(result) = unverified_indirect_input_result(
+                            pack_id,
+                            &detail,
+                            allowlists,
+                            project_path,
+                            first_allowlist_hit,
+                        ) {
+                            return Some(result);
+                        }
+                        continue 'flow;
+                    }
+                };
+                total_bytes = total_bytes.saturating_add(nested.payload.len() as u64);
+                if total_bytes > MAX_INDIRECT_INPUT_BYTES {
+                    let detail =
+                        format!("database script graph exceeds {MAX_INDIRECT_INPUT_BYTES} bytes");
+                    if let Some(result) = unverified_indirect_input_result(
+                        pack_id,
+                        &detail,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(result);
+                    }
+                    continue 'flow;
+                }
+                let origin = nested
+                    .origin
+                    .expect("file-backed indirect input always records its origin");
+                let identity = fs::canonicalize(&origin).unwrap_or_else(|_| origin.clone());
+                if work.ancestry.contains(&identity) {
+                    let detail =
+                        format!("database script include cycle reaches {}", origin.display());
+                    if let Some(result) = unverified_indirect_input_result(
+                        pack_id,
+                        &detail,
+                        allowlists,
+                        project_path,
+                        first_allowlist_hit,
+                    ) {
+                        return Some(result);
+                    }
+                    continue 'flow;
+                }
+                let mut nested_ancestry = work.ancestry.clone();
+                nested_ancestry.insert(identity);
+                queue.push_back(PayloadWork {
+                    payload: nested.payload,
+                    origin: Some(origin),
+                    depth: work.depth + 1,
+                    ancestry: nested_ancestry,
+                });
+            }
+        }
+    }
+    None
+}
+
+fn unverified_indirect_input_result(
+    pack_id: &str,
+    detail: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+) -> Option<EvaluationResult> {
+    let reason = format!(
+        "A protected REPL receives indirect input that dcg cannot statically verify: {detail}."
+    );
+    if let Some(hit) = allowlists.match_rule_at_path(pack_id, INDIRECT_INPUT_RULE, project_path) {
+        if first_allowlist_hit.is_none() {
+            *first_allowlist_hit = Some((
+                PatternMatch {
+                    pack_id: Some(pack_id.to_string()),
+                    pattern_name: Some(INDIRECT_INPUT_RULE.to_string()),
+                    severity: Some(crate::packs::Severity::High),
+                    reason,
+                    source: MatchSource::Pack,
+                    matched_span: None,
+                    matched_text_preview: None,
+                    explanation: Some(
+                        "Review or materialize the exact input before invoking the REPL. Dynamic, missing, non-regular, non-UTF-8, and oversized sources are denied because silently allowing them would recreate the stdin bypass."
+                            .to_string(),
+                    ),
+                    suggestions: &[],
+                },
+                hit.layer,
+                hit.entry.reason.clone(),
+            ));
+        }
+        return None;
+    }
+    Some(EvaluationResult::denied_by_pack_pattern(
+        pack_id,
+        INDIRECT_INPUT_RULE,
+        &reason,
+        Some(
+            "Review or materialize the exact input before invoking the REPL. Dynamic, missing, non-regular, non-UTF-8, and oversized sources are denied because silently allowing them would recreate the stdin bypass.",
+        ),
+        crate::packs::Severity::High,
+        &[],
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_indirect_payload_patterns(
+    pack_id: &str,
+    pack: &crate::packs::Pack,
+    payload: &str,
+    allowlists: &LayeredAllowlist,
+    project_path: Option<&Path>,
+    first_allowlist_hit: &mut Option<(PatternMatch, AllowlistLayer, String)>,
+    deadline: Option<&Deadline>,
+) -> Option<EvaluationResult> {
+    for pattern in &pack.destructive_patterns {
+        if pattern.name == Some(INDIRECT_INPUT_RULE) {
+            continue;
+        }
+        if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
+            return Some(EvaluationResult::allowed_due_to_budget());
+        }
+        if !pattern.regex.is_match(payload) {
+            continue;
+        }
+
+        let pattern_name = pattern.name.unwrap_or("unnamed");
+        if let Some(hit) = allowlists.match_rule_at_path(pack_id, pattern_name, project_path) {
+            if first_allowlist_hit.is_none() {
+                *first_allowlist_hit = Some((
+                    PatternMatch {
+                        pack_id: Some(pack_id.to_string()),
+                        pattern_name: pattern.name.map(str::to_string),
+                        severity: Some(pattern.severity),
+                        reason: pattern.reason.to_string(),
+                        source: MatchSource::Pack,
+                        matched_span: None,
+                        matched_text_preview: None,
+                        explanation: pattern.explanation.map(str::to_string),
+                        suggestions: pattern.suggestions,
+                    },
+                    hit.layer,
+                    hit.entry.reason.clone(),
+                ));
+            }
+            continue;
+        }
+
+        return Some(EvaluationResult::denied_by_pack_pattern(
+            pack_id,
+            pattern_name,
+            pattern.reason,
+            pattern.explanation,
+            pattern.severity,
+            pattern.suggestions,
+        ));
+    }
+    None
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1851,6 +6960,36 @@ fn evaluate_packs_with_allowlists(
     keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
     deadline: Option<&Deadline>,
     project_path: Option<&Path>,
+) -> EvaluationResult {
+    evaluate_packs_with_allowlists_at_depth(
+        command_for_packs,
+        normalized,
+        command_for_match,
+        original_command,
+        ordered_packs,
+        allowlists,
+        keyword_index,
+        deadline,
+        project_path,
+        0,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
+fn evaluate_packs_with_allowlists_at_depth(
+    command_for_packs: &str,
+    normalized: &str,
+    command_for_match: &str,
+    original_command: &str,
+    ordered_packs: &[String],
+    allowlists: &LayeredAllowlist,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    deadline: Option<&Deadline>,
+    project_path: Option<&Path>,
+    embedded_shell_depth: usize,
+    nested_context: Option<&NestedCommandEvaluationContext<'_, '_>>,
 ) -> EvaluationResult {
     if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
         return EvaluationResult::allowed_due_to_budget();
@@ -1942,6 +7081,21 @@ fn evaluate_packs_with_allowlists(
     let original_len = original_command.len();
     let segment_ranges = command_segment_ranges(command_for_packs);
     let has_compound_segments = segment_ranges.len() > 1;
+    let has_indirect_input_pack = candidate_packs.iter().any(|(pack_id, _)| {
+        matches!(
+            pack_id.as_str(),
+            "database.redis"
+                | "database.postgresql"
+                | "database.mysql"
+                | "database.mongodb"
+                | "database.sqlite"
+        )
+    });
+    let indirect_input_flows = if has_indirect_input_pack {
+        collect_indirect_input_flows(original_command, &command_segment_ranges(original_command))
+    } else {
+        Vec::new()
+    };
 
     // Single-pass per-pack evaluation: safe patterns only protect their own pack's
     // destructive patterns, not other packs. This prevents compound command bypass
@@ -1957,6 +7111,22 @@ fn evaluate_packs_with_allowlists(
     for &(pack_id, pack) in &candidate_packs {
         if deadline_exceeded(deadline) || remaining_below(deadline, &crate::perf::PATTERN_MATCH) {
             return EvaluationResult::allowed_due_to_budget();
+        }
+
+        if let Some(result) = evaluate_indirect_inputs_for_pack(
+            pack_id,
+            pack,
+            &indirect_input_flows,
+            ordered_packs,
+            keyword_index,
+            allowlists,
+            project_path,
+            &mut first_allowlist_hit,
+            deadline,
+            embedded_shell_depth,
+            nested_context,
+        ) {
+            return result;
         }
 
         // Check safe patterns for this pack first.
@@ -2661,21 +7831,6 @@ where
         if pattern.is_match(&normalized) {
             return EvaluationResult::allowed();
         }
-    }
-
-    // Built-in inspection-wrapper exemption (dcg#132).
-    //
-    // Mirrors the check in `evaluate_command_with_pack_order_deadline_at_path`:
-    // a small hard-coded set of inspection-wrapper prefixes (e.g.
-    // `ee preflight check --cmd`) consumes the destructive command as data,
-    // not as an instruction. Without this, dcg substring-matches the
-    // destructive verb inside the analyzed argument and blocks the wrapper.
-    // See `BUILTIN_INSPECTION_WRAPPER_PREFIXES` for the safe-list and
-    // `command_prefix_safely_matches` for the anti-injection guard.
-    if crate::allowlist::is_builtin_inspection_wrapper_call(command)
-        || crate::allowlist::is_builtin_inspection_wrapper_call(&normalized)
-    {
-        return EvaluationResult::allowed();
     }
 
     let normalized_offset = compute_normalized_offset(command_for_match, &normalized);
@@ -3592,6 +8747,14 @@ mod tests {
     }
 
     fn evaluate_with_pack_ids(command: &str, pack_ids: &[&str]) -> EvaluationResult {
+        evaluate_with_pack_ids_at_path(command, pack_ids, None)
+    }
+
+    fn evaluate_with_pack_ids_at_path(
+        command: &str,
+        pack_ids: &[&str],
+        project_path: Option<&Path>,
+    ) -> EvaluationResult {
         let enabled_packs: std::collections::HashSet<String> =
             pack_ids.iter().map(|id| (*id).to_string()).collect();
         let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
@@ -3601,7 +8764,7 @@ mod tests {
         let allowlists = default_allowlists();
         let heredoc_settings = default_config().heredoc_settings();
 
-        evaluate_command_with_pack_order(
+        evaluate_command_with_pack_order_deadline_at_path(
             command,
             enabled_keywords.as_slice(),
             ordered_packs.as_slice(),
@@ -3609,6 +8772,9 @@ mod tests {
             &compiled,
             &allowlists,
             &heredoc_settings,
+            None,
+            project_path,
+            None,
         )
     }
 
@@ -3721,6 +8887,1318 @@ mod tests {
             .expect("denial should include pattern info");
         assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
         assert_eq!(info.pattern_name.as_deref(), Some("railway-volume-delete"));
+    }
+
+    #[test]
+    fn indirect_repl_pipelines_are_evaluated_by_the_consumer_pack() {
+        let cases = [
+            ("echo FLUSHALL | redis-cli", "database.redis", "flushall"),
+            (
+                "printf '%s\\n' 'DROP TABLE users;' | psql app",
+                "database.postgresql",
+                "drop-table",
+            ),
+            (
+                "echo 'TRUNCATE TABLE users;' | mysql app",
+                "database.mysql",
+                "truncate",
+            ),
+            (
+                "echo 'db.users.drop()' | mongosh",
+                "database.mongodb",
+                "drop",
+            ),
+            (
+                "printf 'DELETE FROM users;' | sqlite3 app.db",
+                "database.sqlite",
+                "delete-without-where",
+            ),
+        ];
+
+        for (command, pack_id, pattern_fragment) in cases {
+            let result = evaluate_with_pack_ids(command, &[pack_id]);
+            assert!(result.is_denied(), "indirect payload must block: {command}");
+            let info = result.pattern_info.expect("denial must identify a pattern");
+            assert_eq!(info.pack_id.as_deref(), Some(pack_id));
+            assert!(
+                info.pattern_name
+                    .as_deref()
+                    .is_some_and(|name| name.contains(pattern_fragment)),
+                "unexpected rule for {command}: {:?}",
+                info.pattern_name
+            );
+        }
+
+        for command in [
+            "echo FLUSHALL | { redis-cli; }",
+            "echo FLUSHALL | (redis-cli)",
+            "echo FLUSHALL | sh -c 'redis-cli'",
+            r"printf '*1\r\n$8\r\nFLUSHALL\r\n' | redis-cli --pipe",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["database.redis"]).is_denied(),
+                "nested or raw-protocol Redis consumer must block: {command}"
+            );
+        }
+        assert!(
+            evaluate_with_pack_ids(
+                r"printf '*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n' | redis-cli --pipe",
+                &["database.redis"],
+            )
+            .is_allowed(),
+            "safe raw Redis protocol should remain allowed"
+        );
+    }
+
+    #[test]
+    fn sqlite_cli_option_arities_cannot_hide_stdin_or_code_arguments() {
+        for option in [
+            "-cmd",
+            "--escape",
+            "-heap",
+            "--init",
+            "-maxsize",
+            "--mmap",
+            "-newline",
+            "--nonce",
+            "-nullvalue",
+            "--separator",
+            "-vfs",
+        ] {
+            let stdin_args = [option, "VALUE", "app.db"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert!(
+                analyze_sqlite_cli_args(&stdin_args).reads_stdin_as_code,
+                "one-value option must not turn its value into SQL: {option}"
+            );
+
+            let direct_args = [option, "VALUE", "app.db", "DROP TABLE users;"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let analysis = analyze_sqlite_cli_args(&direct_args);
+            assert!(!analysis.reads_stdin_as_code, "direct SQL suppresses stdin");
+            assert!(
+                analysis.code_values.contains(&"DROP TABLE users;"),
+                "direct SQL must remain a code slot after {option}"
+            );
+        }
+
+        for option in ["-lookaside", "--pagecache"] {
+            let args = [option, "1024", "32", "app.db", "DROP TABLE users;"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let analysis = analyze_sqlite_cli_args(&args);
+            assert!(!analysis.reads_stdin_as_code);
+            assert!(analysis.code_values.contains(&"DROP TABLE users;"));
+        }
+
+        let unknown = ["--future-option", "VALUE", "app.db", "__DCG_SUB_0__"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let analysis = analyze_sqlite_cli_args(&unknown);
+        assert!(analysis.reads_stdin_as_code);
+        assert!(analysis.code_values.contains(&"__DCG_SUB_0__"));
+
+        for args in [["-A", "archive.db"], ["--version", "app.db"]] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(!analyze_sqlite_cli_args(&args).reads_stdin_as_code);
+        }
+    }
+
+    #[test]
+    fn redis_cli_option_arities_cannot_hide_commands_or_pipe_mode() {
+        for (option, value) in [
+            ("-t", "1"),
+            ("--tls-ciphers", "DEFAULT"),
+            ("--tls-ciphersuites", "DEFAULT"),
+            ("--show-pushes", "no"),
+            ("--keystats-samples", "5"),
+            ("--cursor", "0"),
+            ("--top", "10"),
+            ("--count", "100"),
+        ] {
+            let direct = [option, value, "FLUSHALL"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            let analysis = analyze_redis_cli_args(&direct);
+            assert!(!analysis.reads_stdin_as_code);
+            assert_eq!(analysis.code_values, ["FLUSHALL"]);
+
+            let piped = [option, value, "--pipe"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert!(analyze_redis_cli_args(&piped).reads_stdin_as_code);
+        }
+
+        for (option, value) in [
+            ("--lru-test", "10"),
+            ("--rdb", "dump.rdb"),
+            ("--functions-rdb", "functions.rdb"),
+            ("--intrinsic-latency", "1"),
+        ] {
+            let args = [option, value, "--pipe"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert!(analyze_redis_cli_args(&args).reads_stdin_as_code);
+        }
+
+        let unknown = ["--future-option", "VALUE", "__DCG_SUB_0__"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let analysis = analyze_redis_cli_args(&unknown);
+        assert!(analysis.reads_stdin_as_code);
+        assert!(analysis.code_values.contains(&"__DCG_SUB_0__"));
+    }
+
+    #[test]
+    fn database_cli_option_and_stdin_reentry_bypasses_are_blocked() {
+        for command in [
+            "printf 'DROP TABLE users;' | sqlite3 -nullvalue NULL app.db",
+            "printf 'DROP TABLE users;' | sqlite3 -vfs unix-dotfile app.db",
+            "printf 'DROP TABLE users;' | sqlite3 -lookaside 128 32 app.db",
+            "printf 'DROP TABLE users;' | sqlite3 app.db '.read /dev/stdin'",
+            "printf 'DROP TABLE users;' | sqlite3 app.db '.read /proc/self/fd/0'",
+            "printf 'DROP TABLE users;' | sqlite3 -cmd '.read /dev/fd/0' app.db 'SELECT 1;'",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["database.sqlite"]).is_denied(),
+                "SQLite stdin re-entry must block: {command}"
+            );
+        }
+
+        for command in [
+            "printf 'DROP TABLE users;' | psql -f -",
+            "printf 'DROP TABLE users;' | psql --file=-",
+            "printf 'DROP TABLE users;' | psql -f/dev/stdin",
+            "printf 'DROP TABLE users;' | psql -f /proc/self/fd/0",
+            "psql -f <(printf 'DROP TABLE users;')",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["database.postgresql"]).is_denied(),
+                "psql file/stdin indirection must block: {command}"
+            );
+        }
+
+        for command in [
+            "printf 'FLUSHALL' | redis-cli -t 1 --pipe",
+            "printf 'FLUSHALL' | redis-cli --tls-ciphers DEFAULT --pipe",
+            "printf 'FLUSHALL' | redis-cli --show-pushes no --pipe",
+            "printf 'FLUSHALL' | redis-cli --count 10 --pipe",
+            "printf 'FLUSHALL' | redis-cli --eval /dev/stdin",
+            "printf 'FLUSHALL' | redis-cli -X script EVAL script 0",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["database.redis"]).is_denied(),
+                "Redis stdin option form must block: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_cli_option_arities_do_not_hide_dynamic_code_arguments() {
+        for command in [
+            "redis-cli -t 1 \"$(printf FLUSHALL)\"",
+            "redis-cli --tls-ciphers DEFAULT \"$(printf FLUSHALL)\"",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["database.redis"]).is_denied(),
+                "Redis command substitution must block: {command}"
+            );
+        }
+
+        for command in [
+            "sqlite3 -nullvalue NULL app.db \"$(printf 'DROP TABLE users;')\"",
+            "sqlite3 -vfs unix-dotfile app.db \"$(printf 'DROP TABLE users;')\"",
+            "sqlite3 -lookaside 128 32 app.db \"$(printf 'DROP TABLE users;')\"",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["database.sqlite"]).is_denied(),
+                "SQLite command substitution must block: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_client_option_boundaries_preserve_real_stdin_semantics() {
+        for args in [vec!["-d", "-c", "app"], vec!["--", "-c", "ignored"]] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                analyze_psql_args(&args).reads_stdin_as_code,
+                "psql option values and -- operands must not masquerade as -c"
+            );
+        }
+        for args in [vec!["-D", "-e", "app"], vec!["--", "-e", "ignored"]] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(
+                analyze_mysql_cli_args(&args).reads_stdin_as_code,
+                "mysql option values and -- operands must not masquerade as -e"
+            );
+        }
+        let args = ["--host", "--eval", "localhost"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            analyze_mongo_cli_args(&args).reads_stdin_as_code,
+            "mongosh option values must not masquerade as --eval"
+        );
+
+        for args in [vec!["--version"], vec!["--help"], vec!["--list"]] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(!analyze_psql_args(&args).reads_stdin_as_code);
+        }
+        for args in [vec!["--version"], vec!["--help"]] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(!analyze_mysql_cli_args(&args).reads_stdin_as_code);
+            assert!(!analyze_mongo_cli_args(&args).reads_stdin_as_code);
+        }
+    }
+
+    #[test]
+    fn encoded_database_option_shadowing_and_reentry_payloads_are_blocked() {
+        for (command, pack_id) in [
+            (
+                "printf 'DROP%s' ' TABLE users;' | psql -- -c ignored",
+                "database.postgresql",
+            ),
+            (
+                "printf 'DROP%s' ' TABLE users;' | psql -d -c app",
+                "database.postgresql",
+            ),
+            (
+                "printf 'DROP%s' ' TABLE users;' | mysql -- -e ignored",
+                "database.mysql",
+            ),
+            (
+                "printf 'DROP%s' ' TABLE users;' | mysql -D -e app",
+                "database.mysql",
+            ),
+            (
+                "printf 'db.users.%s' 'drop()' | mongosh --host --eval localhost",
+                "database.mongodb",
+            ),
+            (
+                "printf 'DROP%s' ' TABLE users;' | sqlite3 -init /dev/stdin app.db 'SELECT 1;'",
+                "database.sqlite",
+            ),
+            (
+                "printf 'DROP%s' ' TABLE users;' | mysql app -e 'source /dev/stdin'",
+                "database.mysql",
+            ),
+            (
+                "printf 'DROP%s' ' TABLE users;' | mysql app -e '\\. /proc/self/fd/0'",
+                "database.mysql",
+            ),
+            (
+                "printf 'db.users.%s' 'drop()' | mongosh --eval 'load(\"/dev/stdin\")'",
+                "database.mongodb",
+            ),
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &[pack_id]).is_denied(),
+                "encoded indirect payload must block: {command}"
+            );
+        }
+
+        for (command, pack_id) in [
+            (
+                "printf 'DROP%s' ' TABLE users;' | psql --version",
+                "database.postgresql",
+            ),
+            (
+                "printf 'DROP%s' ' TABLE users;' | mysql --version",
+                "database.mysql",
+            ),
+            (
+                "printf 'db.users.%s' 'drop()' | mongosh --version",
+                "database.mongodb",
+            ),
+            (
+                "printf 'FLUSH%s' ALL | redis-cli -x SET note",
+                "database.redis",
+            ),
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &[pack_id]).is_allowed(),
+                "non-executable stdin data must remain allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_script_files_are_bounded_and_inspected_by_their_client_pack() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (
+                "database.postgresql",
+                "dangerous.psql",
+                "DROP TABLE users;\n",
+                "safe.psql",
+                "SELECT 1;\n",
+                "psql -f",
+                "",
+            ),
+            (
+                "database.mysql",
+                "dangerous.mysql",
+                "TRUNCATE TABLE users;\n",
+                "safe.mysql",
+                "SELECT 1;\n",
+                "mysql app -e 'source",
+                "'",
+            ),
+            (
+                "database.mongodb",
+                "dangerous.js",
+                "db.users.drop();\n",
+                "safe.js",
+                "db.users.find({});\n",
+                "mongosh --file",
+                "",
+            ),
+            (
+                "database.sqlite",
+                "dangerous.sqlite",
+                "DELETE FROM users;\n",
+                "safe.sqlite",
+                "SELECT 1;\n",
+                "sqlite3 -init",
+                " app.db 'SELECT 1;'",
+            ),
+            (
+                "database.redis",
+                "dangerous.lua",
+                "return redis.call('FLUSHALL')\n",
+                "safe.lua",
+                "return redis.call('GET', 'account:1')\n",
+                "redis-cli --eval",
+                "",
+            ),
+        ];
+
+        for (pack_id, dangerous_name, dangerous_body, safe_name, safe_body, prefix, suffix) in cases
+        {
+            let dangerous = temp.path().join(dangerous_name);
+            let safe = temp.path().join(safe_name);
+            std::fs::write(&dangerous, dangerous_body).expect("write dangerous client script");
+            std::fs::write(&safe, safe_body).expect("write safe client script");
+
+            let dangerous_command = format!("{prefix} {}{suffix}", dangerous.display());
+            assert!(
+                evaluate_with_pack_ids(&dangerous_command, &[pack_id]).is_denied(),
+                "destructive executable file must block: {dangerous_command}"
+            );
+            let safe_command = format!("{prefix} {}{suffix}", safe.display());
+            assert!(
+                evaluate_with_pack_ids(&safe_command, &[pack_id]).is_allowed(),
+                "safe executable file must remain allowed: {safe_command}"
+            );
+        }
+
+        for (command, pack_id) in [
+            ("psql -f \"$SQL_FILE\"", "database.postgresql"),
+            ("mysql app -e 'source $SQL_FILE'", "database.mysql"),
+            ("mongosh --file \"$JS_FILE\"", "database.mongodb"),
+            ("sqlite3 -init \"$SQL_FILE\" app.db", "database.sqlite"),
+            ("redis-cli --eval \"$LUA_FILE\"", "database.redis"),
+        ] {
+            let result = evaluate_with_pack_ids(command, &[pack_id]);
+            assert!(
+                result.is_denied(),
+                "dynamic executable file must block: {command}"
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some(INDIRECT_INPUT_RULE)
+            );
+        }
+    }
+
+    #[test]
+    fn database_argument_quote_provenance_is_preserved() {
+        for (command, pack_id) in [
+            ("psql app -c 'SELECT $1;'", "database.postgresql"),
+            (
+                "mongosh --eval 'db.users.updateMany({}, {$set: {active: true}})'",
+                "database.mongodb",
+            ),
+            ("psql app -c SELECT\\é", "database.postgresql"),
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &[pack_id]).is_allowed(),
+                "literal quoted metacharacters must remain data: {command}"
+            );
+        }
+        if !cfg!(windows) {
+            assert!(
+                evaluate_with_pack_ids(
+                    "psql app -c \"SELECT * FROM users WHERE name LIKE '%foo%'\"",
+                    &["database.postgresql"],
+                )
+                .is_allowed(),
+                "POSIX shells do not expand percent-delimited SQL literals"
+            );
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("$SQL_FILE"), "SELECT 1;\n")
+            .expect("write literal-dollar script");
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "psql -f '$SQL_FILE'",
+                &["database.postgresql"],
+                Some(temp.path()),
+            )
+            .is_allowed(),
+            "a single-quoted dollar path is a literal filename"
+        );
+        assert!(
+            evaluate_with_pack_ids("psql app -c \"$SQL\"", &["database.postgresql"]).is_denied(),
+            "an active parameter expansion must fail closed"
+        );
+    }
+
+    #[test]
+    fn embedded_shell_wrappers_and_exec_cannot_hide_database_consumers() {
+        for command in [
+            "printf 'DROP TABLE users;' | bash --noprofile -lc 'psql app'",
+            "bash -o errexit -c \"printf 'DROP TABLE users;' | psql app\"",
+            "exec bash -lc \"printf 'DROP TABLE users;' | psql app\"",
+            "exec psql -c \"$(printf 'DROP TABLE users;')\"",
+            "db=psql; printf 'DROP TABLE users;' | \"$db\" app",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["database.postgresql"]).is_denied(),
+                "shell indirection must not hide a psql code sink: {command}"
+            );
+        }
+        assert!(
+            evaluate_with_pack_ids("bash -c \"$COMMAND\"", &["database.postgresql"]).is_allowed(),
+            "a dynamic shell with no visible database client is outside this analyzer"
+        );
+        assert!(
+            evaluate_with_pack_ids("db=psql; echo '$db'", &["database.postgresql"]).is_allowed(),
+            "a quoted alias printed as data is not an executable client"
+        );
+    }
+
+    #[test]
+    fn recursive_database_includes_are_bounded_and_context_aware() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("danger.psql"), "DROP TABLE users;\n")
+            .expect("write dangerous psql child");
+        std::fs::write(temp.path().join("root.psql"), "\\i danger.psql\n")
+            .expect("write psql root");
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "psql -f root.psql",
+                &["database.postgresql"],
+                Some(temp.path()),
+            )
+            .is_denied()
+        );
+
+        let subdir = temp.path().join("nested");
+        std::fs::create_dir(&subdir).expect("create nested scripts directory");
+        std::fs::write(subdir.join("danger.psql"), "DROP TABLE users;\n")
+            .expect("write relative child");
+        std::fs::write(subdir.join("root.psql"), "\\ir danger.psql\n")
+            .expect("write relative root");
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "psql -f nested/root.psql",
+                &["database.postgresql"],
+                Some(temp.path()),
+            )
+            .is_denied(),
+            "psql \\ir must resolve from the including file's parent"
+        );
+
+        std::fs::write(temp.path().join("cycle-a.psql"), "\\i cycle-b.psql\n")
+            .expect("write cycle a");
+        std::fs::write(temp.path().join("cycle-b.psql"), "\\i cycle-a.psql\n")
+            .expect("write cycle b");
+        let cycle = evaluate_with_pack_ids_at_path(
+            "psql -f cycle-a.psql",
+            &["database.postgresql"],
+            Some(temp.path()),
+        );
+        assert!(cycle.is_denied());
+        assert_eq!(
+            cycle
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some(INDIRECT_INPUT_RULE)
+        );
+
+        std::fs::write(temp.path().join("danger.sqlite"), "DELETE FROM users;\n")
+            .expect("write sqlite child");
+        std::fs::write(temp.path().join("root.sqlite"), ".read danger.sqlite\n")
+            .expect("write sqlite root");
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "sqlite3 -init root.sqlite app.db 'SELECT 1;'",
+                &["database.sqlite"],
+                Some(temp.path()),
+            )
+            .is_denied()
+        );
+
+        std::fs::write(temp.path().join("danger.mongodb"), "db.users.drop();\n")
+            .expect("write MongoDB child");
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "mongosh --eval \"load/*guard*/('danger.mongodb')\"",
+                &["database.mongodb"],
+                Some(temp.path()),
+            )
+            .is_denied(),
+            "comments between load and its call must not hide the file"
+        );
+        for command in [
+            "mongosh --eval \"/x/*load('danger.mongodb')\"",
+            "mongosh --eval \"function f(){ return /x/*load('danger.mongodb') }; f()\"",
+            "mongosh --eval \"// inert\u{2028}load('danger.mongodb')\"",
+            r#"mongosh --eval "lo\u0061d('danger.mongodb')""#,
+            r#"mongosh --eval '`${lo\u0061d("danger.mongodb")}`'"#,
+            r#"mongosh --eval 'eval("load(\"danger.mongodb\")")'"#,
+            r#"mongosh --eval 'Function("load(\"danger.mongodb\")")()'"#,
+            "mongosh --eval \"(load)('danger.mongodb')\"",
+            "mongosh --eval \"load.call(null, 'danger.mongodb')\"",
+            "mongosh --eval \"globalThis['load']('danger.mongodb')\"",
+        ] {
+            assert!(
+                evaluate_with_pack_ids_at_path(command, &["database.mongodb"], Some(temp.path()),)
+                    .is_denied(),
+                "indirect or encoded MongoDB load must fail closed: {command}"
+            );
+        }
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "mongosh --eval \"/* load('danger.mongodb') */ db.users.find({})\"",
+                &["database.mongodb"],
+                Some(temp.path()),
+            )
+            .is_allowed(),
+            "a genuine block comment must keep load() inert"
+        );
+    }
+
+    #[test]
+    fn database_client_shell_escapes_are_rechecked_by_all_enabled_packs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            ("escape.psql", "\\!rm -rf /\n", "psql -f escape.psql"),
+            ("pipe.psql", "SELECT 1 \\g |rm -rf /\n", "psql -f pipe.psql"),
+            ("hash.psql", "SELECT 1 # \\!rm -rf /\n", "psql -f hash.psql"),
+            (
+                "standard-string.psql",
+                "SELECT 'x\\' \\!rm -rf /\n",
+                "psql -f standard-string.psql",
+            ),
+            (
+                "backtick.psql",
+                "SELECT `x \\!rm -rf /\n",
+                "psql -f backtick.psql",
+            ),
+            (
+                "multiple-meta.psql",
+                "\\x \\!rm -rf /\n",
+                "psql -f multiple-meta.psql",
+            ),
+            (
+                "program.psql",
+                "\\copy users TO PROGRAM 'rm -rf /'\n",
+                "psql -f program.psql",
+            ),
+            (
+                "server-program.psql",
+                "COPY (SELECT 1) TO PROGRAM 'rm -rf /';\n",
+                "psql -f server-program.psql",
+            ),
+            (
+                "g-options.psql",
+                "SELECT 1 \\g (format=unaligned) |rm -rf /\n",
+                "psql -f g-options.psql",
+            ),
+            (
+                "gexec.psql",
+                "SELECT 'DR'||'OP TABLE users' \\gexec\n",
+                "psql -f gexec.psql",
+            ),
+            (
+                "nested-shell.psql",
+                "\\! bash -c 'rm -rf /'\n",
+                "psql -f nested-shell.psql",
+            ),
+            (
+                "escape.sqlite",
+                ".shell rm -rf /\n",
+                "sqlite3 -init escape.sqlite app.db 'SELECT 1;'",
+            ),
+            (
+                "escape.mysql",
+                "SELECT 1; \\!rm -rf /\n",
+                "mysql --execute='source escape.mysql' app",
+            ),
+        ];
+        for (name, body, command) in cases {
+            std::fs::write(temp.path().join(name), body).expect("write shell-escape fixture");
+            assert!(
+                evaluate_with_pack_ids_at_path(
+                    command,
+                    &[
+                        "database.postgresql",
+                        "database.sqlite",
+                        "database.mysql",
+                        "core.filesystem",
+                    ],
+                    Some(temp.path()),
+                )
+                .is_denied(),
+                "database shell escape must be evaluated as a shell command: {name}"
+            );
+        }
+        for command in [
+            "psql -c '\\!rm -rf /'",
+            "mysql --execute='system rm -rf /' app",
+            "sqlite3 app.db '.shell rm -rf /'",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(
+                    command,
+                    &[
+                        "database.postgresql",
+                        "database.mysql",
+                        "database.sqlite",
+                        "core.filesystem",
+                    ],
+                )
+                .is_denied(),
+                "literal code arguments must enter cross-pack analysis: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn psql_variables_and_startup_files_follow_effective_cli_semantics() {
+        assert!(
+            evaluate_with_pack_ids(
+                "psql -v verb=DROP -c ':verb TABLE users'",
+                &["database.postgresql"],
+            )
+            .is_allowed(),
+            "psql deliberately does not interpolate variables in -c command strings"
+        );
+        assert!(
+            evaluate_with_pack_ids(
+                "printf ':danger TABLE users;' | psql -v danger=DROP",
+                &["database.postgresql"],
+            )
+            .is_denied(),
+            "psql interpolates variables in stdin scripts"
+        );
+        assert!(
+            evaluate_with_pack_ids("printf 'SELECT 1::int;' | psql", &["database.postgresql"],)
+                .is_allowed(),
+            "a PostgreSQL cast is not a psql variable reference"
+        );
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let safe = temp.path().join("safe.rc");
+        let danger = temp.path().join("danger.rc");
+        std::fs::write(&safe, "SELECT 1;\n").expect("write safe rc");
+        std::fs::write(&danger, "DROP TABLE users;\n").expect("write dangerous rc");
+        std::fs::write(temp.path().join("variable.psql"), ":danger TABLE users;\n")
+            .expect("write variable script");
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "psql -v danger=DROP -f variable.psql",
+                &["database.postgresql"],
+                Some(temp.path()),
+            )
+            .is_denied(),
+            "psql variable interpolation in file scripts must fail closed"
+        );
+        for command in [
+            format!("PSQLRC={} psql -d -X -c 'SELECT 1'", danger.display()),
+            format!("PSQLRC={} psql -- -X", danger.display()),
+            format!(
+                "PSQLRC={} PSQLRC={} psql -c 'SELECT 1'",
+                safe.display(),
+                danger.display()
+            ),
+            format!(
+                "X=/usr/bin/psql PSQLRC={} psql -c 'SELECT 1'",
+                danger.display()
+            ),
+        ] {
+            assert!(
+                evaluate_with_pack_ids(&command, &["database.postgresql"]).is_denied(),
+                "effective PSQLRC must be inspected: {command}"
+            );
+        }
+        assert!(
+            evaluate_with_pack_ids(
+                &format!("PSQLRC={} psql -Xq -c 'SELECT 1'", danger.display()),
+                &["database.postgresql"],
+            )
+            .is_allowed(),
+            "a parsed -X cluster disables PSQLRC"
+        );
+
+        let versioned_base = temp.path().join("versioned.rc");
+        std::fs::write(&versioned_base, "SELECT 1;\n").expect("write base rc");
+        std::fs::write(temp.path().join("versioned.rc-17"), "DROP TABLE users;\n")
+            .expect("write versioned rc");
+        let ambiguous = evaluate_with_pack_ids(
+            &format!("PSQLRC={} psql -c 'SELECT 1'", versioned_base.display()),
+            &["database.postgresql"],
+        );
+        assert!(ambiguous.is_denied());
+        assert_eq!(
+            ambiguous
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some(INDIRECT_INPUT_RULE)
+        );
+    }
+
+    #[test]
+    fn literal_printf_reconstruction_closes_split_token_bypass() {
+        for command in [
+            "printf 'FLUSH%s' ALL | redis-cli",
+            r"printf '\x46LUSHALL' | redis-cli",
+            "printf '%s\\n' GET FLUSHALL | redis-cli",
+            r"echo -e '\106LUSHALL' | redis-cli",
+            r"echo -ne '\x46LUSHALL' | redis-cli",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["database.redis"]);
+            assert!(result.is_denied(), "rendered payload must block: {command}");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some("flushall"),
+                "unexpected rule for reconstructed payload: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_literal_repl_pipelines_remain_allowed() {
+        let cases = [
+            ("echo 'GET account:1' | redis-cli", "database.redis"),
+            ("echo 'SELECT 1;' | psql app", "database.postgresql"),
+            ("echo 'SHOW TABLES;' | mysql app", "database.mysql"),
+            ("echo 'db.users.find({})' | mongosh", "database.mongodb"),
+            ("echo 'SELECT 1;' | sqlite3 app.db", "database.sqlite"),
+        ];
+
+        for (command, pack_id) in cases {
+            let result = evaluate_with_pack_ids(command, &[pack_id]);
+            assert!(
+                result.is_allowed(),
+                "safe static payload blocked: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn heredoc_pipeline_producers_are_reconstructed_without_trusting_expansion() {
+        for command in [
+            "cat <<'SQL' | psql app\nDROP TABLE users;\nSQL",
+            "cat <<EOF | redis-cli\nFLUSHALL\nEOF",
+            "cat <<'EOF' | cat | redis-cli\nFLUSHALL\nEOF",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(
+                    command,
+                    &[if command.contains("psql") {
+                        "database.postgresql"
+                    } else {
+                        "database.redis"
+                    }],
+                )
+                .is_denied(),
+                "destructive heredoc payload must block: {command}"
+            );
+        }
+
+        assert!(
+            evaluate_with_pack_ids(
+                "cat <<'SQL' | psql app\nSELECT 1;\nSQL",
+                &["database.postgresql"],
+            )
+            .is_allowed(),
+            "a quoted, statically safe heredoc should remain allowed"
+        );
+        assert!(
+            evaluate_with_pack_ids(
+                "cat <<'EOF' | cat | redis-cli\nGET account:1\nEOF",
+                &["database.redis"],
+            )
+            .is_allowed(),
+            "literal cat pass-through stages must preserve the verified payload"
+        );
+        assert!(
+            evaluate_with_pack_ids("cat <<SQL | psql app\n$SQL\nSQL", &["database.postgresql"],)
+                .is_denied(),
+            "an expandable heredoc body must fail closed"
+        );
+    }
+
+    #[test]
+    fn dynamic_repl_pipeline_fails_closed_with_stable_rule() {
+        let mut cases = vec![("generate-sql | psql app", "database.postgresql")];
+        if cfg!(windows) {
+            cases.extend([
+                ("echo %REDIS_COMMAND% | redis-cli", "database.redis"),
+                ("echo !REDIS_COMMAND! | redis-cli", "database.redis"),
+            ]);
+        }
+        for (command, pack_id) in cases {
+            let result = evaluate_with_pack_ids(command, &[pack_id]);
+            assert!(result.is_denied(), "dynamic input must block: {command}");
+            let info = result
+                .pattern_info
+                .expect("unverified input must name a rule");
+            assert_eq!(info.pack_id.as_deref(), Some(pack_id));
+            assert_eq!(info.pattern_name.as_deref(), Some(INDIRECT_INPUT_RULE));
+            assert_eq!(info.severity, Some(crate::packs::Severity::High));
+        }
+    }
+
+    #[test]
+    fn sed_executable_scripts_are_evaluated_as_shell_commands() {
+        for command in [
+            "sed 'e rm -rf /' file.txt",
+            "sed 'erm -rf /' file.txt",
+            "sed -e 's|x|rm -rf /|e' file.txt",
+            "sed -ne 's|x|git reset --hard|ep' file.txt",
+            "sed '1e rm -rf /' file.txt",
+            "sed '1,+1e rm -rf /' file.txt",
+            "sed '\\%foo% e rm -rf /' file.txt",
+            "sed '1{e rm -rf /\n}' file.txt",
+            "sed -e 'e rm -rf /' -- --sandbox",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["core.filesystem", "core.git"]).is_denied(),
+                "sed-executed destructive shell command must block: {command}"
+            );
+        }
+
+        for command in [
+            "sed 's|foo|bar|g' file.txt",
+            "sed -e 's|foo|bar|p' file.txt",
+            "sed 'e echo ok' file.txt",
+            "sed 'eecho ok' file.txt",
+            "sed 'e echo \"rm -rf /\"' file.txt",
+            "sed --sandbox 'e rm -rf /' file.txt",
+            "sed -e '-f' input.txt",
+        ] {
+            assert!(
+                evaluate_with_pack_ids(command, &["core.filesystem", "core.git"]).is_allowed(),
+                "non-destructive sed command must remain allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_dependent_sed_execution_fails_closed_with_stable_rule() {
+        for command in [
+            "sed 'e' file.txt",
+            "sed 'e $DCG_TEST_COMMAND' file.txt",
+            "sed 's|.*|rm -rf &|e' file.txt",
+            "sed 's|x|rm -rf \\U/tmp|e' file.txt",
+            "sed 's|x|$DCG_TEST_COMMAND|e' file.txt",
+        ] {
+            let result = evaluate_with_pack_ids(command, &["core.filesystem"]);
+            assert!(
+                result.is_denied(),
+                "dynamic sed execution must block: {command}"
+            );
+            let info = result
+                .pattern_info
+                .expect("stable sed rule must be reported");
+            assert_eq!(info.pack_id.as_deref(), Some("core.filesystem"));
+            assert_eq!(info.pattern_name.as_deref(), Some(SED_EXEC_UNVERIFIED_RULE));
+            assert_eq!(info.severity, Some(crate::packs::Severity::High));
+        }
+    }
+
+    #[test]
+    fn sed_line_consuming_commands_do_not_manufacture_exec_sources() {
+        for command in [
+            "sed '# inert; e rm -rf /' file.txt",
+            "sed 'w output; e rm -rf /' file.txt",
+            "sed 'r input; e rm -rf /' file.txt",
+        ] {
+            assert!(
+                collect_sed_shell_sources(command, None).is_empty(),
+                "line-consuming sed syntax must not manufacture an e command: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn sed_program_files_are_inspected_for_shell_execution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dangerous = temp.path().join("dangerous.sed");
+        let dynamic = temp.path().join("dynamic.sed");
+        let safe = temp.path().join("safe.sed");
+        std::fs::write(&dangerous, "e rm -rf /\n").expect("write dangerous sed program");
+        std::fs::write(&dynamic, "e $DCG_TEST_COMMAND\n").expect("write dynamic sed program");
+        std::fs::write(&safe, "s/foo/bar/g\n").expect("write safe sed program");
+
+        for command in [
+            format!("sed -f {} input.txt", dangerous.display()),
+            format!("sed -nf{} input.txt", dangerous.display()),
+        ] {
+            assert!(
+                evaluate_with_pack_ids(&command, &["core.filesystem"]).is_denied(),
+                "dangerous sed program file must block: {command}"
+            );
+        }
+
+        let dynamic_result = evaluate_with_pack_ids(
+            &format!("sed --file={} input.txt", dynamic.display()),
+            &["core.filesystem"],
+        );
+        assert!(dynamic_result.is_denied());
+        assert_eq!(
+            dynamic_result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some(SED_EXEC_UNVERIFIED_RULE)
+        );
+
+        assert!(
+            evaluate_with_pack_ids(
+                &format!("sed -f {} input.txt", safe.display()),
+                &["core.filesystem"],
+            )
+            .is_allowed(),
+            "non-executing sed program file must remain allowed"
+        );
+
+        assert!(
+            evaluate_with_pack_ids(
+                &format!(
+                    "printf 'e rm -rf /' > {}; sed -f {} input.txt",
+                    safe.display(),
+                    safe.display()
+                ),
+                &["core.filesystem"],
+            )
+            .is_denied(),
+            "a sed program file modified by an earlier segment must fail closed"
+        );
+    }
+
+    #[test]
+    fn indirect_flow_limit_fails_closed_instead_of_skipping_tail_flows() {
+        let command = (0..=MAX_INDIRECT_INPUT_FLOWS)
+            .map(|index| format!("echo 'GET key:{index}' | redis-cli"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let result = evaluate_with_pack_ids(&command, &["database.redis"]);
+        assert!(result.is_denied());
+        assert_eq!(
+            result
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some(INDIRECT_INPUT_RULE)
+        );
+    }
+
+    #[test]
+    fn substitutions_are_checked_only_when_they_supply_repl_code() {
+        for command in [
+            "redis-cli $(echo FLUSHALL)",
+            "redis-cli `printf FLUSHALL`",
+            "redis-cli $(printf FLUSH; printf ALL)",
+            "redis-cli `printf FLUSH; printf ALL`",
+            "redis-cli \"FLUSH$(echo ALL)\"",
+            "psql app -c \"$(echo 'DROP TABLE users;')\"",
+            "psql app -c \"DROP $(printf TABLE) users;\"",
+            "psql app -c$(echo 'DROP TABLE users;')",
+            "mysql app --execute=\"$(echo 'TRUNCATE TABLE users;')\"",
+            "mysql app -e$(echo 'TRUNCATE TABLE users;')",
+            "mongosh --eval \"$(echo 'db.users.drop()')\"",
+            "sqlite3 app.db \"$(echo 'DELETE FROM users;')\"",
+        ] {
+            let pack_id = if command.starts_with("redis") {
+                "database.redis"
+            } else if command.starts_with("psql") {
+                "database.postgresql"
+            } else if command.starts_with("mysql") {
+                "database.mysql"
+            } else if command.starts_with("mongo") {
+                "database.mongodb"
+            } else {
+                "database.sqlite"
+            };
+            assert!(
+                evaluate_with_pack_ids(command, &[pack_id]).is_denied(),
+                "payload-bearing substitution must block: {command}"
+            );
+        }
+
+        assert!(
+            evaluate_with_pack_ids("psql $(echo app)", &["database.postgresql"]).is_allowed(),
+            "a substitution used only as a database name is not SQL"
+        );
+        assert!(
+            evaluate_with_pack_ids(
+                "psql app -c \"SELECT $(printf 1);\"",
+                &["database.postgresql"],
+            )
+            .is_allowed(),
+            "a statically reconstructed safe code argument remains allowed"
+        );
+
+        let mut dynamic_arguments = vec![
+            ("redis-cli \"$REDIS_COMMAND\"", "database.redis"),
+            ("psql app -c \"$SQL\"", "database.postgresql"),
+            ("mysql app -e \"$SQL\"", "database.mysql"),
+            ("mongosh --eval \"$JS\"", "database.mongodb"),
+            ("sqlite3 app.db \"$SQL\"", "database.sqlite"),
+        ];
+        if cfg!(windows) {
+            dynamic_arguments.extend([
+                ("redis-cli %REDIS_COMMAND%", "database.redis"),
+                ("psql app -c !SQL!", "database.postgresql"),
+            ]);
+        }
+        for (command, pack_id) in dynamic_arguments {
+            let result = evaluate_with_pack_ids(command, &[pack_id]);
+            assert!(
+                result.is_denied(),
+                "dynamic code argument must fail closed: {command}"
+            );
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some(INDIRECT_INPUT_RULE)
+            );
+        }
+        if !cfg!(windows) {
+            assert!(
+                evaluate_with_pack_ids("redis-cli %REDIS_COMMAND%", &["database.redis"],)
+                    .is_allowed(),
+                "POSIX shells treat percent-delimited text as a literal argument"
+            );
+        }
+        assert!(
+            evaluate_with_pack_ids(
+                "psql -c __DCG_SUB_0__ $(echo 'DROP TABLE users;')",
+                &["database.postgresql"],
+            )
+            .is_allowed(),
+            "literal text resembling an internal marker must not associate an unrelated substitution"
+        );
+    }
+
+    #[test]
+    fn redirected_repl_files_are_bounded_and_evaluated() {
+        assert_eq!(
+            parse_redirect_path(r#""C:\Temp\danger.redis""#),
+            Some(PathBuf::from(r"C:\Temp\danger.redis")),
+            "quoted Windows paths must preserve their separators"
+        );
+        assert_eq!(
+            parse_redirect_path(r"C:\Temp\danger.redis"),
+            Some(PathBuf::from(r"C:\Temp\danger.redis")),
+            "unquoted Windows paths must not be interpreted as POSIX escapes"
+        );
+        assert_eq!(
+            parse_redirect_path(r"safe\ input.redis"),
+            Some(PathBuf::from("safe input.redis")),
+            "POSIX escaped paths should still be decoded"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("danger.redis"), "FLUSHALL\n").unwrap();
+        std::fs::write(temp.path().join("safe.redis"), "GET account:1\n").unwrap();
+
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "redis-cli \"$(cat danger.redis)\"",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_denied(),
+            "a literal file read by command substitution is evaluated"
+        );
+
+        let denied = evaluate_with_pack_ids_at_path(
+            "redis-cli < danger.redis",
+            &["database.redis"],
+            Some(temp.path()),
+        );
+        assert!(denied.is_denied());
+        assert_eq!(
+            denied
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("flushall")
+        );
+
+        for command in [
+            "< danger.redis redis-cli",
+            "0<danger.redis redis-cli",
+            "exec < danger.redis; redis-cli",
+        ] {
+            assert!(
+                evaluate_with_pack_ids_at_path(command, &["database.redis"], Some(temp.path()),)
+                    .is_denied(),
+                "prefix or inherited stdin redirect must block: {command}"
+            );
+        }
+
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "redis-cli < safe.redis",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_allowed()
+        );
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "redis-cli < missing.redis",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_denied()
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("safe.redis", temp.path().join("linked.redis")).unwrap();
+            assert!(
+                evaluate_with_pack_ids_at_path(
+                    "redis-cli < linked.redis",
+                    &["database.redis"],
+                    Some(temp.path()),
+                )
+                .is_denied(),
+                "redirected symlinks must fail closed to prevent target-swap races"
+            );
+        }
+
+        // The explicit redirect wins at runtime, but the earlier pipeline stage
+        // can still mutate the file after inspection. Compound-before-consumer
+        // redirects therefore fail closed instead of trusting a racy snapshot.
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "echo FLUSHALL | redis-cli < safe.redis",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_denied()
+        );
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "echo 'GET account:1' | redis-cli < danger.redis",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_denied(),
+            "the final explicit stdin redirect must be evaluated even when a safe pipe precedes it"
+        );
+
+        // A non-stdin descriptor must not suppress the actual pipe source.
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "echo FLUSHALL | redis-cli 3< safe.redis",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_denied()
+        );
+
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "redis-cli < safe.redis && echo done",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_allowed(),
+            "a later segment cannot rewrite stdin before the consumer reads it"
+        );
+
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "printf FLUSHALL > safe.redis; redis-cli < safe.redis",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_denied(),
+            "a prior segment can replace a previously-safe file after inspection"
+        );
+
+        let last_redirect_wins = evaluate_with_pack_ids_at_path(
+            "redis-cli < safe.redis < danger.redis",
+            &["database.redis"],
+            Some(temp.path()),
+        );
+        assert!(last_redirect_wins.is_denied());
+        assert_eq!(
+            last_redirect_wins
+                .pattern_info
+                .as_ref()
+                .and_then(|info| info.pattern_name.as_deref()),
+            Some("flushall")
+        );
+        assert!(
+            evaluate_with_pack_ids_at_path(
+                "redis-cli < danger.redis < safe.redis",
+                &["database.redis"],
+                Some(temp.path()),
+            )
+            .is_allowed(),
+            "an earlier redirect is superseded by the final stdin redirect"
+        );
+    }
+
+    #[test]
+    fn pipeline_payload_does_not_cross_sequence_boundaries_or_direct_commands() {
+        assert!(
+            evaluate_with_pack_ids(
+                "echo FLUSHALL | cat; redis-cli GET account:1",
+                &["database.redis"],
+            )
+            .is_allowed()
+        );
+        assert!(
+            evaluate_with_pack_ids(
+                "echo FLUSHALL | redis-cli SET account:1 active",
+                &["database.redis"],
+            )
+            .is_allowed(),
+            "redis-cli with a direct command does not read stdin as commands"
+        );
     }
 
     #[test]
