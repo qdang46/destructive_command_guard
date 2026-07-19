@@ -2152,10 +2152,10 @@ fn visible_powershell_scriptblock_invocations(statement: &str) -> Vec<String> {
                     &tokens,
                     index,
                     statement,
-                ))
-                    && !names.contains(&name) {
-                        names.push(name);
-                    }
+                )) && !names.contains(&name)
+                {
+                    names.push(name);
+                }
             }
         }
 

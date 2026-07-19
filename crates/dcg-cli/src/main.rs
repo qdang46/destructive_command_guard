@@ -25,8 +25,7 @@ use dcg_cli::cli::{self, Cli};
 // Exit codes are used by cli.rs for robot mode; main.rs uses them for hook mode errors
 use dcg_cli::config::Config;
 use dcg_cli::evaluator::{
-    EvaluationDecision, MatchSource,
-    evaluate_command_with_pack_order_deadline_at_path_in_dialect,
+    EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
 use dcg_cli::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
