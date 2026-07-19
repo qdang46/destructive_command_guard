@@ -250,7 +250,7 @@
           "default": null
         },
         "max_command_bytes": {
-          "description": "Maximum bytes for command string after extraction from JSON.\nCommands exceeding this limit are allowed (fail-open) with a warning.\nDefault: 65536 (64 KiB).",
+          "description": "Maximum bytes for command string after extraction from JSON.\nCommands exceeding this limit produce an explicit indeterminate result;\nreview-capable protocols ask and other protocols block.\nDefault: 65536 (64 KiB).",
           "type": [
             "integer",
             "null"

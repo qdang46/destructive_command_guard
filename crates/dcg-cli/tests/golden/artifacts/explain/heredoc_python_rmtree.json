@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "command": "python3 <<'PY'\nimport shutil\nshutil.rmtree('/home/example/project')\nPY",
   "decision": "deny",
   "total_duration_us": "<duration_us>",

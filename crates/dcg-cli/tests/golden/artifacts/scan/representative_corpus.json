@@ -6,16 +6,16 @@
       "files_scanned": 2,
       "files_skipped": 0,
       "commands_extracted": 7,
-      "findings_total": 3,
+      "findings_total": 4,
       "decisions": {
         "allow": 0,
         "warn": 0,
-        "deny": 3
+        "deny": 4
       },
       "severities": {
         "info": 0,
         "warning": 0,
-        "error": 3
+        "error": 4
       },
       "max_findings_reached": false,
       "elapsed_ms": "<elapsed_ms>"
@@ -42,6 +42,17 @@
         "rule_id": "core.git:reset-hard",
         "reason": "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
         "suggestion": "Use `git reset --soft` or `--mixed` to preserve changes"
+      },
+      {
+        "file": "representative.sh",
+        "line": 6,
+        "extractor_id": "shell.script",
+        "extracted_command": "rm -rf \"$TMPDIR/dcg-cache\"",
+        "decision": "deny",
+        "severity": "error",
+        "rule_id": "core.filesystem:rm-rf-general",
+        "reason": "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
+        "suggestion": "Use `rm -ri` for interactive confirmation of each file"
       },
       {
         "file": "representative.sh",

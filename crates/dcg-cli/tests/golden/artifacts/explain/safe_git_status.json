@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "command": "git status --short",
   "decision": "allow",
   "total_duration_us": "<duration_us>",
@@ -9,7 +9,7 @@
       "duration_us": "<duration_us>",
       "details": {
         "type": "keyword_gating",
-        "quick_rejected": true,
+        "quick_rejected": false,
         "keywords_checked": [
           "&>",
           "/cp",
