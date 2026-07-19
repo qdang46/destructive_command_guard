@@ -1804,7 +1804,7 @@ mod tests {
             let allowlists =
                 apply_agent_allowlist_profile(config, agent, LayeredAllowlist::default());
 
-            evaluate_command_with_pack_order_deadline_at_path(
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
                 command,
                 &enabled_keywords,
                 &ordered_packs,
@@ -1815,6 +1815,7 @@ mod tests {
                 None,
                 None,
                 None,
+                dcg_cli::normalize::ShellDialect::Unknown,
             )
         }
 
