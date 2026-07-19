@@ -3825,6 +3825,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 
     patterns
 }
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::packs::Severity;
