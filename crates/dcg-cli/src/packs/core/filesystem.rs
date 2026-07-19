@@ -3828,7 +3828,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 mod tests {
     use super::*;
     use crate::packs::Severity;
-    use crate::packs::test_helpers::*;
+    
 
     #[test]
     fn test_pack_creation() {
@@ -5449,6 +5449,7 @@ mod tests {
         assert_blocks(&pack, "rm -rf /tmp/../etc", "rm -rf on root or home paths");
     }
 
+    #[allow(dead_code)]
     fn assert_rm_parser_allows(command: &str) {
         let decision = parse_rm_command(command);
         assert!(
@@ -5457,6 +5458,7 @@ mod tests {
         );
     }
 
+    #[allow(dead_code)]
     fn assert_rm_parser_denies(command: &str, expected_rule: &str, expected_severity: Severity) {
         match parse_rm_command(command) {
             RmParseDecision::Deny(hit) => {
@@ -5473,6 +5475,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn assert_rm_parser_no_match(command: &str) {
         match parse_rm_command(command) {
             RmParseDecision::NoMatch => {}

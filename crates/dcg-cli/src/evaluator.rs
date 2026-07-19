@@ -2138,7 +2138,7 @@ fn visible_powershell_scriptblock_invocations(statement: &str) -> Vec<String> {
             if let Some((name, variable_end)) = powershell_variable_prefix(decoded.as_ref()) {
                 let remainder = decoded.get(variable_end..).unwrap_or_default();
                 let remainder = remainder.strip_prefix('?').unwrap_or(remainder);
-                if powershell_method_token_invocation(
+                if (powershell_method_token_invocation(
                     remainder, ".invoke", &tokens, index, statement,
                 ) || powershell_method_token_invocation(
                     remainder,
@@ -2152,11 +2152,10 @@ fn visible_powershell_scriptblock_invocations(statement: &str) -> Vec<String> {
                     &tokens,
                     index,
                     statement,
-                ) {
-                    if !names.contains(&name) {
+                ))
+                    && !names.contains(&name) {
                         names.push(name);
                     }
-                }
             }
         }
 

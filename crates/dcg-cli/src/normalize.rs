@@ -2010,11 +2010,10 @@ fn consume_powershell_literal_word(bytes: &[u8], mut i: usize, len: usize) -> us
         if matches!(byte, b'\r' | b'\n') {
             break;
         }
-        if quote.is_none() {
-            if byte.is_ascii_whitespace() || powershell_pipeline_end(bytes, i, len).is_some() {
+        if quote.is_none()
+            && (byte.is_ascii_whitespace() || powershell_pipeline_end(bytes, i, len).is_some()) {
                 break;
             }
-        }
         if matches!(byte, b'\'' | b'"') {
             quote = if quote == Some(byte) {
                 None
