@@ -698,6 +698,119 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Materialize and review the exact rendered SQL, including templates and variables, before executing it.",
             REVIEW_SUGGESTIONS
         ),
+        // ------------------------------------------------------------------
+        // CLI-surface drops. Unlike the semantic `snow sql` entries above,
+        // these are ordinary regexes over the (sanitized) command line: the
+        // Snowflake CLI can drop live objects directly, without any SQL
+        // payload, via `snow object drop`, `snow stage drop`/`remove`,
+        // `snow app teardown`, `snow spcs ... drop`, and `snow snowpark
+        // drop` — and `--force` variants skip the interactive confirmation.
+        // The shared prefix accepts global options (with values) between
+        // `snow` and the subcommand path while refusing to cross shell
+        // separators.
+        // ------------------------------------------------------------------
+        destructive_pattern!(
+            "cli-object-drop-database",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+object\s+drop\s+(?:database|schema)\b",
+            "snow object drop database/schema removes the object and everything inside it.",
+            Critical,
+            "Dropping a database or schema removes ALL contained objects (tables, views, \
+             stages, pipes, tasks, functions). Time Travel/UNDROP recovery is conditional \
+             on retention, edition, and privileges - it is not a substitute for preventing \
+             the drop. Verify with `snow object list database` / `snow object describe` \
+             and consider `CREATE DATABASE <name>_backup CLONE <name>` first.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-object-drop",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+object\s+drop\b",
+            "snow object drop permanently removes a Snowflake object.",
+            High,
+            "snow object drop removes tables, views, stages, streams, tasks, warehouses, \
+             users, roles, integrations, and more; --force skips the confirmation prompt. \
+             Dropping shared infrastructure can break applications and automation \
+             immediately. Inspect first with `snow object describe <type> <name>`.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-stage-drop",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+stage\s+drop\b",
+            "snow stage drop removes the stage; internal staged files are not recoverable.",
+            High,
+            "Dropped stages cannot be recovered - internal stage files are gone, and \
+             workflows (COPY INTO, Snowpipe) referencing the stage break immediately. \
+             List contents first with `snow stage list-files <stage>`.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-stage-remove",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+stage\s+remove\b",
+            "snow stage remove deletes files from a stage.",
+            High,
+            "Files removed from an internal stage are not covered by Time Travel. \
+             Ingestion pipelines expecting those files will silently see nothing to \
+             load. Preview with `snow stage list-files <stage>` and consider copying \
+             the files out first.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-app-teardown",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+app\s+teardown\b",
+            "snow app teardown drops the Native App and (with --cascade) its owned objects.",
+            High,
+            "snow app teardown drops the application object and the application \
+             package's development artifacts; with --cascade it also drops objects the \
+             app owns, databases included. Anyone using the app loses access \
+             immediately.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-app-version-drop",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+app\s+version\s+drop\b",
+            "snow app version drop removes a Native App version definition.",
+            Medium,
+            "Dropping an application package version prevents new installs and upgrades \
+             of that version; releases pinned to it break.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-snowpark-drop",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+snowpark\s+drop\b",
+            "snow snowpark drop removes a deployed procedure or function from Snowflake.",
+            Medium,
+            "snow snowpark drop function/procedure drops the named object from \
+             Snowflake. Downstream callers (tasks, other procedures, applications) \
+             fail until it is redeployed.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-spcs-drop",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+spcs\s+(?:service|compute-pool|image-repository)\s+drop\b",
+            "snow spcs ... drop removes container services infrastructure.",
+            High,
+            "Dropping an SPCS service stops and removes the running workload; dropping \
+             a compute pool removes the compute for every service on it; dropping an \
+             image repository deletes the stored images.",
+            INGESTION_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-dbt-drop",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+dbt\s+drop\b",
+            "snow dbt drop removes a dbt project object from Snowflake.",
+            Medium,
+            "snow dbt drop removes the named DBT PROJECT object; scheduled `snow dbt \
+             execute` runs and tasks referencing it fail until it is redeployed.",
+            REVIEW_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "cli-dcm-drop",
+            r"(?:^|[\s;&|(])snow(?:\s+--?[^\s;&|]+(?:\s+[^-\s;&|][^\s;&|]*)?)*\s+dcm\s+drop\b",
+            "snow dcm drop removes a DCM project object from Snowflake.",
+            Medium,
+            "snow dcm drop removes the named DCM PROJECT object, including its \
+             deployment history in Snowflake.",
+            REVIEW_SUGGESTIONS
+        ),
     ]
 }
 
@@ -2261,6 +2374,78 @@ fn strip_directive_comment(input: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
+    use crate::packs::test_helpers::{
+        assert_blocks_with_pattern, assert_blocks_with_severity, assert_no_match,
+    };
+
+    #[test]
+    fn cli_surface_drops_are_blocked() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "snow object drop database prod_db",
+            "cli-object-drop-database",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "snow object drop schema prod_db.public",
+            "cli-object-drop-database",
+        );
+        assert_blocks_with_pattern(&pack, "snow object drop table t --force", "cli-object-drop");
+        assert_blocks_with_pattern(&pack, "snow stage drop my_stage", "cli-stage-drop");
+        assert_blocks_with_pattern(
+            &pack,
+            "snow stage remove my_stage /data/file.csv",
+            "cli-stage-remove",
+        );
+        assert_blocks_with_pattern(&pack, "snow app teardown --cascade", "cli-app-teardown");
+        assert_blocks_with_pattern(&pack, "snow app version drop v1_0", "cli-app-version-drop");
+        assert_blocks_with_pattern(
+            &pack,
+            "snow snowpark drop procedure 'hello(int)'",
+            "cli-snowpark-drop",
+        );
+        assert_blocks_with_pattern(&pack, "snow dbt drop analytics_project", "cli-dbt-drop");
+        assert_blocks_with_pattern(&pack, "snow dcm drop my_dcm_project", "cli-dcm-drop");
+        assert_blocks_with_pattern(&pack, "snow spcs service drop my_service", "cli-spcs-drop");
+        assert_blocks_with_pattern(
+            &pack,
+            "snow spcs compute-pool drop my_pool",
+            "cli-spcs-drop",
+        );
+        // Global flags (with values) between `snow` and the subcommand path.
+        assert_blocks_with_pattern(
+            &pack,
+            "snow --connection prod object drop database prod_db",
+            "cli-object-drop-database",
+        );
+    }
+
+    #[test]
+    fn cli_surface_drop_severities() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "snow object drop database prod", Severity::Critical);
+        assert_blocks_with_severity(&pack, "snow object drop table t", Severity::High);
+        assert_blocks_with_severity(&pack, "snow app version drop v1", Severity::Medium);
+    }
+
+    #[test]
+    fn cli_surface_read_only_commands_do_not_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "snow object list table");
+        assert_no_match(&pack, "snow object describe table users");
+        assert_no_match(&pack, "snow stage list-files my_stage");
+        assert_no_match(&pack, "snow stage copy @src ./local");
+        assert_no_match(&pack, "snow app run");
+        assert_no_match(&pack, "snow connection test");
+        assert_no_match(&pack, "snow dbt list");
+        assert_no_match(&pack, "snow dcm list");
+        // `snow ... drop` text inside inert data must not match: the prefix
+        // requires `snow` in command position and refuses to cross shell
+        // separators.
+        assert_no_match(&pack, "echo let it snow");
+    }
 
     fn assert_match(sql: &str, expected: &str) {
         match scan_sql(sql) {

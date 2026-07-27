@@ -748,6 +748,29 @@ pub fn classify_command(command: &str) -> CommandSpans {
     ContextClassifier::new().classify(command)
 }
 
+/// Returns true when byte `offset` in `command` falls inside a quoted span whose
+/// contents are inert data — a single-quoted string (`SpanKind::Data`) or a
+/// double-quoted argument (`SpanKind::Argument`).
+///
+/// This exists for the redirect false-positive class (issue #225): a `>` that
+/// appears *inside* a quoted string is a literal byte, not a shell redirect
+/// operator, so a redirect rule must not fire on it. The distinction versus the
+/// anti-bypass case (`"git">/dev/null reset --hard`) is precisely quote
+/// membership: in the bypass the operator is *outside* the quotes (an executable
+/// span), whereas in the false positive it is *inside* them.
+///
+/// Command substitutions inside a double-quoted string (`"$(...)"`) are
+/// classified as their own `InlineCode` span by [`ContextClassifier::classify`],
+/// so genuinely executable content nested in double quotes is never masked by
+/// this check.
+#[must_use]
+pub fn offset_is_quoted_data(command: &str, offset: usize) -> bool {
+    classify_command(command).spans().iter().any(|span| {
+        matches!(span.kind, SpanKind::Data | SpanKind::Argument)
+            && span.byte_range.contains(&offset)
+    })
+}
+
 // =============================================================================
 // Safe String-Argument Registry (git_safety_guard-t8x.1)
 // =============================================================================
@@ -881,6 +904,13 @@ pub static SAFE_STRING_REGISTRY: SafeStringRegistry = SafeStringRegistry {
         SafeFlagEntry::long_multi("bd", "--title"),
         SafeFlagEntry::long_multi("bd", "--notes"),
         SafeFlagEntry::long_multi("bd", "--reason"),
+        // beads_rust (`br`) is bd's successor with the same free-text flags plus
+        // `--body`; its argument bodies are documentation, not executed (#225).
+        SafeFlagEntry::long_multi("br", "--description"),
+        SafeFlagEntry::long_multi("br", "--title"),
+        SafeFlagEntry::long_multi("br", "--body"),
+        SafeFlagEntry::long_multi("br", "--notes"),
+        SafeFlagEntry::long_multi("br", "--reason"),
         // Search tools - patterns are data, not executed (only pattern-supplying flags)
         SafeFlagEntry::both("grep", "-e", "--regexp"),
         SafeFlagEntry::both("rg", "-e", "--regexp"),
@@ -931,8 +961,8 @@ static SAFE_COMMANDS_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
     let commands: &[&str] = &[
         // all_args_data commands
         "echo", "printf", // Commands from flag_data_pairs
-        "git", "bd", "grep", "rg", "ag", "ack", "sed", "gh", "curl", "jq", "docker", "kubectl",
-        "xargs", "cargo", "npm",
+        "git", "bd", "br", "grep", "rg", "ag", "ack", "sed", "gh", "curl", "jq", "docker",
+        "kubectl", "xargs", "cargo", "npm",
         // Special built-in: `command -v/-V` queries mask their arguments
         "command",
     ];

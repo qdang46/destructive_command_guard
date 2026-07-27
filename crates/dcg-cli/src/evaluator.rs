@@ -13012,6 +13012,17 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             };
 
+            // A `>` inside quoted argument data is a literal byte, not a shell
+            // redirect operator; skip the `core.filesystem` redirect rules when
+            // the operator offset lies inside an inert quoted span (#225). The
+            // anti-bypass forms keep the operator outside the quotes, so they
+            // still match here.
+            if is_core_filesystem_redirect_rule(pack_id, pattern.name)
+                && crate::context::offset_is_quoted_data(command_for_packs, span.start)
+            {
+                continue;
+            }
+
             // Non-filesystem packs already checked each segment above, so skip
             // duplicate full-command matches that sit wholly inside one segment.
             // core.filesystem uses its specialized rm parser instead of that
@@ -14059,6 +14070,17 @@ fn evaluate_core_filesystem_pack(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// True for the `core.filesystem` truncating-redirect rules, whose regexes match
+/// a `>` operator followed by a sensitive path. These are the rules that must be
+/// span-gated so a literal `>` inside quoted argument data does not fire (#225).
+fn is_core_filesystem_redirect_rule(pack_id: &str, name: Option<&str>) -> bool {
+    pack_id == "core.filesystem"
+        && matches!(
+            name,
+            Some("redirect-truncate-root-home" | "redirect-truncate-dynamic-path")
+        )
+}
+
 fn evaluate_pack_destructive_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
@@ -14176,6 +14198,27 @@ fn evaluate_pack_destructive_patterns(
             .is_some_and(|span| span_is_inside_any_segment(*span, ignored_ranges))
         {
             continue;
+        }
+
+        // A `core.filesystem` redirect rule matches the byte sequence `>` +
+        // sensitive path anywhere in the command, including inside a quoted
+        // string where `>` is a literal byte and not a shell redirect operator
+        // (issue #225: `br create --body 'see series/<digest>/ ...'`,
+        // `psql -c 'SELECT 1 where a>/etc/x'`). Skip the match when the operator
+        // offset lies inside an inert quoted span. The anti-bypass cases
+        // (`"git">/dev/null reset --hard`) keep the operator *outside* the
+        // quotes, so they remain matched.
+        if is_core_filesystem_redirect_rule(pack_id, pattern.name) {
+            if let Some(span) = matched_span.as_ref() {
+                // Use the original command (not the sanitized `pattern_command`)
+                // so `classify_command` sees the actual quotes, not spaces that
+                // replaced masked quoted content (#225). `span.start` is already
+                // an absolute offset in `original_command` thanks to slice_offset
+                // added at the MatchSpan construction above.
+                if crate::context::offset_is_quoted_data(original_command, span.start) {
+                    continue;
+                }
+            }
         }
 
         let reason = pattern.reason;
@@ -20518,6 +20561,26 @@ mod tests {
                 ShellDialect::PowerShell,
                 "Remove-Item ―R: $true ―For: $true C:\\src",
                 "remove-item-recurse-force",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"[System.IO.Directory]::Delete('C:\src', $true)",
+                "dotnet-directory-delete-recursive",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"[IO.Directory]::Delete($path, $flag)",
+                "dotnet-directory-delete",
+            ),
+            (
+                ShellDialect::PowerShell,
+                r"(Get-Item 'C:\src').Delete($true)",
+                "directoryinfo-delete-recursive",
+            ),
+            (
+                ShellDialect::Unknown,
+                r"[System.IO.Directory]::Delete('C:\src', $true)",
+                "dotnet-directory-delete-recursive",
             ),
             (
                 ShellDialect::PowerShell,
