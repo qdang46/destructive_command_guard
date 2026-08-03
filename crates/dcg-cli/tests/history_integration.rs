@@ -16,16 +16,15 @@ use common::db::TestDb;
 use common::fixtures;
 use common::logging::init_test_logging;
 use dcg_cli::config::{HistoryConfig, HistoryRedactionMode};
-use dcg_cli::history::{CommandEntry, HistoryDb, HistoryWriter, Outcome};
-use fsqlite_types::value::SqliteValue;
+use dcg_cli::history::{CommandEntry, HistoryDb, HistoryWriter, Outcome, SqliteValue};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 fn sv_to_string(v: &SqliteValue) -> String {
     match v {
-        SqliteValue::Text(s) => s.to_string(),
+        SqliteValue::Text(s) => s.clone(),
         SqliteValue::Integer(i) => i.to_string(),
-        SqliteValue::Float(f) => f.to_string(),
+        SqliteValue::Real(f) => f.to_string(),
         SqliteValue::Null => String::new(),
         SqliteValue::Blob(_) => String::new(),
     }
@@ -34,7 +33,7 @@ fn sv_to_string(v: &SqliteValue) -> String {
 fn sv_to_i64(v: &SqliteValue) -> i64 {
     match v {
         SqliteValue::Integer(i) => *i,
-        SqliteValue::Float(f) => *f as i64,
+        SqliteValue::Real(f) => *f as i64,
         SqliteValue::Text(s) => s.parse().unwrap_or(0),
         _ => 0,
     }
@@ -42,7 +41,7 @@ fn sv_to_i64(v: &SqliteValue) -> i64 {
 
 fn sv_to_opt_string(v: &SqliteValue) -> Option<String> {
     match v {
-        SqliteValue::Text(s) => Some(s.to_string()),
+        SqliteValue::Text(s) => Some(s.clone()),
         SqliteValue::Null => None,
         SqliteValue::Integer(i) => Some(i.to_string()),
         _ => None,
@@ -356,9 +355,8 @@ fn test_concurrent_writes() {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let db_path = temp_dir.path().join("concurrent_test.db");
 
-    // fsqlite uses MVCC within a single connection; multi-connection file
-    // writes are not supported.  Test that a single connection can handle
-    // many interleaved writes from different "agent" contexts reliably.
+    // Test that a single connection can handle many interleaved writes from
+    // different "agent" contexts reliably.
     let db = HistoryDb::open(Some(db_path.clone())).unwrap();
 
     // Initial seed entry
@@ -385,6 +383,94 @@ fn test_concurrent_writes() {
 
     // 1 init + 4 agents * 25 commands = 101
     assert_eq!(count, 101, "All writes should succeed");
+}
+
+#[test]
+fn concurrent_opens_and_inserts_keep_fts_exactly_synchronized() {
+    init_test_logging();
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("concurrent_fts.db");
+    HistoryDb::open(Some(db_path.clone())).expect("initialize history schema");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let successes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut workers = Vec::new();
+    for worker_id in 0..8 {
+        let db_path = db_path.clone();
+        let barrier = barrier.clone();
+        let successes = successes.clone();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            let Ok(db) = HistoryDb::open(Some(db_path)) else {
+                return;
+            };
+            for entry_id in 0..20 {
+                if db
+                    .log_command(&CommandEntry {
+                        command: format!("concurrent-fts-{worker_id}-{entry_id}"),
+                        ..Default::default()
+                    })
+                    .is_ok()
+                {
+                    successes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for worker in workers {
+        worker.join().expect("history worker panicked");
+    }
+
+    let connection = rusqlite::Connection::open(&db_path).expect("open stock SQLite");
+    let commands: i64 = connection
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .expect("command count");
+    let fts: i64 = connection
+        .query_row("SELECT COUNT(*) FROM commands_fts", [], |row| row.get(0))
+        .expect("FTS count");
+    assert!(successes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+    assert_eq!(
+        commands, fts,
+        "every committed command must have an FTS row"
+    );
+}
+
+#[test]
+fn locked_history_database_never_delays_writer_drop_past_hook_budget() {
+    init_test_logging();
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("locked_history.db");
+    HistoryDb::open(Some(db_path.clone())).expect("initialize history schema");
+    let locker = rusqlite::Connection::open(&db_path).expect("open lock connection");
+    locker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("hold SQLite writer lock");
+
+    let config = HistoryConfig {
+        enabled: true,
+        redaction_mode: HistoryRedactionMode::None,
+        batch_size: 1,
+        ..Default::default()
+    };
+    let started = Instant::now();
+    let writer = HistoryWriter::new(Some(db_path), &config);
+    writer.log(CommandEntry {
+        command: "history lock contention probe".to_string(),
+        ..Default::default()
+    });
+    writer.flush_sync();
+    drop(writer);
+    let elapsed = started.elapsed();
+
+    locker
+        .execute_batch("ROLLBACK")
+        .expect("release writer lock");
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "best-effort history delayed hook completion by {elapsed:?}"
+    );
 }
 
 /// Test: VACUUM operation
@@ -434,7 +520,10 @@ fn test_history_writer_logs_allow() {
         outcome: Outcome::Allow,
         ..Default::default()
     });
-    writer.flush_sync();
+    assert!(
+        writer.flush_sync_with_timeout(Duration::from_secs(2)),
+        "history writer did not acknowledge allow entry"
+    );
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     assert_eq!(reader.count_commands().unwrap(), 1);
@@ -461,7 +550,10 @@ fn test_history_writer_respects_disabled() {
         outcome: Outcome::Allow,
         ..Default::default()
     });
-    writer.flush_sync();
+    assert!(
+        writer.flush_sync_with_timeout(Duration::from_secs(2)),
+        "disabled history writer should not require storage"
+    );
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     assert_eq!(reader.count_commands().unwrap(), 0);
@@ -489,7 +581,10 @@ fn test_history_writer_full_redaction() {
         outcome: Outcome::Allow,
         ..Default::default()
     });
-    writer.flush_sync();
+    assert!(
+        writer.flush_sync_with_timeout(Duration::from_secs(2)),
+        "history writer did not acknowledge redacted entry"
+    );
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     let stored: String = reader
@@ -524,7 +619,10 @@ fn test_history_writer_logs_deny_with_match_info() {
         pattern_name: Some("reset-hard".to_string()),
         ..Default::default()
     });
-    writer.flush_sync();
+    assert!(
+        writer.flush_sync_with_timeout(Duration::from_secs(2)),
+        "history writer did not acknowledge deny entry"
+    );
 
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     let row = reader
@@ -585,8 +683,8 @@ fn test_history_writer_async_performance() {
     };
     let writer = HistoryWriter::new(Some(db_path.clone()), &config);
 
-    // Keep this test below the known io_uring instability threshold observed on
-    // constrained CI kernels while still exercising the async batching path.
+    // Exercise asynchronous batching without making the integration test
+    // disproportionately expensive on constrained CI workers.
     let entry_count = 200;
 
     let start = Instant::now();
@@ -608,7 +706,169 @@ fn test_history_writer_async_performance() {
         "Logging too slow: {elapsed:?}"
     );
 
-    writer.flush_sync();
+    assert!(
+        writer.flush_sync_with_timeout(Duration::from_secs(5)),
+        "history writer did not acknowledge async batch"
+    );
     let reader = HistoryDb::open(Some(db_path)).expect("open reader");
     assert_eq!(reader.count_commands().unwrap(), entry_count);
+}
+
+#[test]
+fn fresh_history_survives_repeated_hook_style_reopens_with_stock_integrity() {
+    init_test_logging();
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("repeated_hook_writes.db");
+    let config = HistoryConfig {
+        enabled: true,
+        redaction_mode: HistoryRedactionMode::None,
+        batch_size: 1,
+        ..Default::default()
+    };
+
+    for index in 0..50 {
+        let writer = HistoryWriter::new(Some(db_path.clone()), &config);
+        writer.log(CommandEntry {
+            timestamp: Utc::now(),
+            agent_type: "claude_code".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: format!("echo probe-{index}"),
+            outcome: Outcome::Allow,
+            ..Default::default()
+        });
+        assert!(
+            writer.flush_sync_with_timeout(Duration::from_secs(2)),
+            "history writer did not acknowledge reopen probe {index}"
+        );
+        drop(writer);
+    }
+
+    let stock = rusqlite::Connection::open(&db_path).expect("open with stock SQLite");
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("stock integrity_check");
+    let commands: i64 = stock
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .expect("command count");
+    let fts: i64 = stock
+        .query_row("SELECT COUNT(*) FROM commands_fts", [], |row| row.get(0))
+        .expect("FTS count");
+    let page_count: i64 = stock
+        .query_row("PRAGMA page_count", [], |row| row.get(0))
+        .expect("page count");
+    let freelist_count: i64 = stock
+        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+        .expect("freelist count");
+
+    assert_eq!(integrity, "ok");
+    assert_eq!(commands, 50);
+    assert_eq!(fts, commands);
+    assert!(
+        freelist_count <= page_count / 4,
+        "fresh repeated writes leaked disproportionate free pages: {freelist_count}/{page_count}"
+    );
+    // Migration must not retain the legacy fsqlite namespace sidecars.
+    for suffix in ["-fsqlite-ns-gate", "-fsqlite-ns-use"] {
+        assert!(
+            !std::path::PathBuf::from(format!("{}{suffix}", db_path.display())).exists(),
+            "history backend created legacy namespace sidecar {suffix}"
+        );
+    }
+}
+
+#[test]
+fn history_max_size_mb_is_a_hard_main_database_cap() {
+    init_test_logging();
+
+    const MAX_SIZE_BYTES: u64 = 1024 * 1024;
+    let temp_dir = TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("size_limited.db");
+    let config = HistoryConfig {
+        enabled: true,
+        redaction_mode: HistoryRedactionMode::None,
+        max_size_mb: 1,
+        batch_size: 1,
+        ..Default::default()
+    };
+    let writer = HistoryWriter::new(Some(db_path.clone()), &config);
+    let payload = "x".repeat(64 * 1024);
+
+    for index in 0..100 {
+        writer.log(CommandEntry {
+            timestamp: Utc::now(),
+            agent_type: "claude_code".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: format!("{index}:{payload}"),
+            outcome: Outcome::Allow,
+            ..Default::default()
+        });
+    }
+    assert!(
+        writer.flush_sync_with_timeout(Duration::from_secs(5)),
+        "history writer did not acknowledge size-cap batch"
+    );
+    drop(writer);
+
+    let main_size = std::fs::metadata(&db_path).expect("history metadata").len();
+    assert!(
+        main_size <= MAX_SIZE_BYTES,
+        "max_size_mb was exceeded: {main_size} > {MAX_SIZE_BYTES}"
+    );
+
+    let stock = rusqlite::Connection::open(&db_path).expect("open capped history");
+    let integrity: String = stock
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("integrity_check");
+    let commands: i64 = stock
+        .query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+        .expect("command count");
+    assert_eq!(integrity, "ok");
+    assert!(
+        commands > 0 && commands < 100,
+        "the cap should retain committed rows and reject later growth: {commands}"
+    );
+}
+
+#[test]
+fn configured_direct_history_writes_share_the_hard_size_cap() {
+    init_test_logging();
+
+    const MAX_SIZE_BYTES: u64 = 1024 * 1024;
+    let temp_dir = TempDir::new().expect("temp dir");
+    let db_path = temp_dir.path().join("direct_size_limited.db");
+    let db = HistoryDb::open_with_max_size(Some(db_path.clone()), 1)
+        .expect("open configured capped history");
+    let payload = "x".repeat(64 * 1024);
+    let mut successes = 0;
+    let mut failures = 0;
+
+    for index in 0..100 {
+        match db.log_command(&CommandEntry {
+            timestamp: Utc::now(),
+            agent_type: "cli".to_string(),
+            working_dir: "/tmp".to_string(),
+            command: format!("{index}:{payload}"),
+            outcome: Outcome::Allow,
+            ..Default::default()
+        }) {
+            Ok(_) => successes += 1,
+            Err(_) => failures += 1,
+        }
+    }
+    db.checkpoint_truncate().expect("checkpoint capped history");
+
+    let main_size = std::fs::metadata(&db_path).expect("history metadata").len();
+    assert!(
+        main_size <= MAX_SIZE_BYTES,
+        "configured direct writes exceeded max_size_mb: {main_size} > {MAX_SIZE_BYTES}"
+    );
+    assert!(
+        successes > 0 && failures > 0,
+        "the cap must retain early writes and reject later growth: {successes} successes, {failures} failures"
+    );
+    assert_eq!(
+        db.count_commands().expect("command count"),
+        u64::try_from(successes).expect("success count fits u64")
+    );
 }

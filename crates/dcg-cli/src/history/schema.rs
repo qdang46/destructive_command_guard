@@ -9,15 +9,14 @@
 //! - Graceful schema migrations
 
 use chrono::{DateTime, Duration, Utc};
-use fsqlite::Connection;
-use fsqlite_error::FrankenError;
-use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
+
+use super::sqlite::{Connection, SqliteValue};
 
 // ============================================================================
 // SqliteValue Conversion Helpers
@@ -26,9 +25,9 @@ use std::path::{Path, PathBuf};
 /// Extract a `String` from a `SqliteValue`.
 fn sv_to_string(v: &SqliteValue) -> String {
     match v {
-        SqliteValue::Text(s) => s.to_string(),
+        SqliteValue::Text(s) => s.clone(),
         SqliteValue::Integer(i) => i.to_string(),
-        SqliteValue::Float(f) => f.to_string(),
+        SqliteValue::Real(f) => f.to_string(),
         SqliteValue::Null => String::new(),
         SqliteValue::Blob(_) => String::new(),
     }
@@ -38,7 +37,7 @@ fn sv_to_string(v: &SqliteValue) -> String {
 fn sv_to_i64(v: &SqliteValue) -> i64 {
     match v {
         SqliteValue::Integer(i) => *i,
-        SqliteValue::Float(f) => *f as i64,
+        SqliteValue::Real(f) => *f as i64,
         SqliteValue::Text(s) => s.parse().unwrap_or(0),
         _ => 0,
     }
@@ -48,7 +47,7 @@ fn sv_to_i64(v: &SqliteValue) -> i64 {
 #[allow(dead_code)]
 fn sv_to_f64(v: &SqliteValue) -> f64 {
     match v {
-        SqliteValue::Float(f) => *f,
+        SqliteValue::Real(f) => *f,
         SqliteValue::Integer(i) => *i as f64,
         SqliteValue::Text(s) => s.parse().unwrap_or(0.0),
         _ => 0.0,
@@ -58,7 +57,7 @@ fn sv_to_f64(v: &SqliteValue) -> f64 {
 /// Extract an `f32` from a `SqliteValue`.
 fn sv_to_f32(v: &SqliteValue) -> f32 {
     match v {
-        SqliteValue::Float(f) => *f as f32,
+        SqliteValue::Real(f) => *f as f32,
         SqliteValue::Integer(i) => *i as f32,
         SqliteValue::Text(s) => s.parse().unwrap_or(0.0),
         _ => 0.0,
@@ -69,7 +68,7 @@ fn sv_to_f32(v: &SqliteValue) -> f32 {
 fn sv_to_i32(v: &SqliteValue) -> i32 {
     match v {
         SqliteValue::Integer(i) => i32::try_from(*i).unwrap_or(0),
-        SqliteValue::Float(f) => *f as i32,
+        SqliteValue::Real(f) => *f as i32,
         SqliteValue::Text(s) => s.parse().unwrap_or(0),
         _ => 0,
     }
@@ -78,7 +77,7 @@ fn sv_to_i32(v: &SqliteValue) -> i32 {
 /// Extract an `Option<String>` from a `SqliteValue`.
 fn sv_to_opt_string(v: &SqliteValue) -> Option<String> {
     match v {
-        SqliteValue::Text(s) => Some(s.to_string()),
+        SqliteValue::Text(s) => Some(s.clone()),
         SqliteValue::Null => None,
         SqliteValue::Integer(i) => Some(i.to_string()),
         _ => None,
@@ -113,97 +112,6 @@ fn opt_i64_to_sv(v: Option<&i64>) -> SqliteValue {
     }
 }
 
-/// Inline bind parameters into SQL for use with `conn.query()`.
-///
-/// Workaround: fsqlite's `query_with_params()` only returns the first matching
-/// row instead of all rows. This helper substitutes `?1`, `?2`, ... placeholders
-/// with the actual values so we can use the non-parameterized `query()` method.
-///
-/// **Correctness note (`git_safety_guard-tovy`):** the previous reverse-`replace`
-/// implementation was vulnerable to substituted-value-collides-with-earlier-
-/// placeholder corruption. If `params[4]` was the literal text `?1`, replacing
-/// `?5` first would inject `'?1'` into the SQL — and the subsequent pass over
-/// `?1` would then re-substitute that injected text. This implementation walks
-/// the SQL template left-to-right, recognizing `?N` only inside the template
-/// itself (not inside single-quoted string literals), and writes substituted
-/// values into the output without ever rescanning them. Single-pass, no
-/// recursion possible.
-fn inline_params(sql: &str, params: &[SqliteValue]) -> String {
-    // Walk by `char` rather than `u8` so a multi-byte UTF-8 character in
-    // the SQL template (e.g. an em-dash inside a string literal, a
-    // non-ASCII column comment) doesn't get split mid-codepoint and
-    // emitted as garbage Latin-1. None of today's callers use non-ASCII
-    // templates, but keeping this byte-safe avoids a foot-gun for future
-    // additions. SQL templates are small (<1 KB) so the `Vec<char>`
-    // allocation is negligible.
-    let chars: Vec<char> = sql.chars().collect();
-    let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    let mut in_string = false;
-
-    while i < chars.len() {
-        let c = chars[i];
-        if in_string {
-            // Inside a single-quoted string literal. SQLite escapes a quote
-            // by doubling it (`''`), so a `'` followed by `'` stays inside
-            // the string and consumes both characters.
-            out.push(c);
-            if c == '\'' {
-                if i + 1 < chars.len() && chars[i + 1] == '\'' {
-                    out.push('\'');
-                    i += 2;
-                    continue;
-                }
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-
-        if c == '\'' {
-            in_string = true;
-            out.push('\'');
-            i += 1;
-            continue;
-        }
-
-        if c == '?' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
-            // Parse the full digit run that follows `?`.
-            let mut j = i + 1;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                j += 1;
-            }
-            let idx_str: String = chars[i + 1..j].iter().collect();
-            if let Ok(idx) = idx_str.parse::<usize>() {
-                if idx >= 1 && idx <= params.len() {
-                    let value = match &params[idx - 1] {
-                        SqliteValue::Text(s) => format!("'{}'", s.replace('\'', "''")),
-                        SqliteValue::Integer(n) => n.to_string(),
-                        SqliteValue::Float(f) => f.to_string(),
-                        SqliteValue::Null => "NULL".to_string(),
-                        SqliteValue::Blob(_) => "X''".to_string(),
-                    };
-                    out.push_str(&value);
-                    i = j;
-                    continue;
-                }
-            }
-            // Unknown placeholder index — preserve the original text so the
-            // SQL parser surfaces the error at execution time rather than
-            // silently producing wrong results.
-            out.push('?');
-            out.push_str(&idx_str);
-            i = j;
-            continue;
-        }
-
-        out.push(c);
-        i += 1;
-    }
-
-    out
-}
-
 /// Current schema version for migrations.
 pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
@@ -213,8 +121,8 @@ pub const DEFAULT_DB_FILENAME: &str = "history.db";
 /// History-specific error type.
 #[derive(Debug)]
 pub enum HistoryError {
-    /// FrankenSQLite error.
-    Sqlite(FrankenError),
+    /// SQLite error.
+    Sqlite(rusqlite::Error),
     /// I/O error.
     Io(std::io::Error),
     /// Schema version mismatch (expected, found).
@@ -252,8 +160,8 @@ impl std::error::Error for HistoryError {
     }
 }
 
-impl From<FrankenError> for HistoryError {
-    fn from(e: FrankenError) -> Self {
+impl From<rusqlite::Error> for HistoryError {
+    fn from(e: rusqlite::Error) -> Self {
         Self::Sqlite(e)
     }
 }
@@ -597,15 +505,15 @@ impl<'a> HistoryAnalyzer<'a> {
         let since_ts = format_timestamp(since);
         let min_count_i64 = i64::from(min_count);
 
-        let rows = self.conn.query(&inline_params(
+        let rows = self.conn.query_with_params(
             "SELECT command, COUNT(*) as block_count, MAX(timestamp) as last_seen
              FROM commands
              WHERE outcome = 'deny' AND timestamp >= ?1
              GROUP BY command
              HAVING COUNT(*) >= ?2
-             ORDER BY block_count DESC, command ASC",
+            ORDER BY block_count DESC, command ASC",
             &[text_sv(since_ts), SqliteValue::Integer(min_count_i64)],
-        ))?;
+        )?;
 
         let mut blocks = Vec::new();
         for row in &rows {
@@ -633,15 +541,15 @@ impl<'a> HistoryAnalyzer<'a> {
     pub fn get_path_clusters(&self, min_count: u32) -> Result<Vec<PathCluster>, HistoryError> {
         let min_count_i64 = i64::from(min_count);
 
-        let rows = self.conn.query(&inline_params(
+        let rows = self.conn.query_with_params(
             "SELECT command, working_dir, COUNT(*) as block_count
              FROM commands
              WHERE outcome = 'deny'
              GROUP BY command, working_dir
              HAVING COUNT(*) >= ?1
-             ORDER BY block_count DESC, command ASC, working_dir ASC",
+            ORDER BY block_count DESC, command ASC, working_dir ASC",
             &[SqliteValue::Integer(min_count_i64)],
-        ))?;
+        )?;
 
         let mut clusters = Vec::new();
         for row in &rows {
@@ -684,7 +592,7 @@ impl<'a> HistoryAnalyzer<'a> {
     ) -> Result<Vec<SuggestionCandidate>, HistoryError> {
         let min_count_i64 = i64::from(min_count.max(1));
 
-        let rows = self.conn.query(&inline_params(
+        let rows = self.conn.query_with_params(
             "SELECT command,
                     COUNT(*) as bypass_count,
                     MAX(timestamp) as last_seen,
@@ -695,9 +603,9 @@ impl<'a> HistoryAnalyzer<'a> {
              WHERE outcome = 'bypass'
              GROUP BY command
              HAVING COUNT(*) >= ?1
-             ORDER BY bypass_count DESC, last_seen DESC, command ASC",
+            ORDER BY bypass_count DESC, last_seen DESC, command ASC",
             &[SqliteValue::Integer(min_count_i64)],
-        ))?;
+        )?;
 
         let mut candidates = Vec::new();
         for row in &rows {
@@ -855,8 +763,9 @@ pub struct HistoryDb {
 impl HistoryDb {
     /// Open or create the history database at the default path.
     ///
-    /// The default path is `~/.config/dcg/history.db` unless overridden
-    /// by the `DCG_HISTORY_DB` environment variable.
+    /// The default path is the platform-native dcg configuration directory
+    /// (while honoring an existing legacy XDG-style installation), unless
+    /// overridden by the `DCG_HISTORY_DB` environment variable.
     ///
     /// # Errors
     ///
@@ -877,13 +786,33 @@ impl HistoryDb {
             std::fs::create_dir_all(parent)?;
         }
 
-        let path_str = db_path.to_string_lossy().to_string();
-        let conn = Connection::open(&path_str)?;
+        let conn = Connection::open(&db_path)?;
         let db = Self {
             conn,
             path: Some(db_path),
         };
         db.initialize_schema()?;
+        Ok(db)
+    }
+
+    /// Open a file-backed database and install the configured hard page cap.
+    ///
+    /// The cap is connection-local SQLite state, so every config-aware writer
+    /// must use this constructor rather than assuming an asynchronous history
+    /// worker configured it in another process. Existing over-cap databases
+    /// remain readable, but their page count cannot grow further.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened, initialized, or
+    /// configured with the requested size limit.
+    pub fn open_with_max_size(
+        path: Option<PathBuf>,
+        max_size_mb: u32,
+    ) -> Result<Self, HistoryError> {
+        let db = Self::open(path)?;
+        let max_bytes = u64::from(max_size_mb.max(1)).saturating_mul(1024 * 1024);
+        let _under_limit = db.enforce_size_limit(max_bytes)?;
         Ok(db)
     }
 
@@ -967,6 +896,44 @@ impl HistoryDb {
             Some(p) => Ok(std::fs::metadata(p)?.len()),
             None => Ok(0),
         }
+    }
+
+    /// Configure SQLite's hard main-database page limit.
+    ///
+    /// If an existing database is already over the requested limit and has
+    /// free pages, compact it once before applying the limit. Returns `false`
+    /// when live data still exceeds the cap; callers should stop writing rather
+    /// than allowing the file to continue growing.
+    pub(crate) fn enforce_size_limit(&self, max_bytes: u64) -> Result<bool, HistoryError> {
+        if self.path.is_none() {
+            return Ok(true);
+        }
+
+        self.checkpoint_truncate()?;
+        if self.file_size()? > max_bytes {
+            let freelist = self.conn.query_row("PRAGMA freelist_count")?;
+            if sv_to_i64(&freelist.values()[0]) > 0 {
+                self.vacuum()?;
+                self.checkpoint_truncate()?;
+            }
+        }
+
+        let page_size_row = self.conn.query_row("PRAGMA page_size")?;
+        let page_size = u64::try_from(sv_to_i64(&page_size_row.values()[0]))
+            .unwrap_or(4096)
+            .max(1);
+        let max_pages = (max_bytes / page_size).max(1);
+        self.conn
+            .execute(&format!("PRAGMA max_page_count={max_pages};"))?;
+
+        // Keep a checkpointed WAL bounded as well. SQLite may temporarily
+        // exceed this while transactions are active, but truncates back to the
+        // configured limit at checkpoints and process shutdown.
+        let journal_limit = (max_bytes / 10).clamp(page_size, 16 * 1024 * 1024);
+        self.conn
+            .execute(&format!("PRAGMA journal_size_limit={journal_limit};"))?;
+
+        Ok(self.file_size()? <= max_bytes)
     }
 
     /// Count total commands in the database.
@@ -1086,9 +1053,6 @@ impl HistoryDb {
                 "DELETE FROM commands WHERE timestamp < ?1",
                 &[text_sv(cutoff_ts)],
             )?;
-            // Rebuild FTS index after deletion since fsqlite FTS5 doesn't support
-            // individual row deletion via 'delete' control command triggers
-            self.rebuild_fts()?;
         }
 
         Ok(u64::try_from(count).unwrap_or(0))
@@ -1166,12 +1130,12 @@ impl HistoryDb {
         let total_commands = u64::try_from(sv_to_i64(&total_row.values()[0])).unwrap_or(0);
 
         let mut outcomes = OutcomeStats::default();
-        let outcome_rows = self.conn.query(&inline_params(
+        let outcome_rows = self.conn.query_with_params(
             "SELECT outcome, COUNT(*) FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2
-             GROUP BY outcome",
+            GROUP BY outcome",
             ts_params,
-        ))?;
+        )?;
         for row in &outcome_rows {
             let vals = row.values();
             let outcome = sv_to_string(&vals[0]);
@@ -1188,14 +1152,14 @@ impl HistoryDb {
         let block_rate = ratio(outcomes.denied, total_commands);
 
         let mut top_patterns = Vec::new();
-        let pattern_rows = self.conn.query(&inline_params(
+        let pattern_rows = self.conn.query_with_params(
             "SELECT pattern_name, pack_id, COUNT(*) FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2 AND pattern_name IS NOT NULL
              GROUP BY pattern_name, pack_id
              ORDER BY COUNT(*) DESC, pattern_name ASC
-             LIMIT 10",
+            LIMIT 10",
             ts_params,
-        ))?;
+        )?;
         for row in &pattern_rows {
             let vals = row.values();
             let name = sv_to_string(&vals[0]);
@@ -1209,14 +1173,14 @@ impl HistoryDb {
         }
 
         let mut top_projects = Vec::new();
-        let project_rows = self.conn.query(&inline_params(
+        let project_rows = self.conn.query_with_params(
             "SELECT working_dir, COUNT(*) FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY working_dir
              ORDER BY COUNT(*) DESC, working_dir ASC
-             LIMIT 10",
+            LIMIT 10",
             ts_params,
-        ))?;
+        )?;
         for row in &project_rows {
             let vals = row.values();
             let path = sv_to_string(&vals[0]);
@@ -1228,13 +1192,13 @@ impl HistoryDb {
         }
 
         let mut agents = Vec::new();
-        let agent_rows = self.conn.query(&inline_params(
+        let agent_rows = self.conn.query_with_params(
             "SELECT agent_type, COUNT(*) FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2
              GROUP BY agent_type
-             ORDER BY COUNT(*) DESC, agent_type ASC",
+            ORDER BY COUNT(*) DESC, agent_type ASC",
             ts_params,
-        ))?;
+        )?;
         for row in &agent_rows {
             let vals = row.values();
             let name = sv_to_string(&vals[0]);
@@ -1246,12 +1210,12 @@ impl HistoryDb {
         }
 
         let mut durations = Vec::new();
-        let dur_rows = self.conn.query(&inline_params(
+        let dur_rows = self.conn.query_with_params(
             "SELECT eval_duration_us FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2 AND eval_duration_us > 0
-             ORDER BY eval_duration_us ASC",
+            ORDER BY eval_duration_us ASC",
             ts_params,
-        ))?;
+        )?;
         for row in &dur_rows {
             let value = sv_to_i64(&row.values()[0]);
             if let Ok(value) = u64::try_from(value) {
@@ -1325,9 +1289,7 @@ impl HistoryDb {
             ],
         )?;
 
-        // FrankenSQLite: last_insert_rowid() is a stub, use max(id) instead
-        let row = self.conn.query_row("SELECT max(id) FROM commands")?;
-        Ok(sv_to_i64(&row.values()[0]))
+        Ok(self.conn.last_insert_rowid())
     }
 
     /// Run VACUUM to reclaim space after deletions.
@@ -1342,12 +1304,30 @@ impl HistoryDb {
 
     /// Initialize the database schema.
     fn initialize_schema(&self) -> Result<(), HistoryError> {
-        // Enable WAL mode for better concurrent performance
-        self.conn.execute("PRAGMA journal_mode=WAL;")?;
+        // Bound lock waits before any pragma that may need an exclusive lock.
+        // In particular, negotiating WAL mode can contend during concurrent
+        // first-open initialization.
+        self.conn.execute("PRAGMA busy_timeout=25;")?;
 
-        // Set busy timeout for better concurrent access (5 seconds default)
-        self.conn.execute("PRAGMA busy_timeout=5000;")?;
+        // Enabling WAL takes an exclusive lock. Reissuing the assignment on
+        // every hook-style reopen can therefore fail while a healthy writer
+        // connection is still finishing its bounded shutdown. Query first and
+        // only negotiate the mode for a database that is not already in WAL.
+        let journal_mode = self.conn.query_row("PRAGMA journal_mode")?;
+        if !sv_to_string(&journal_mode.values()[0]).eq_ignore_ascii_case("wal") {
+            self.conn.execute("PRAGMA journal_mode=WAL;")?;
+        }
+        // NORMAL is the standard durability/performance tradeoff for WAL:
+        // committed telemetry survives process crashes while avoiding a disk
+        // sync for every short-lived hook invocation. A machine power loss may
+        // lose the newest telemetry transaction, which is acceptable for this
+        // explicitly best-effort history database.
+        self.conn.execute("PRAGMA synchronous=NORMAL;")?;
 
+        // History is best-effort telemetry on the hook hot path. A competing
+        // process may briefly own SQLite's single-writer lock, but waiting
+        // seconds here would delay the guarded command itself. Keep lock
+        // contention bounded below the hook deadline and drop that sample.
         // Configure WAL checkpoint behavior
         self.conn.execute("PRAGMA wal_autocheckpoint=1000;")?;
 
@@ -1369,7 +1349,23 @@ impl HistoryDb {
             .unwrap_or(true);
 
         if needs_init {
-            self.create_v1_schema()?;
+            // Fresh schema creation contains many DDL statements. Running
+            // each in its own autocommit transaction incurs repeated journal
+            // syncs and can outlive the hook's bounded writer shutdown. One
+            // transaction is both atomic and dramatically cheaper.
+            self.conn.execute("BEGIN IMMEDIATE;")?;
+            match self.create_v1_schema() {
+                Ok(()) => {
+                    if let Err(error) = self.conn.execute("COMMIT;") {
+                        let _ = self.conn.execute("ROLLBACK;");
+                        return Err(error.into());
+                    }
+                }
+                Err(error) => {
+                    let _ = self.conn.execute("ROLLBACK;");
+                    return Err(error);
+                }
+            }
         } else {
             // Run migrations if needed
             let version = self.get_schema_version()?;
@@ -1378,8 +1374,108 @@ impl HistoryDb {
             }
         }
 
+        self.repair_legacy_fsqlite_fts_if_needed()?;
         self.ensure_cross_session_indexes()?;
+        self.ensure_fts_sync_triggers()?;
 
+        Ok(())
+    }
+
+    /// Repair the one known on-disk incompatibility left by legacy fsqlite.
+    ///
+    /// Some fsqlite-created FTS5 databases contain a corrupt primary-key
+    /// autoindex for the `commands_fts_config` shadow table. Stock SQLite
+    /// reports `DatabaseCorrupt` on an indexed lookup even though the content
+    /// table remains readable. Keep detection deliberately exact so unrelated
+    /// corruption is never rewritten automatically.
+    fn repair_legacy_fsqlite_fts_if_needed(&self) -> Result<(), HistoryError> {
+        const LEGACY_CORRUPT_INDEX: &str = "sqlite_autoindex_commands_fts_config_1";
+
+        let indexed_probe = self
+            .conn
+            .query_row("SELECT v FROM commands_fts_config WHERE k = 'version'");
+        match indexed_probe {
+            Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+            Err(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseCorrupt => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        // The indexed lookup above reports only "database disk image is
+        // malformed" through rusqlite. Corroborate that the underlying FTS
+        // configuration row is intact, then require integrity_check to name
+        // the exact legacy shadow-table autoindex. Requiring one and only one
+        // integrity failure prevents an unrelated corrupt database from being
+        // rewritten automatically just because it also contains this table.
+        let unindexed_version = self
+            .conn
+            .query_row("SELECT v FROM commands_fts_config NOT INDEXED WHERE k = 'version'")?;
+        if sv_to_i64(&unindexed_version.values()[0]) != 4 {
+            return Err(HistoryError::IntegrityCheckFailed(
+                "unexpected legacy FTS configuration version".to_string(),
+            ));
+        }
+        let first_integrity_failure = self.conn.query_row("PRAGMA integrity_check")?;
+        let first_integrity_failure = sv_to_string(&first_integrity_failure.values()[0]);
+        if !first_integrity_failure.contains(LEGACY_CORRUPT_INDEX) {
+            return Err(HistoryError::IntegrityCheckFailed(first_integrity_failure));
+        }
+
+        tracing::warn!(
+            "Detected legacy fsqlite FTS5 index corruption; rebuilding the derived history search index"
+        );
+        self.conn.execute("BEGIN IMMEDIATE;")?;
+        let repair = (|| -> Result<(), HistoryError> {
+            self.conn.execute(
+                r"DROP TRIGGER IF EXISTS commands_fts_insert;
+                  DROP TRIGGER IF EXISTS commands_fts_delete;
+                  DROP TRIGGER IF EXISTS commands_fts_update;
+                  DROP TABLE commands_fts;
+                  CREATE VIRTUAL TABLE commands_fts USING fts5(
+                      command,
+                      content = 'commands',
+                      content_rowid = 'id'
+                  );
+                  CREATE TRIGGER commands_fts_insert AFTER INSERT ON commands BEGIN
+                      INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
+                  END;
+                  CREATE TRIGGER commands_fts_delete AFTER DELETE ON commands BEGIN
+                      INSERT INTO commands_fts(commands_fts, rowid, command)
+                      VALUES ('delete', old.id, old.command);
+                  END;
+                  CREATE TRIGGER commands_fts_update AFTER UPDATE OF command ON commands BEGIN
+                      INSERT INTO commands_fts(commands_fts, rowid, command)
+                      VALUES ('delete', old.id, old.command);
+                      INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
+                  END;
+                  INSERT INTO commands_fts(commands_fts) VALUES ('rebuild');",
+            )?;
+
+            self.conn
+                .query_row("SELECT v FROM commands_fts_config WHERE k = 'version'")?;
+            let integrity = self.conn.query("PRAGMA integrity_check")?;
+            if integrity.len() != 1 || sv_to_string(&integrity[0].values()[0]) != "ok" {
+                let details = integrity
+                    .iter()
+                    .map(|row| sv_to_string(&row.values()[0]))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(HistoryError::IntegrityCheckFailed(details));
+            }
+            Ok(())
+        })();
+        match repair {
+            Ok(()) => {
+                if let Err(error) = self.conn.execute("COMMIT;") {
+                    let _ = self.conn.execute("ROLLBACK;");
+                    return Err(error.into());
+                }
+            }
+            Err(error) => {
+                let _ = self.conn.execute("ROLLBACK;");
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -1392,6 +1488,24 @@ impl HistoryDb {
             "CREATE INDEX IF NOT EXISTS idx_commands_rule_outcome_timestamp
              ON commands(rule_id, outcome, timestamp)
              WHERE rule_id IS NOT NULL",
+        )?;
+        Ok(())
+    }
+
+    fn ensure_fts_sync_triggers(&self) -> Result<(), HistoryError> {
+        self.conn.execute(
+            r"CREATE TRIGGER IF NOT EXISTS commands_fts_insert AFTER INSERT ON commands BEGIN
+                  INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
+              END;
+              CREATE TRIGGER IF NOT EXISTS commands_fts_delete AFTER DELETE ON commands BEGIN
+                  INSERT INTO commands_fts(commands_fts, rowid, command)
+                  VALUES ('delete', old.id, old.command);
+              END;
+              CREATE TRIGGER IF NOT EXISTS commands_fts_update AFTER UPDATE OF command ON commands BEGIN
+                  INSERT INTO commands_fts(commands_fts, rowid, command)
+                  VALUES ('delete', old.id, old.command);
+                  INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
+              END;",
         )?;
         Ok(())
     }
@@ -1456,16 +1570,6 @@ impl HistoryDb {
             )",
         )?;
 
-        // Create trigger to keep FTS in sync on INSERT.
-        // Note: fsqlite's FTS5 does not support the 'delete' control command via
-        // INSERT INTO fts(fts, rowid, col) VALUES('delete', ...), so we omit
-        // DELETE/UPDATE triggers. Instead, prune_older_than_days rebuilds FTS after deletion.
-        self.conn.execute(
-            r"CREATE TRIGGER IF NOT EXISTS commands_fts_insert AFTER INSERT ON commands BEGIN
-                INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
-            END",
-        )?;
-
         // Create stats_cache table for real-time statistics (v3 feature)
         self.conn.execute(
             r"CREATE TABLE IF NOT EXISTS stats_cache (
@@ -1522,12 +1626,7 @@ impl HistoryDb {
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_interactive_allowlist_audit_timestamp ON interactive_allowlist_audit(timestamp)")?;
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_interactive_allowlist_audit_option_type ON interactive_allowlist_audit(option_type)")?;
 
-        // Record schema version.
-        // Use INSERT OR REPLACE so that reopening a file-backed database whose
-        // pager already contains the schema_version row does not fail with a
-        // PRIMARY KEY constraint error (fsqlite may replay `create_v1_schema`
-        // when the schema_version table appears empty in the in-memory catalog
-        // but its B-tree pages are already populated on disk).
+        // Record schema version idempotently for a newly created database.
         self.conn.execute_with_params(
             "INSERT OR REPLACE INTO schema_version (version, description, last_prune_at) VALUES (?1, ?2, NULL)",
             &[
@@ -1758,8 +1857,7 @@ impl HistoryDb {
         }
 
         // Use BEGIN IMMEDIATE for reliable single-writer batching.
-        // BEGIN CONCURRENT is available in fsqlite for multi-writer MVCC scenarios,
-        // but the HistoryWriter uses a single connection so IMMEDIATE is sufficient.
+        // The HistoryWriter uses a single connection, so IMMEDIATE is sufficient.
         self.conn.execute("BEGIN IMMEDIATE;")?;
 
         let result = (|| -> Result<(), HistoryError> {
@@ -1768,9 +1866,7 @@ impl HistoryDb {
                 let timestamp = entry.timestamp.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
                 let eval_duration_us = i64::try_from(entry.eval_duration_us).unwrap_or(i64::MAX);
 
-                // Use inline_params + execute to avoid execute_with_params
-                // nesting auto-transaction inside our explicit BEGIN IMMEDIATE.
-                let sql = inline_params(
+                self.conn.execute_with_params(
                     r"INSERT INTO commands (
                         timestamp, agent_type, working_dir, command, command_hash,
                         outcome, pack_id, pattern_name, eval_duration_us,
@@ -1797,17 +1893,20 @@ impl HistoryDb {
                         opt_string_to_sv(entry.bypass_code.as_ref()),
                         opt_string_to_sv(entry.get_rule_id().as_ref()),
                     ],
-                );
-                self.conn.execute(&sql)?;
+                )?;
             }
             Ok(())
         })();
 
         match result {
-            Ok(()) => {
-                self.conn.execute("COMMIT;")?;
-                Ok(())
-            }
+            Ok(()) => self.conn.execute("COMMIT;").map_err(|error| {
+                // A failed COMMIT can leave the connection inside the
+                // transaction. Best-effort rollback keeps later batches from
+                // inheriting that poisoned state while preserving the original
+                // error for contention/recovery classification.
+                let _ = self.conn.execute("ROLLBACK;");
+                HistoryError::from(error)
+            }),
             Err(e) => {
                 let _ = self.conn.execute("ROLLBACK;");
                 Err(e)
@@ -1989,10 +2088,8 @@ impl HistoryDb {
         let cmd_row = self.conn.query_row("SELECT COUNT(*) FROM commands")?;
         let commands_count = u64::try_from(sv_to_i64(&cmd_row.values()[0])).unwrap_or(0);
 
-        // FrankenSQLite's FTS5 fallback does not reliably collapse COUNT(*)
-        // over virtual tables to a single aggregate row, so count by scanning.
-        let fts_count = u64::try_from(self.conn.query("SELECT rowid FROM commands_fts")?.len())
-            .unwrap_or(u64::MAX);
+        let fts_row = self.conn.query_row("SELECT COUNT(*) FROM commands_fts")?;
+        let fts_count = u64::try_from(sv_to_i64(&fts_row.values()[0])).unwrap_or(0);
 
         // Journal mode
         let jm_row = self.conn.query_row("PRAGMA journal_mode")?;
@@ -2047,36 +2144,10 @@ impl HistoryDb {
     ///
     /// Returns an error if the rebuild fails.
     pub fn rebuild_fts(&self) -> Result<u64, HistoryError> {
-        // FrankenSQLite currently rejects recreating a live VTAB with the same
-        // name while the DROP is still staged inside a transaction. Clear and
-        // repopulate the existing FTS table instead of dropping/recreating it.
         self.conn
-            .execute("DROP TRIGGER IF EXISTS commands_fts_insert")?;
-        self.conn
-            .execute("DROP TRIGGER IF EXISTS commands_fts_delete")?;
-        self.conn
-            .execute("DROP TRIGGER IF EXISTS commands_fts_update")?;
-
-        self.conn.execute("DELETE FROM commands_fts")?;
-
-        // fsqlite FTS5 does not support the control-column rebuild syntax, so
-        // repopulate the index row-by-row.
-        let rows = self.conn.query("SELECT id, command FROM commands")?;
-        for row in &rows {
-            let vals = row.values();
-            self.conn.execute_with_params(
-                "INSERT INTO commands_fts(rowid, command) VALUES (?1, ?2)",
-                &[vals[0].clone(), vals[1].clone()],
-            )?;
-        }
-
-        self.conn.execute(
-            r"CREATE TRIGGER commands_fts_insert AFTER INSERT ON commands BEGIN
-                INSERT INTO commands_fts(rowid, command) VALUES (new.id, new.command);
-            END",
-        )?;
-
-        Ok(u64::try_from(self.conn.query("SELECT rowid FROM commands_fts")?.len()).unwrap_or(0))
+            .execute("INSERT INTO commands_fts(commands_fts) VALUES ('rebuild');")?;
+        let row = self.conn.query_row("SELECT COUNT(*) FROM commands_fts")?;
+        Ok(u64::try_from(sv_to_i64(&row.values()[0])).unwrap_or(0))
     }
 
     /// Check and optionally repair database health issues.
@@ -2163,7 +2234,7 @@ impl HistoryDb {
             // Skip verification for compressed backups (would need to decompress)
             false
         } else {
-            // Verify uncompressed backups via FrankenSQLite
+            // Verify uncompressed backups with the same bundled SQLite engine.
             let path_str = output_path.to_string_lossy().to_string();
             Connection::open(&path_str)
                 .and_then(|conn| conn.query_row("PRAGMA integrity_check"))
@@ -2233,7 +2304,7 @@ impl HistoryDb {
             ));
         }
 
-        let rows = self.conn.query(&inline_params(&sql, &params))?;
+        let rows = self.conn.query_with_params(&sql, &params)?;
 
         let mut entries = Vec::new();
         for row in &rows {
@@ -2458,13 +2529,13 @@ impl HistoryDb {
 
         // Get deny counts per pattern
         let mut deny_counts: HashMap<(String, Option<String>), u64> = HashMap::new();
-        let deny_rows = self.conn.query(&inline_params(
+        let deny_rows = self.conn.query_with_params(
             "SELECT pattern_name, pack_id, COUNT(*) FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2
              AND outcome = 'deny' AND pattern_name IS NOT NULL
-             GROUP BY pattern_name, pack_id",
+            GROUP BY pattern_name, pack_id",
             ts_params,
-        ))?;
+        )?;
         for row in &deny_rows {
             let vals = row.values();
             let pattern = sv_to_string(&vals[0]);
@@ -2475,13 +2546,13 @@ impl HistoryDb {
 
         // Get bypass counts per pattern
         let mut bypass_counts: HashMap<(String, Option<String>), u64> = HashMap::new();
-        let bypass_rows = self.conn.query(&inline_params(
+        let bypass_rows = self.conn.query_with_params(
             "SELECT pattern_name, pack_id, COUNT(*) FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2
              AND outcome = 'bypass' AND pattern_name IS NOT NULL
-             GROUP BY pattern_name, pack_id",
+            GROUP BY pattern_name, pack_id",
             ts_params,
-        ))?;
+        )?;
         for row in &bypass_rows {
             let vals = row.values();
             let pattern = sv_to_string(&vals[0]);
@@ -2571,12 +2642,12 @@ impl HistoryDb {
         since_ts: &str,
         end_ts: &str,
     ) -> Result<Vec<String>, HistoryError> {
-        let rows = self.conn.query(&inline_params(
+        let rows = self.conn.query_with_params(
             "SELECT DISTINCT pack_id FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2
-             AND pack_id IS NOT NULL",
+            AND pack_id IS NOT NULL",
             &[text_sv(since_ts.to_string()), text_sv(end_ts.to_string())],
-        ))?;
+        )?;
         let mut packs = Vec::new();
         for row in &rows {
             packs.push(sv_to_string(&row.values()[0]));
@@ -2605,14 +2676,14 @@ impl HistoryDb {
             ("chmod 777", "World-writable permissions"),
         ];
 
-        let rows = self.conn.query(&inline_params(
+        let rows = self.conn.query_with_params(
             "SELECT command, timestamp, working_dir FROM commands
              WHERE timestamp >= ?1 AND timestamp < ?2
              AND outcome = 'allow'
              ORDER BY timestamp DESC
-             LIMIT 1000",
+            LIMIT 1000",
             &[text_sv(since_ts.to_string()), text_sv(end_ts.to_string())],
-        ))?;
+        )?;
 
         for row in &rows {
             let vals = row.values();
@@ -2760,9 +2831,9 @@ impl HistoryDb {
 
         // Query for main aggregates
         let limit_i64 = i64::try_from(limit).unwrap_or(100);
-        // fsqlite does not support SUM(CASE WHEN ...) with GROUP BY.
-        // Use two separate queries and merge bypass counts in Rust.
-        let rows = self.conn.query(&inline_params(
+        // Keep hit and bypass aggregation separate so their ranking inputs stay
+        // explicit and independently testable.
+        let rows = self.conn.query_with_params(
             r"SELECT
                 rule_id,
                 COUNT(*) as total_hits,
@@ -2774,14 +2845,14 @@ impl HistoryDb {
                AND timestamp >= ?1
              GROUP BY rule_id
              ORDER BY total_hits DESC
-             LIMIT ?2",
+            LIMIT ?2",
             &[text_sv(since_ts.clone()), SqliteValue::Integer(limit_i64)],
-        ))?;
+        )?;
         // Bypass counts per rule
-        let bypass_rows = self.conn.query(&inline_params(
+        let bypass_rows = self.conn.query_with_params(
             "SELECT rule_id, COUNT(*) FROM commands WHERE rule_id IS NOT NULL AND outcome = 'bypass' AND timestamp >= ?1 GROUP BY rule_id",
             &[text_sv(since_ts)],
-        ))?;
+        )?;
         let bypass_map: HashMap<String, i64> = bypass_rows
             .iter()
             .map(|r| (sv_to_string(&r.values()[0]), sv_to_i64(&r.values()[1])))
@@ -2845,19 +2916,19 @@ impl HistoryDb {
         &self,
         rule_id: &str,
     ) -> Result<Option<RuleMetrics>, HistoryError> {
-        // fsqlite does not support SUM(CASE WHEN ...) or scalar subqueries
-        // mixed with aggregates. Use two separate queries.
+        // Keep hit and bypass aggregates separate for a straightforward
+        // optional-result path.
         let params = &[text_sv(rule_id.to_string())];
-        let result = self.conn.query_row(&inline_params(
+        let result = self.conn.query_row_with_params(
             r"SELECT
                 COUNT(*) as total_hits,
                 MIN(timestamp) as first_seen,
                 MAX(timestamp) as last_seen,
                 COUNT(DISTINCT command_hash) as unique_commands
              FROM commands
-             WHERE rule_id = ?1",
+            WHERE rule_id = ?1",
             params,
-        ));
+        );
 
         match result {
             Ok(row) => {
@@ -2872,10 +2943,10 @@ impl HistoryDb {
                 // Separate query for bypass count
                 let bypass_count = self
                     .conn
-                    .query_row(&inline_params(
+                    .query_row_with_params(
                         "SELECT COUNT(*) FROM commands WHERE rule_id = ?1 AND outcome = 'bypass'",
                         params,
-                    ))
+                    )
                     .map(|r| sv_to_i64(&r.values()[0]))
                     .unwrap_or(0);
                 let overrides = u64::try_from(bypass_count).unwrap_or(0);
@@ -2916,7 +2987,7 @@ impl HistoryDb {
                     is_anomaly,
                 }))
             }
-            Err(FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(HistoryError::Sqlite(e)),
         }
     }
@@ -2933,9 +3004,8 @@ impl HistoryDb {
     pub fn get_noisiest_rules(&self, limit: usize) -> Result<Vec<RuleMetrics>, HistoryError> {
         let min_hits = i64::try_from(RuleMetrics::MIN_HITS_FOR_TREND).unwrap_or(5);
 
-        // fsqlite does not support SUM(CASE WHEN ...) with GROUP BY.
-        // Use two queries and merge bypass counts in Rust, then sort.
-        let rows = self.conn.query(&inline_params(
+        // Merge separately aggregated hit and bypass counts in Rust, then sort.
+        let rows = self.conn.query_with_params(
             r"SELECT
                 rule_id,
                 COUNT(*) as total_hits,
@@ -2945,9 +3015,9 @@ impl HistoryDb {
              FROM commands
              WHERE rule_id IS NOT NULL
              GROUP BY rule_id
-             HAVING total_hits >= ?1",
+            HAVING total_hits >= ?1",
             &[SqliteValue::Integer(min_hits)],
-        ))?;
+        )?;
         let bypass_rows = self.conn.query(
             "SELECT rule_id, COUNT(*) FROM commands WHERE rule_id IS NOT NULL AND outcome = 'bypass' GROUP BY rule_id",
         )?;
@@ -3104,7 +3174,7 @@ impl HistoryDb {
                 text_sv(entry.pattern.clone()),
                 opt_string_to_sv(entry.final_pattern.as_ref()),
                 text_sv(entry.risk_level.clone()),
-                SqliteValue::Float(f64::from(entry.risk_score)),
+                SqliteValue::Real(f64::from(entry.risk_score)),
                 text_sv(entry.confidence_tier.clone()),
                 SqliteValue::Integer(i64::from(entry.confidence_points)),
                 SqliteValue::Integer(cluster_frequency),
@@ -3172,7 +3242,7 @@ impl HistoryDb {
             i64::try_from(limit).unwrap_or(i64::MAX),
         ));
 
-        let rows = self.conn.query(&inline_params(&sql, &params))?;
+        let rows = self.conn.query_with_params(&sql, &params)?;
 
         let mut entries = Vec::new();
         for row in &rows {
@@ -3298,7 +3368,7 @@ impl HistoryDb {
             i64::try_from(limit).unwrap_or(i64::MAX),
         ));
 
-        let rows = self.conn.query(&inline_params(&sql, &params))?;
+        let rows = self.conn.query_with_params(&sql, &params)?;
 
         let mut entries = Vec::new();
         for row in &rows {
@@ -4039,8 +4109,7 @@ mod tests {
     fn test_commands_table_columns() {
         let db = HistoryDb::open_in_memory().unwrap();
 
-        // Verify columns exist by selecting them (fsqlite PRAGMA table_info
-        // may return empty results for in-memory databases).
+        // Verify columns exist through the normal query path.
         let row = db.conn.query_row(
             "SELECT id, timestamp, agent_type, working_dir, command, command_hash,
                         outcome, eval_duration_us, session_id, exit_code,
@@ -4050,7 +4119,7 @@ mod tests {
         // The query should parse successfully even with no data (LIMIT 0).
         // If any column didn't exist, this would fail with "no such column".
         assert!(
-            row.is_ok() || matches!(row, Err(FrankenError::QueryReturnedNoRows)),
+            row.is_ok() || matches!(row, Err(rusqlite::Error::QueryReturnedNoRows)),
             "all expected columns should exist in commands table"
         );
     }
@@ -4449,8 +4518,7 @@ mod tests {
         })
         .unwrap();
 
-        // Search for git commands using LIKE (fsqlite's FTS5 MATCH operator does
-        // not correctly handle aggregation in the fallback execution path).
+        // Search for git commands using LIKE to exercise the generic query API.
         let count = db
             .conn
             .query("SELECT rowid FROM commands_fts WHERE command LIKE '%git%'")
@@ -4697,9 +4765,7 @@ mod tests {
             )
             .unwrap();
 
-        // Note: fsqlite does not enforce CHECK constraints at this time,
-        // so we only verify valid outcomes can be inserted. Application-level
-        // validation in CommandEntry::outcome ensures correctness.
+        // Verify every valid constrained outcome can be inserted.
     }
 
     #[test]
@@ -6448,105 +6514,5 @@ mod tests {
         // Verify trending fields exist
         assert!(m.change_percentage.is_finite());
         assert_eq!(m.previous_period_hits, 0);
-    }
-
-    // ========================================================================
-    // inline_params correctness tests (git_safety_guard-tovy)
-    // ========================================================================
-
-    #[test]
-    fn inline_params_substitutes_in_template_order() {
-        let sql = "SELECT * FROM t WHERE a = ?1 AND b = ?2 AND c = ?3";
-        let params = vec![
-            SqliteValue::Integer(10),
-            SqliteValue::Text("hi".into()),
-            SqliteValue::Null,
-        ];
-        let out = inline_params(sql, &params);
-        assert_eq!(
-            out,
-            "SELECT * FROM t WHERE a = 10 AND b = 'hi' AND c = NULL"
-        );
-    }
-
-    #[test]
-    fn inline_params_substituted_value_is_not_rescanned() {
-        // The bug: a value containing literal `?1` text used to be re-scanned
-        // and re-substituted on the next pass. Fixed implementation must
-        // emit the value verbatim (with escaping) and never look at it again.
-        let sql = "SELECT * FROM t WHERE a = ?1 AND b = ?2";
-        let params = vec![
-            SqliteValue::Text("real-a".into()),
-            SqliteValue::Text("?1".into()), // <-- the trap
-        ];
-        let out = inline_params(sql, &params);
-        assert_eq!(out, "SELECT * FROM t WHERE a = 'real-a' AND b = '?1'");
-    }
-
-    #[test]
-    fn inline_params_preserves_placeholder_inside_string_literal() {
-        // A literal `?1` already inside a single-quoted string in the SQL
-        // template must NOT be substituted — it's part of a string constant,
-        // not a parameter marker. fsqlite would never bind it; neither
-        // should our inliner.
-        let sql = "SELECT '?1' AS lit, x FROM t WHERE x = ?1";
-        let params = vec![SqliteValue::Integer(7)];
-        let out = inline_params(sql, &params);
-        assert_eq!(out, "SELECT '?1' AS lit, x FROM t WHERE x = 7");
-    }
-
-    #[test]
-    fn inline_params_handles_doubled_single_quote_escape_inside_string() {
-        // SQLite escapes single quotes inside a string by doubling: 'it''s'
-        // is "it's". The walk must stay in `in_string` state across the
-        // doubled quote and not exit until the real terminator.
-        let sql = "SELECT 'it''s ?1' AS lit, x FROM t WHERE x = ?1";
-        let params = vec![SqliteValue::Integer(99)];
-        let out = inline_params(sql, &params);
-        assert_eq!(out, "SELECT 'it''s ?1' AS lit, x FROM t WHERE x = 99");
-    }
-
-    #[test]
-    fn inline_params_two_digit_indexes_resolve_before_one_digit_prefix() {
-        // ?10 must be parsed as a full digit run, not as ?1 followed by 0.
-        let sql = "SELECT ?1, ?10";
-        let params = (1..=10)
-            .map(|n| SqliteValue::Integer(i64::from(n)))
-            .collect::<Vec<_>>();
-        let out = inline_params(sql, &params);
-        assert_eq!(out, "SELECT 1, 10");
-    }
-
-    #[test]
-    fn inline_params_escapes_single_quotes_in_string_values() {
-        let sql = "SELECT * FROM t WHERE c = ?1";
-        let params = vec![SqliteValue::Text("o'reilly".into())];
-        let out = inline_params(sql, &params);
-        assert_eq!(out, "SELECT * FROM t WHERE c = 'o''reilly'");
-    }
-
-    #[test]
-    fn inline_params_unknown_index_passes_through() {
-        // Out-of-range placeholder is left as-is so the SQL parser
-        // surfaces the error rather than silently producing wrong results.
-        let sql = "SELECT ?5";
-        let params = vec![SqliteValue::Integer(1)];
-        let out = inline_params(sql, &params);
-        assert_eq!(out, "SELECT ?5");
-    }
-
-    #[test]
-    fn inline_params_preserves_utf8_in_template() {
-        // A future caller might embed non-ASCII in a string literal or comment
-        // inside the SQL template (em-dash, accented char, emoji). The walker
-        // must traverse by `char`, not by byte, so multi-byte sequences
-        // round-trip intact.
-        let sql = "SELECT 'naïve façade — done' AS lit, x FROM t WHERE x = ?1";
-        let params = vec![SqliteValue::Integer(7)];
-        let out = inline_params(sql, &params);
-        assert_eq!(
-            out,
-            "SELECT 'naïve façade — done' AS lit, x FROM t WHERE x = 7"
-        );
     }
 }

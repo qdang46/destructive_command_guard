@@ -144,4 +144,4 @@ jobs:
           echo "- Quick reject: < 50μs (panic threshold)" >> $GITHUB_STEP_SUMMARY
           echo "- Fast path: < 500μs (panic threshold)" >> $GITHUB_STEP_SUMMARY
           echo "- Full heredoc pipeline: < 20ms (panic threshold)" >> $GITHUB_STEP_SUMMARY
-          echo "- Hook fail-open deadline: 200ms" >> $GITHUB_STEP_SUMMARY
+          echo "- Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)" >> $GITHUB_STEP_SUMMARY

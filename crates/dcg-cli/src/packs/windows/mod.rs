@@ -14,17 +14,12 @@
 //!    every pattern. This is the authoritative gate, so once a command reaches
 //!    the regex stage any casing is matched.
 //! 2. **Keyword quick-reject** (the hot-path pre-filter that decides whether a
-//!    pack's regexes run at all) is a *case-sensitive* substring/Aho-Corasick
-//!    match for zero-allocation performance on the Unix hot path (dcg's design
-//!    guarantees no allocation there for safe commands). To avoid a pack being
-//!    skipped before its `(?i)` regex runs, each pack enumerates the **realistic
-//!    casings** of its keywords: lowercase + UPPERCASE for cmd verbs (agents and
-//!    humans write `del` or `DEL`), and canonical PascalCase + lowercase for
-//!    PowerShell cmdlets (`Remove-Item` / `remove-item`). Pathological mixed-case
-//!    obfuscation (`dEl`) is intentionally out of scope — it is not a realistic
-//!    honest mistake and falls under the documented "a determined attacker can
-//!    bypass this hook" threat model. The `windows_keyword_casings` helper
-//!    generates these casings so packs stay terse and consistent.
+//!    pack's regexes run at all) uses an ASCII-case-insensitive Aho-Corasick
+//!    automaton. Consequently `del`, `DEL`, and `dEl` all admit the same pack
+//!    without allocating a lowercased command on the hot path. Keyword arrays
+//!    may still enumerate conventional spellings for readable metadata and
+//!    compatibility with external pack tooling; correctness does not depend on
+//!    those duplicates.
 //!
 //! ## Default enablement
 //!

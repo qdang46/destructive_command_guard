@@ -14,9 +14,10 @@
 # -----------------------------------------------------------------------------
 
 [[case]]
-description = "many repeated 'git' without subcommands"
+description = "many repeated unresolved Git alias/helper invocations stay bounded and fail closed"
 command = "git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git git"
-expected = "allow"
+expected = "deny"
+rule_id = "core.git:git-alias-semantic-unverified"
 
 [[case]]
 description = "many almost-reset commands"

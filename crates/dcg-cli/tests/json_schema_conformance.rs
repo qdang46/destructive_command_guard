@@ -8,21 +8,8 @@
 use regex::Regex;
 use serde_json::{Value, json};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
-
-/// Resolve a path relative to the repository root.
-///
-/// `CARGO_MANIFEST_DIR` is the workspace member directory (`crates/dcg-cli`),
-/// but the JSON schemas live at `docs/json-schema/` under the repository
-/// root. This helper bridges the two so test paths stay readable.
-fn repo_path(rel: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("manifest dir has two ancestors (workspace root)")
-        .join(rel)
-}
 
 fn load_json(path: impl AsRef<Path>) -> Value {
     let path = path.as_ref();
@@ -160,7 +147,7 @@ fn matches_type(kind: &str, value: &Value) -> bool {
 }
 
 fn validate_fixture(schema_path: &str, fixture_path: &str) {
-    let schema = load_json(repo_path(schema_path));
+    let schema = load_json(schema_path);
     let instance = load_json(fixture_path);
     validate(&schema, &instance).unwrap_or_else(|errors| {
         panic!("{fixture_path} does not conform to {schema_path}:\n{errors}")
@@ -243,7 +230,7 @@ fn run_claude_hook(command: &str, config_toml: Option<&str>) -> (Value, String) 
 
 #[test]
 fn hook_schema_examples_conform() {
-    let schema = load_json(repo_path("docs/json-schema/hook-output.json"));
+    let schema = load_json("../../docs/json-schema/hook-output.json");
     let examples = schema
         .get("examples")
         .and_then(Value::as_array)
@@ -258,7 +245,7 @@ fn hook_schema_examples_conform() {
 
 #[test]
 fn hook_golden_deny_fixtures_conform() {
-    let schema = load_json(repo_path("docs/json-schema/hook-output.json"));
+    let schema = load_json("../../docs/json-schema/hook-output.json");
     for fixture in [
         "tests/golden/hook/deny_filesystem.json",
         "tests/golden/hook/deny_git.json",
@@ -272,7 +259,7 @@ fn hook_golden_deny_fixtures_conform() {
 
 #[test]
 fn real_claude_deny_output_conforms_to_hook_schema() {
-    let schema = load_json(repo_path("docs/json-schema/hook-output.json"));
+    let schema = load_json("../../docs/json-schema/hook-output.json");
     let (instance, stderr) = run_claude_hook("git reset --hard HEAD~1", None);
 
     validate(&schema, &instance)
@@ -284,29 +271,29 @@ fn real_claude_deny_output_conforms_to_hook_schema() {
 }
 
 #[test]
-fn real_claude_warn_output_conforms_to_hook_schema() {
-    let schema = load_json(repo_path("docs/json-schema/hook-output.json"));
+fn real_claude_ask_output_conforms_to_hook_schema() {
+    let schema = load_json("../../docs/json-schema/hook-output.json");
     let (instance, stderr) = run_claude_hook(
         "git reset --hard HEAD~1",
-        Some("[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n"),
+        Some("[policy]\ndefault_mode = \"ask\"\n"),
     );
 
     validate(&schema, &instance)
         .unwrap_or_else(|errors| panic!("real warn hook output does not conform:\n{errors}"));
     assert_eq!(
         instance["hookSpecificOutput"]["permissionDecision"], "ask",
-        "warn policy must emit Claude ask JSON"
+        "ask policy must emit Claude review JSON"
     );
     assert!(
-        stderr.contains("WARNING") || stderr.contains("warn"),
-        "stderr should contain the human-readable warning, got:\n{stderr}"
+        stderr.contains("BLOCKED") || stderr.contains("blocked"),
+        "stderr should contain the human-readable review block, got:\n{stderr}"
     );
 }
 
 #[test]
 fn scan_fixture_conforms_to_scan_results_schema() {
     validate_fixture(
-        "docs/json-schema/scan-results.json",
+        "../../docs/json-schema/scan-results.json",
         "tests/fixtures/scan/expected_output.json",
     );
 }
@@ -314,11 +301,11 @@ fn scan_fixture_conforms_to_scan_results_schema() {
 #[test]
 fn schema_examples_conform_for_scan_stats_and_error_outputs() {
     for schema_path in [
-        "docs/json-schema/scan-results.json",
-        "docs/json-schema/stats-output.json",
-        "docs/json-schema/error.json",
+        "../../docs/json-schema/scan-results.json",
+        "../../docs/json-schema/stats-output.json",
+        "../../docs/json-schema/error.json",
     ] {
-        let schema = load_json(repo_path(schema_path));
+        let schema = load_json(schema_path);
         let examples = schema
             .get("examples")
             .and_then(Value::as_array)

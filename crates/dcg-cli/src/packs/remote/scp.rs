@@ -7,6 +7,192 @@
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScpSemanticDecision {
+    Safe,
+    Destructive(&'static str),
+    NonDestructive,
+    NoMatch,
+}
+
+fn normalize_absolute_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component),
+        }
+    }
+    let mut normalized = String::from("/");
+    normalized.push_str(&components.join("/"));
+    Some(normalized)
+}
+
+fn path_has_parent_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|component| component == "..")
+}
+
+fn windows_system_destination(path: &str) -> Option<bool> {
+    let normalized = path.replace('\\', "/");
+    let mut candidate = normalized.as_str();
+    if let Some(stripped) = candidate
+        .strip_prefix("//?/")
+        .or_else(|| candidate.strip_prefix("//./"))
+    {
+        candidate = stripped;
+    }
+    candidate = candidate.strip_prefix('/').unwrap_or(candidate);
+    let bytes = candidate.as_bytes();
+    let [drive, b':', b'/', ..] = bytes else {
+        return None;
+    };
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    let tail = candidate.get(3..).unwrap_or_default();
+    if tail.is_empty() {
+        return Some(true);
+    }
+    let mut components = Vec::new();
+    for component in tail.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component),
+        }
+    }
+    let lower = components.join("/").to_ascii_lowercase();
+    Some(
+        lower == "windows"
+            || lower.starts_with("windows/")
+            || lower == "window~1"
+            || lower.starts_with("window~1/")
+            || lower == "program files"
+            || lower.starts_with("program files/")
+            || lower == "program files (x86)"
+            || lower.starts_with("program files (x86)/")
+            || lower == "progra~1"
+            || lower.starts_with("progra~1/")
+            || lower == "progra~2"
+            || lower.starts_with("progra~2/")
+            || lower == "programdata"
+            || lower.starts_with("programdata/")
+            || lower == "progra~3"
+            || lower.starts_with("progra~3/")
+            || lower == "boot"
+            || lower.starts_with("boot/")
+            || lower == "efi"
+            || lower.starts_with("efi/")
+            || lower == "recovery"
+            || lower.starts_with("recovery/")
+            || lower == "system volume information"
+            || lower.starts_with("system volume information/"),
+    )
+}
+
+fn windows_drive_relative_destination(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let candidate = normalized.strip_prefix('/').unwrap_or(&normalized);
+    let bytes = candidate.as_bytes();
+    matches!(bytes, [drive, b':', tail @ ..] if drive.is_ascii_alphabetic() && !tail.starts_with(b"/"))
+}
+
+/// Classify a literal, single-process scp/pscp destination without compiling
+/// the pack's regexes. Complex shell syntax retains the established matcher.
+pub(crate) fn scp_semantic_decision(command: &str) -> ScpSemanticDecision {
+    scp_semantic_decision_in_dialect(command, crate::normalize::ShellDialect::Unknown)
+}
+
+pub(crate) fn scp_semantic_decision_in_dialect(
+    command: &str,
+    dialect: crate::normalize::ShellDialect,
+) -> ScpSemanticDecision {
+    use crate::packs::careful_company_running_windows::transfer::{
+        direct_scp_invocation_in_dialect, parse_scp_destination,
+    };
+
+    let Some(invocation) = direct_scp_invocation_in_dialect(command, dialect) else {
+        return ScpSemanticDecision::NoMatch;
+    };
+    if invocation.help || matches!(invocation.destination.as_str(), "." | "./" | ".\\") {
+        return ScpSemanticDecision::Safe;
+    }
+    if invocation.transfer_operand_count < 2 {
+        return ScpSemanticDecision::NonDestructive;
+    }
+    if invocation.destination_is_windows_drive {
+        return ScpSemanticDecision::NonDestructive;
+    }
+    if invocation.destination_is_dynamic {
+        return ScpSemanticDecision::Destructive("scp-destination-unverified");
+    }
+    let Some(destination) = parse_scp_destination(&invocation.destination) else {
+        return ScpSemanticDecision::Destructive("scp-destination-unverified");
+    };
+    let Some(path) = destination.path.as_deref() else {
+        return ScpSemanticDecision::Destructive("scp-destination-unverified");
+    };
+    if (path == "~" || path.starts_with("~/")) && !path_has_parent_component(path) {
+        return ScpSemanticDecision::Safe;
+    }
+    if destination.host.is_some()
+        && let Some(system_target) = windows_system_destination(path)
+        && system_target
+    {
+        return ScpSemanticDecision::Destructive("scp-to-windows-system");
+    }
+    if destination.host.is_some() && windows_drive_relative_destination(path) {
+        return ScpSemanticDecision::Destructive("scp-destination-unverified");
+    }
+    if destination.host.is_some() && !path.starts_with('/') && path_has_parent_component(path) {
+        return ScpSemanticDecision::Destructive("scp-relative-traversal");
+    }
+    let Some(path) = normalize_absolute_path(path) else {
+        return ScpSemanticDecision::NonDestructive;
+    };
+    if path == "/tmp"
+        || path.starts_with("/tmp/")
+        || path == "/var/tmp"
+        || path.starts_with("/var/tmp/")
+    {
+        return ScpSemanticDecision::Safe;
+    }
+    if path == "/" {
+        return if invocation.recursive {
+            ScpSemanticDecision::Destructive("scp-recursive-root")
+        } else {
+            ScpSemanticDecision::NonDestructive
+        };
+    }
+    for (prefix, rule) in [
+        ("/etc", "scp-to-etc"),
+        ("/var", "scp-to-var"),
+        ("/boot", "scp-to-boot"),
+        ("/usr", "scp-to-usr"),
+        ("/bin", "scp-to-bin"),
+        ("/sbin", "scp-to-bin"),
+        ("/lib", "scp-to-lib"),
+        ("/lib64", "scp-to-lib"),
+    ] {
+        if path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|tail| tail.starts_with('/'))
+        {
+            return ScpSemanticDecision::Destructive(rule);
+        }
+    }
+    ScpSemanticDecision::NonDestructive
+}
+
 /// Create the `scp` pack.
 #[must_use]
 pub fn create_pack() -> Pack {
@@ -14,13 +200,12 @@ pub fn create_pack() -> Pack {
         id: "remote.scp".to_string(),
         name: "scp",
         description: "Protects against destructive SCP operations like overwrites to system paths.",
-        keywords: &["scp"],
+        keywords: &["scp", "pscp"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
-        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
     }
 }
 
@@ -54,6 +239,37 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        // Semantic-only rules. Their bounded parsers run before regex
+        // matching; the unsatisfiable expressions keep stable names,
+        // severities, explanations, and allowlist identities in the ordinary
+        // pack model without duplicating shell parsing in regex.
+        destructive_pattern!(
+            "scp-destination-unverified",
+            r"(?!)",
+            "scp/pscp has a runtime-dependent or malformed destination that cannot be verified before execution.",
+            High,
+            "A shell variable, expression, malformed URI, or otherwise unverified final operand can \
+             resolve to a protected local path or an arbitrary remote host. Use a literal destination \
+             so dcg can determine direction and target before the transfer runs."
+        ),
+        destructive_pattern!(
+            "scp-relative-traversal",
+            r"(?!)",
+            "scp/pscp uses parent-directory traversal in a remote relative destination.",
+            High,
+            "Remote relative paths and tilde paths are resolved by the remote account. A `..` component \
+             can escape the account's apparent home/staging directory and overwrite a protected system \
+             location. Resolve the remote absolute path first and use a traversal-free destination."
+        ),
+        destructive_pattern!(
+            "scp-to-windows-system",
+            r"(?!)",
+            "scp/pscp targets a protected Windows system directory on the remote host.",
+            Critical,
+            "Copying into a remote drive root, Windows, Program Files, ProgramData, Boot, or EFI tree can \
+             overwrite operating-system files and make the destination host unusable. Stage the payload \
+             in a non-system directory and install it through a reviewed deployment mechanism."
+        ),
         // Recursive copy to root
         destructive_pattern!(
             "scp-recursive-root",
@@ -261,6 +477,177 @@ mod tests {
         assert!(
             !pack.matches_safe("scp file user@host:~/../root/.bashrc"),
             "traversal out of ~ must NOT be treated as safe"
+        );
+    }
+
+    #[test]
+    fn semantic_direct_scp_preserves_safe_and_protected_destinations() {
+        for command in [
+            "scp --help",
+            "scp -h",
+            "scp user@host:/etc/hosts .",
+            "scp file user@host:~/documents/",
+            "scp file user@host:/tmp/stash/",
+            "scp file user@host:/var/tmp/stash/",
+        ] {
+            assert_eq!(
+                scp_semantic_decision(command),
+                ScpSemanticDecision::Safe,
+                "{command}"
+            );
+        }
+        for (command, rule) in [
+            ("scp file user@host:/etc/passwd", "scp-to-etc"),
+            ("scp file user@host:\"/etc/important config\"", "scp-to-etc"),
+            ("scp file \"user@host\":/etc/passwd", "scp-to-etc"),
+            ("scp file user@host:/tmp/../etc/passwd", "scp-to-etc"),
+            ("scp file user@host:/etc/[x]:passwd", "scp-to-etc"),
+            ("scp data user@host:/var/lib/app", "scp-to-var"),
+            ("scp image user@host:/boot/vmlinuz", "scp-to-boot"),
+            ("scp binary user@host:/usr/local/bin/tool", "scp-to-usr"),
+            ("scp binary user@host:/sbin/tool", "scp-to-bin"),
+            ("scp library user@host:/lib64/library.so", "scp-to-lib"),
+            ("scp -r tree user@host:/", "scp-recursive-root"),
+            ("scp file --help user@host:/etc/passwd", "scp-to-etc"),
+            (
+                "scp -oStrictHostKeyChecking=no -r tree user@host:/",
+                "scp-recursive-root",
+            ),
+            ("scp -rP2222 tree user@host:/", "scp-recursive-root"),
+            ("scp -vrP 2222 tree user@host:/", "scp-recursive-root"),
+            ("pscp -pw secret -r tree user@host:/", "scp-recursive-root"),
+            (
+                "pscp -load reviewed-session -r tree user@host:/",
+                "scp-recursive-root",
+            ),
+            (
+                "scp file user@host:staging/../../etc/passwd",
+                "scp-relative-traversal",
+            ),
+            (
+                "scp file user@host:~/../root/.ssh/authorized_keys",
+                "scp-relative-traversal",
+            ),
+            (
+                "scp file scp://user@host//tmp/%2e%2e/etc/passwd",
+                "scp-to-etc",
+            ),
+            ("scp file scp://user@host/%2Fetc/passwd", "scp-to-etc"),
+        ] {
+            assert_eq!(
+                scp_semantic_decision(command),
+                ScpSemanticDecision::Destructive(rule),
+                "{command}"
+            );
+        }
+        for command in [
+            "scp file user@outside.example:/home/user/",
+            "scp C:\\data\\report.csv D:\\backup\\report.csv",
+            "scp file user@host:/",
+            "scp -oStrictHostKeyChecking=no file user@host:/",
+            "scp file scp://user@host/etc/passwd",
+            "scp user@host:/etc/passwd",
+            "scp -r user@host:/",
+            "scp file ./archive:name",
+        ] {
+            assert_eq!(
+                scp_semantic_decision(command),
+                ScpSemanticDecision::NonDestructive,
+                "{command}"
+            );
+        }
+        for command in [
+            "scp file $destination",
+            "scp file scp://user@host/path/%ZZ",
+            "scp file scp://user@host/path/%00",
+        ] {
+            assert_eq!(
+                scp_semantic_decision(command),
+                ScpSemanticDecision::Destructive("scp-destination-unverified"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_scp_uses_the_proven_windows_shell_dialect() {
+        use crate::normalize::ShellDialect;
+
+        for (command, dialect, rule) in [
+            (
+                r#"& "C:\Windows\System32\OpenSSH\scp.exe" C:\config user@host:/etc/config"#,
+                ShellDialect::PowerShell,
+                "scp-to-etc",
+            ),
+            (
+                "scp.exe C:\\config user@host:/tmp/../etc/important` config",
+                ShellDialect::PowerShell,
+                "scp-to-etc",
+            ),
+            (
+                r"pscp.exe C:\config user@host:/tmp/../etc/important^ config",
+                ShellDialect::Cmd,
+                "scp-to-etc",
+            ),
+            (
+                r"scp.exe C:\config user@host:C:\Windows\System32 2>NUL",
+                ShellDialect::Cmd,
+                "scp-to-windows-system",
+            ),
+            (
+                r"pscp.exe C:\config user@host:D:\ProgramData\vendor\settings.json",
+                ShellDialect::Cmd,
+                "scp-to-windows-system",
+            ),
+            (
+                r"scp.exe C:\config user@host:E:\",
+                ShellDialect::Cmd,
+                "scp-to-windows-system",
+            ),
+            (
+                r"scp.exe C:\config user@host:/C:/Windows/System32",
+                ShellDialect::Cmd,
+                "scp-to-windows-system",
+            ),
+            (
+                r"scp.exe C:\config user@host:C:\Temp\..\Windows\System32",
+                ShellDialect::Cmd,
+                "scp-to-windows-system",
+            ),
+            (
+                r"scp.exe C:\config user@host:\\?\C:\PROGRA~1\Vendor",
+                ShellDialect::Cmd,
+                "scp-to-windows-system",
+            ),
+            (
+                r"scp.exe C:\config user@host:C:Windows\System32",
+                ShellDialect::Cmd,
+                "scp-destination-unverified",
+            ),
+        ] {
+            assert_eq!(
+                scp_semantic_decision_in_dialect(command, dialect),
+                ScpSemanticDecision::Destructive(rule),
+                "{command:?}"
+            );
+        }
+        for (command, dialect) in [
+            ("scp.exe C:\\config $destination", ShellDialect::PowerShell),
+            (r"scp.exe C:\config %DESTINATION%", ShellDialect::Cmd),
+            (r"pscp.exe C:\config !DESTINATION!", ShellDialect::Cmd),
+        ] {
+            assert_eq!(
+                scp_semantic_decision_in_dialect(command, dialect),
+                ScpSemanticDecision::Destructive("scp-destination-unverified"),
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            scp_semantic_decision_in_dialect(
+                r"scp.exe C:\config user@host:/C:/Users/analyst/staging",
+                ShellDialect::Cmd,
+            ),
+            ScpSemanticDecision::NonDestructive
         );
     }
 }

@@ -903,7 +903,8 @@ pub enum SkipReason {
         null_bytes: usize,
         non_printable_ratio: f32,
     },
-    /// Tier 2 extraction exceeded the time budget (fail-open).
+    /// Tier 2 extraction exceeded the time budget; the evaluator chooses
+    /// bounded fallback or a strict block from configuration.
     Timeout { elapsed_ms: u64, budget_ms: u64 },
     /// Heredoc delimiter not found (unterminated).
     UnterminatedHeredoc { delimiter: String },
@@ -957,13 +958,15 @@ pub enum ExtractionResult {
     NoContent,
     /// Successfully extracted content.
     Extracted(Vec<ExtractedContent>),
-    /// Extraction was skipped (fail-open with reason for observability).
+    /// Extraction was skipped; the evaluator retains reasons for its configured
+    /// bounded-fallback or strict-block decision.
     Skipped(Vec<SkipReason>),
     Partial {
         extracted: Vec<ExtractedContent>,
         skipped: Vec<SkipReason>,
     },
-    /// Extraction failed (timeout, malformed, etc.) - fail open with warning.
+    /// Extraction failed (timeout, malformed, etc.); the evaluator applies its
+    /// configured bounded-fallback or strict-block policy.
     Failed(String),
 }
 
@@ -3194,7 +3197,8 @@ pub struct ExtractedShellCommand {
 /// delimiter from `)` in comments, nested groups, `case` patterns, functions,
 /// or nested substitutions inside double quotes. Tree-sitter-bash already
 /// models those grammar rules, so the evaluator uses this bounded AST view for
-/// security decisions. Any recovery/error node fails closed.
+/// security decisions. A recovery/error region fails closed only when it could
+/// conceal substitution syntax that was not captured as a parsed node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PosixCommandSubstitution {
     /// Command body after removing the outer `$()` or backtick delimiters.
@@ -3210,6 +3214,11 @@ pub struct PosixCommandSubstitution {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PosixCommandSubstitutionParseError;
 
+/// Extract POSIX command substitutions (`$(...)` / backticks) from content.
+///
+/// # Errors
+/// Returns [`PosixCommandSubstitutionParseError`] when the Bash AST cannot
+/// provide complete, non-overlapping source ranges.
 pub fn extract_posix_command_substitutions(
     content: &str,
 ) -> Result<Vec<PosixCommandSubstitution>, PosixCommandSubstitutionParseError> {
@@ -3229,7 +3238,17 @@ pub fn extract_posix_command_substitutions(
     let root = ast.root();
     let mut substitutions = Vec::new();
     let mut parse_error = false;
-    collect_command_substitutions_recursive(root, &mut substitutions, &mut parse_error);
+    let mut error_ranges = Vec::new();
+    collect_command_substitutions_recursive(
+        root,
+        &mut substitutions,
+        &mut parse_error,
+        &mut error_ranges,
+    );
+    if !parse_error {
+        parse_error =
+            error_ranges_conceal_substitution_syntax(content, &error_ranges, &substitutions);
+    }
     if parse_error {
         Err(PosixCommandSubstitutionParseError)
     } else {
@@ -3242,6 +3261,53 @@ pub fn extract_posix_command_substitutions(
     }
 }
 
+/// Whether a tree-sitter recovery region contains command-substitution syntax
+/// that was not captured as a parsed `command_substitution` node.
+///
+/// Tree-sitter recovers from ungrammatical input by wrapping it in `ERROR`
+/// nodes. Failing closed on *every* recovery node meant a single unparseable
+/// fragment anywhere in a submission poisoned the whole command — but only
+/// when a `$(` or backtick happened to appear somewhere, turning benign but
+/// grammar-exotic submissions into unactionable hard denies. The enumeration
+/// is only incomplete if substitution syntax hides *inside* a recovery region
+/// without a corresponding parsed node, so that is the only case that still
+/// fails closed.
+fn error_ranges_conceal_substitution_syntax(
+    content: &str,
+    error_ranges: &[(usize, usize)],
+    substitutions: &[PosixCommandSubstitution],
+) -> bool {
+    if error_ranges.is_empty() {
+        return false;
+    }
+    let covered = |offset: usize| {
+        substitutions
+            .iter()
+            .any(|substitution| offset >= substitution.start && offset < substitution.end)
+    };
+    for &(start, end) in error_ranges {
+        let Some(region) = content.get(start..end) else {
+            return true;
+        };
+        for (relative, _) in region.match_indices("$(") {
+            if !covered(start + relative) {
+                return true;
+            }
+        }
+        for (relative, _) in region.match_indices('`') {
+            if !covered(start + relative) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Extract the bodies of all POSIX command substitutions.
+///
+/// # Errors
+/// Returns [`PosixCommandSubstitutionParseError`] when the Bash AST cannot
+/// provide complete, non-overlapping source ranges.
 pub fn extract_posix_command_substitution_bodies(
     content: &str,
 ) -> Result<Vec<String>, PosixCommandSubstitutionParseError> {
@@ -3258,10 +3324,12 @@ fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
     node: ast_grep_core::Node<'_, D>,
     substitutions: &mut Vec<PosixCommandSubstitution>,
     parse_error: &mut bool,
+    error_ranges: &mut Vec<(usize, usize)>,
 ) {
     let kind = node.kind();
     if kind == "ERROR" {
-        *parse_error = true;
+        let range = node.range();
+        error_ranges.push((range.start, range.end));
     } else if kind == "command_substitution" {
         let text = node.text();
         let text = text.as_ref();
@@ -3292,7 +3360,7 @@ fn collect_command_substitutions_recursive<D: ast_grep_core::Doc>(
     }
 
     for child in node.children() {
-        collect_command_substitutions_recursive(child, substitutions, parse_error);
+        collect_command_substitutions_recursive(child, substitutions, parse_error, error_ranges);
     }
 }
 
@@ -3418,6 +3486,74 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use proptest::prelude::*;
+
+    // ========================================================================
+    // POSIX command-substitution extraction (grammar-recovery scoping)
+    // ========================================================================
+
+    mod posix_substitution_recovery {
+        use super::*;
+
+        #[test]
+        fn well_formed_substitutions_extract_cleanly() {
+            let found = extract_posix_command_substitutions("echo \"$(date)\" `hostname`")
+                .expect("well-formed input must parse");
+            assert_eq!(found.len(), 2);
+            assert_eq!(found[0].body, "date");
+            assert_eq!(found[1].body, "hostname");
+        }
+
+        #[test]
+        fn recovery_region_without_substitution_syntax_does_not_poison_command() {
+            // `done` without a matching `do` forces tree-sitter recovery, but
+            // the broken fragment conceals no substitution syntax, so the
+            // well-formed `$(date)` elsewhere must still be enumerated instead
+            // of failing the whole submission closed.
+            let content = "for f in *; done\necho \"$(date)\"";
+            let ast = AstGrep::new(content, SupportLang::Bash);
+            let mut has_error = false;
+            let mut stack = vec![ast.root()];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "ERROR" {
+                    has_error = true;
+                }
+                stack.extend(node.children());
+            }
+            if has_error {
+                let found = extract_posix_command_substitutions(content)
+                    .expect("recovery without hidden substitution syntax must not fail closed");
+                assert!(
+                    found.iter().any(|s| s.body == "date"),
+                    "the well-formed substitution must still be enumerated"
+                );
+            } else {
+                // If a future grammar version parses this cleanly the scoped
+                // check is simply never consulted; extraction must succeed.
+                extract_posix_command_substitutions(content).expect("clean parse must succeed");
+            }
+        }
+
+        #[test]
+        fn recovery_region_concealing_substitution_syntax_fails_closed() {
+            // An unterminated substitution leaves `$(` inside a recovery
+            // region with no parsed `command_substitution` node covering it:
+            // the enumeration would be incomplete, so this must fail closed.
+            let content = "echo \"$(date\"";
+            assert_eq!(
+                extract_posix_command_substitutions(content),
+                Err(PosixCommandSubstitutionParseError)
+            );
+        }
+
+        #[test]
+        fn stray_backtick_in_recovery_region_fails_closed() {
+            let content = "if [ x; then `rm -rf /tmp/a";
+            assert_eq!(
+                extract_posix_command_substitutions(content),
+                Err(PosixCommandSubstitutionParseError)
+            );
+        }
+    }
 
     // ========================================================================
     // Tier 1: Trigger Detection Tests

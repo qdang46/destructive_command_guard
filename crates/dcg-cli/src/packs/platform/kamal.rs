@@ -100,7 +100,6 @@ pub fn create_pack() -> Pack {
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
-        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
     }
 }
 
@@ -109,88 +108,88 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // --- Top-level inspection (read-only) ---
         safe_pattern!(
             "kamal-audit",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-details",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+details(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+details(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-config",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-secrets",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets(?:\s|$)"
         ),
         // --- Deploy / lifecycle (creates or refreshes; not destructive) ---
         safe_pattern!(
             "kamal-deploy",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+deploy(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deploy(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-redeploy",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+redeploy(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+redeploy(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-setup",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+setup(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+setup(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-build",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-rollback",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+rollback(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+rollback(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-upgrade",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+upgrade(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+upgrade(?:\s|$)"
         ),
         // --- Registry / lock / server bootstrap / meta ---
         safe_pattern!(
             "kamal-registry",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+registry\s+(?:login|logout)(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+registry\s+(?:login|logout)(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-lock",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+lock(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+lock(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-server-bootstrap",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+server\s+bootstrap(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+server\s+bootstrap(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-init",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-docs",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+docs(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+docs(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-help",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+help(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+help(?:\s|$)"
         ),
         safe_pattern!(
             "kamal-version",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?:\s|$)"
         ),
         // --- app: inspection + reversible lifecycle ---
         safe_pattern!(
             "kamal-app-safe",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|containers|images|logs|version|stale_containers|maintenance|live)(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|containers|images|logs|version|stale_containers|maintenance|live)(?:\s|$)"
         ),
         // --- accessory: inspection + reversible lifecycle (restart is safe; reboot is NOT) ---
         safe_pattern!(
             "kamal-accessory-safe",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|logs|upgrade)(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|start|restart|details|logs|upgrade)(?:\s|$)"
         ),
         // --- proxy: inspection + reversible lifecycle (reboot/stop/remove are NOT here) ---
         safe_pattern!(
             "kamal-proxy-safe",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|boot_config|start|restart|details|logs)(?:\s|$)"
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:boot|boot_config|start|restart|details|logs)(?:\s|$)"
         ),
     ]
 }
@@ -200,7 +199,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === Critical: irreversible data loss / full teardown ===
         destructive_pattern!(
             "kamal-remove",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
             "kamal remove tears down the entire deployment, including stateful accessories.",
             Critical,
             "`kamal remove` removes the app container, kamal-proxy, and all accessory containers \
@@ -217,7 +216,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kamal-accessory-remove",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
             "kamal accessory remove deletes the accessory container, image, AND its host data directory.",
             Critical,
             "`kamal accessory remove [NAME]` removes the accessory container and image and ALSO \
@@ -234,7 +233,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === High: prod down / routing dropped (recoverable in principle) ===
         destructive_pattern!(
             "kamal-app-remove",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
             "kamal app remove takes the app offline by removing its containers and images.",
             High,
             "`kamal app remove` removes the app containers and images from the servers. The app goes \
@@ -248,7 +247,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kamal-app-stop",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+stop(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+app(?:\s+--?\S+(?:\s+\S+)?)*\s+stop(?:\s|$)",
             "kamal app stop stops the app container, causing an outage until restarted.",
             High,
             "`kamal app stop` stops the app container on the servers, causing an outage until \
@@ -260,7 +259,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kamal-proxy-remove",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+remove(?:\s|$)",
             "kamal proxy remove drops routing for every app behind that proxy on the host.",
             High,
             "`kamal proxy remove` removes the kamal-proxy container and image. Every app behind that \
@@ -273,7 +272,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kamal-proxy-reboot",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+reboot(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+reboot(?:\s|$)",
             "kamal proxy reboot stops, removes, and recreates the proxy, causing a short outage.",
             High,
             "`kamal proxy reboot` stops, removes, and starts a new proxy container. It is documented \
@@ -286,7 +285,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kamal-proxy-stop",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+stop(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+proxy(?:\s+--?\S+(?:\s+\S+)?)*\s+stop(?:\s|$)",
             "kamal proxy stop drops routing for every app behind that proxy until it is started.",
             High,
             "`kamal proxy stop` stops the kamal-proxy container. Every app behind that proxy on the \
@@ -298,7 +297,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kamal-accessory-reboot",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+reboot(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+reboot(?:\s|$)",
             "kamal accessory reboot stops, removes, and recreates the accessory container (downtime).",
             High,
             "`kamal accessory reboot [NAME]` stops, removes, and starts a new accessory container, \
@@ -311,7 +310,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "kamal-accessory-stop",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+stop(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+accessory(?:\s+--?\S+(?:\s+\S+)?)*\s+stop(?:\s|$)",
             "kamal accessory stop stops the accessory (e.g. the database), erroring the app.",
             High,
             "`kamal accessory stop [NAME]` stops the accessory container. Stopping the database (or \
@@ -325,7 +324,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // === Medium: cleanup that erodes rollback safety ===
         destructive_pattern!(
             "kamal-prune",
-            r"kamal(?:\s+--?\S+(?:\s+\S+)?)*\s+prune(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:all|containers|images)(?:\s|$)",
+            r"(?<![\w-])kamal\b(?:\s+--?\S+(?:\s+\S+)?)*\s+prune(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:all|containers|images)(?:\s|$)",
             "kamal prune removes older images/containers that kamal rollback relies on.",
             Medium,
             "`kamal prune all` prunes unused images and stopped containers, `kamal prune containers` \
@@ -363,6 +362,7 @@ mod tests {
         let pack = create_pack();
         let checks = [
             ("kamal remove", "kamal-remove"),
+            ("/usr/bin/kamal remove", "kamal-remove"),
             ("kamal remove -y", "kamal-remove"),
             ("kamal remove --yes -d production", "kamal-remove"),
             ("kamal -d staging remove -y", "kamal-remove"),
@@ -515,5 +515,8 @@ mod tests {
         assert_no_match(&pack, "ls -la");
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "docker ps");
+        assert_no_match(&pack, "notkamal remove");
+        assert_no_match(&pack, "my-kamal accessory remove db");
+        assert_no_match(&pack, "akamal proxy stop");
     }
 }

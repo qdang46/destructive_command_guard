@@ -46,7 +46,7 @@
 //! let config = Config::load();
 //! let compiled_overrides = config.overrides.compile();
 //! let enabled_keywords = vec!["git", "rm"];
-//! let allowlists = dcg_cli::load_default_allowlists();
+//! let allowlists = destructive_command_guard::load_default_allowlists();
 //! let result = evaluate_command(
 //!     "git status",
 //!     &config,
@@ -95,18 +95,19 @@ pub mod suggestions;
 pub mod trace;
 pub mod update;
 
+// v0.6: re-export dcg-core types so consumers can `use dcg_cli::Engine` etc.
+pub use dcg_core::{
+    Decision, Effect, Engine, EngineConfig, EngineConfigBuilder, Mode, ModePreCheck,
+    ProtectedPaths, Session as PermissionSession, ToolCall,
+};
+pub use permission_modes::{evaluate_with_mode, evaluate_with_mode_and_packs};
+
 // Re-export commonly used types
 pub use allowlist::{
     AllowEntry, AllowSelector, AllowlistError, AllowlistFile, AllowlistLayer, LayeredAllowlist,
     LoadedAllowlistLayer, RuleId, load_default_allowlists,
 };
-
-// v0.6: re-export dcg-core types so consumers can `use dcg_cli::Engine` etc.
 pub use config::Config;
-pub use dcg_core::{
-    Decision, Effect, Engine, EngineConfig, EngineConfigBuilder, Mode, ModePreCheck,
-    ProtectedPaths, Session as PermissionSession, ToolCall,
-};
 pub use error_codes::{DcgError, ErrorCategory, ErrorCode, ErrorResponse};
 pub use evaluator::{
     BypassMethod, ConfidenceResult, DetailedEvaluationResult, EvaluationDecision, EvaluationResult,
@@ -128,7 +129,6 @@ pub use pending_exceptions::{
     AllowOnceEntry, AllowOnceScopeKind, AllowOnceStore, PendingExceptionRecord,
     PendingExceptionStore,
 };
-pub use permission_modes::{evaluate_with_mode, evaluate_with_mode_and_packs};
 
 // Re-export dual regex engine abstraction (from regex safety audit)
 pub use packs::regex_engine::{BACKTRACK_LIMIT, CompiledRegex, needs_backtracking_engine};
@@ -201,10 +201,10 @@ pub use stats::{
 
 // Re-export performance budget types
 pub use perf::{
-    ABSOLUTE_MAX, Budget, BudgetStatus, Deadline, FAST_PATH, FAST_PATH_BUDGET_US,
-    FULL_HEREDOC_PIPELINE, HEREDOC_EXTRACT, HEREDOC_TRIGGER, HOOK_EVALUATION_BUDGET,
-    HOOK_EVALUATION_BUDGET_MS, LANGUAGE_DETECT, PATTERN_MATCH, QUICK_REJECT, SLOW_PATH_BUDGET_MS,
-    exceeds_absolute_budget,
+    ABSOLUTE_MAX, Budget, BudgetStatus, CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS, Deadline,
+    FAST_PATH, FAST_PATH_BUDGET_US, FULL_HEREDOC_PIPELINE, HEREDOC_EXTRACT, HEREDOC_TRIGGER,
+    HOOK_EVALUATION_BUDGET, HOOK_EVALUATION_BUDGET_MS, LANGUAGE_DETECT, PATTERN_MATCH,
+    QUICK_REJECT, SLOW_PATH_BUDGET_MS, exceeds_absolute_budget,
 };
 
 // Re-export normalize types for wrapper stripping

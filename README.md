@@ -214,6 +214,33 @@ writes a starter `~/.config/dcg/config.toml` whose `[packs] enabled` list turns 
 generated starter config, not the no-config default. Enable any pack below by adding
 it to `[packs] enabled` — see [Enable More Protection](#enable-more-protection).
 
+### Careful Company (Windows) Preset
+
+Every other pack answers "will this command destroy something?". This preset also
+answers "is this command **sending our data somewhere**, or switching off the
+controls that watch it?" — the question that matters once an agent runs on a
+Windows workstation with tool-permission prompts disabled. The same policy is
+applied to statically inspectable commands submitted through either
+**PowerShell or `cmd.exe`**, including Cmd's caret escaping, control prefixes,
+nested `cmd /c` / `call`, and command chaining. It is **opt-in on every
+platform**, and one line enables the whole posture:
+
+```toml
+[packs]
+enabled = ["careful_company_running_windows"]
+```
+
+`careful_company_running_windows.*` sub-pack *does* join, through ordinary
+packs machinery, the exfiltration guardrails a Windows company workstation
+needs:
+
+- `careful_company_running_windows.email` - Sending mail from the workstation: `Send-MailMessage`, `System.Net.Mail.SmtpClient`, Outlook COM automation, Microsoft Graph `sendMail`, transactional mail-API send endpoints, `aws ses send-email`, SMTP CLI tools (`blat`, `swaks`, `msmtp`, `git send-email`, `curl --mail-rcpt`), and persistent forwarding rules (`New-InboxRule -ForwardTo`, `Set-Mailbox -ForwardingSmtpAddress`).
+- `careful_company_running_windows.chat` - Chat and webhook destinations: Slack incoming webhooks and Web API writes, Teams connectors and Power Automate triggers, Discord, Telegram, Google Chat, Twilio, Zapier/IFTTT, PagerDuty, and request catchers such as `webhook.site` and `interact.sh`.
+- `careful_company_running_windows.upload` - HTTP file-upload primitives (`-InFile`, `-Form`, `curl -T`, `-F field=@file`, `--data-binary @file`, `--post-file`, `WebClient.UploadFile`, `GetRequestStream`, `MultipartFormDataContent`, BITS uploads), file-drop/paste services, `gh gist create`, `certreq -Post`, and request bodies built from file or clipboard contents.
+- `careful_company_running_windows.transfer` - Outbound file transfer: scp/sftp/WinSCP to a remote destination, scripted FTP, `tftp put`, rsync and rclone to a remote, cloud-storage uploads (`aws s3 cp` local→`s3://`, `az storage blob upload`, azcopy, `gsutil cp`→`gs://`, b2/s3cmd/mc/wrangler r2), peer-to-peer senders, WebDAV mounts, and copy LOLBins (`esentutl /y`, `print /D:`).
+- `careful_company_running_windows.tunnel` - Channels that expose the workstation or bypass inspection: ngrok, cloudflared, devtunnel/`code tunnel`, localtunnel, `tailscale funnel`, `ssh -R`/`-D`, chisel/frp, ncat/netcat/socat, PowerShell raw sockets, `netsh interface portproxy`, DNS tunnels, and out-of-band callback domains.
+- `careful_company_running_windows.guardrails` - Turning off the safety net: Defender (`Set-MpPreference -Disable*`/`-ExclusionPath`), the firewall, EDR and event-log services, BitLocker, `Set-ExecutionPolicy Bypass`, script-block logging, event-log clearing, **dcg's own `DCG_BYPASS`, `dcg uninstall`, allowlist grants (`dcg allowlist add`, `dcg allow-once`), runtime config overrides (`DCG_DISABLE`/`DCG_PACKS`/`DCG_CONFIG`), and the agent's hook config**, plus unreviewed remote code (`iwr | iex`, `powershell -EncodedCommand`, mshta/regsvr32 remote payloads). Diagnosis stays open: `dcg explain`, `dcg allowlist list`, and `dcg allowlist validate` are whitelisted.
+
 ### Storage Packs
 - `storage.s3` - Protects against destructive S3 operations like bucket removal, recursive deletes, and sync --delete.
 - `storage.gcs` - Protects against destructive GCS operations like bucket removal, object deletion, and recursive deletes.
@@ -762,9 +789,15 @@ static FALLBACK_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
 
 This ensures that even oversized or malformed inputs are checked for the most dangerous operations before being allowed.
 
-**Absolute Timeout**:
+**Absolute Evaluation Deadline**:
 
-To prevent any single command from blocking indefinitely, dcg enforces an absolute maximum processing time of **200ms**. Any command exceeding this threshold is immediately allowed with a warning logged.
+To prevent any single command from blocking indefinitely, dcg enforces an
+end-to-end evaluation deadline. The ordinary default is **1000ms**; the
+`careful_company_running_windows` preset defaults to **3000ms**, and an
+explicit `general.hook_timeout_ms` or `DCG_HOOK_TIMEOUT_MS` overrides either
+default (values below **10ms** are clamped to that safety minimum). Exhausting
+that budget produces an explicit indeterminate result, which requests operator
+review where the hook protocol supports it and otherwise blocks.
 
 ## Installation
 
@@ -1893,7 +1926,12 @@ dcg operates under strict latency constraints - every Bash command passes throug
 | 5 | Language detect | < 20μs | > 50μs | > 200μs |
 | 6 | Full heredoc pipeline | < 5ms | > 15ms | > 20ms |
 
-Hook mode also has an absolute 200ms deadline. If that deadline is exhausted, expensive analysis fails open so dcg does not hang an interactive workflow.
+Hook mode also has an absolute wall-clock evaluation deadline (ordinary
+default: 1000ms; configurable). If that deadline is exhausted, dcg returns an
+explicit indeterminate decision: clients that support operator review receive
+`ask`, and clients without that state receive a blocking decision. A timeout
+never becomes a silent allow. Use `dcg test --enforce-budget` to apply the
+effective hook budget during a diagnostic test.
 
 **Fail-Open Behavior**:
 

@@ -51,15 +51,15 @@ const ROBOCOPY_SUGGESTIONS: &[PatternSuggestion] = &[PatternSuggestion::new(
 pub fn create_pack() -> Pack {
     Pack {
         id: "windows.misc".to_string(),
-        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
         name: "Windows Misc (registry/accounts/wsl)",
         description: "Protects against destructive Windows cmd operations: `reg delete`, \
                       `net user|localgroup /delete`, `sc delete`, `schtasks /delete`, \
                       `wsl --unregister` (destroys a WSL distro), and `robocopy /MIR` (mirror \
                       delete).",
-        // Realistic keyword casings (case-sensitive quick-reject); see
-        // packs::windows module docs. Short verbs (reg/net/sc) are noisy
-        // substrings but the `(?i)\b...\b` regexes still gate precisely.
+        // Conventional keyword casings retained for readable metadata; the
+        // quick-reject itself is ASCII case-insensitive. Short verbs
+        // (reg/net/sc) are noisy substrings, but the `(?i)\b...\b` regexes
+        // still gate precisely.
         keywords: &[
             "reg", "REG", "net", "NET", "sc", "SC", "schtasks", "SCHTASKS", "wsl", "WSL",
             "robocopy", "ROBOCOPY",

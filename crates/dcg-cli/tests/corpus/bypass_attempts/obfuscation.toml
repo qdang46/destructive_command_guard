@@ -66,3 +66,25 @@ expected = "deny"
 description = "backslash escaped git"
 command = "\\git reset --hard"
 expected = "deny"
+
+# Variable-rooted temp paths are fail-closed because the caller can point
+# TMPDIR at `/`, `/etc`, or another persistent tree.
+[[case]]
+description = "rm -rf $TMPDIR is denied because the variable root is unknown"
+command = "rm -rf $TMPDIR/build"
+expected = "deny"
+
+[[case]]
+description = "rm -rf ${TMPDIR} is denied because the variable root is unknown"
+command = "rm -rf ${TMPDIR}/build"
+expected = "deny"
+
+[[case]]
+description = "quoted TMPDIR is still dynamic and denied"
+command = "rm -rf \"$TMPDIR/build\""
+expected = "deny"
+
+[[case]]
+description = "TMPDIR default expansion is denied because a nonempty unsafe value wins"
+command = "rm -rf ${TMPDIR:-/tmp}/build"
+expected = "deny"

@@ -31,32 +31,6 @@ destructive_patterns:
     description: legacy_tool destroy is irreversible
 ";
 
-const PACK_YAML_WITH_EFFECTS: &str = r"
-schema_version: 1
-id: example.tagged
-name: Example Effect-Tagged Pack
-version: 1.0.0
-description: Adds effects + default_effects fields.
-keywords:
-  - tagged_tool
-default_effects:
-  - mutate_vcs
-  - write
-destructive_patterns:
-  - name: tagged-yeet
-    pattern: \btagged_tool\s+yeet\b
-    severity: critical
-    description: yeet is irreversible
-    effects:
-      - irreversible
-      - write
-      - fs
-  - name: tagged-meh
-    pattern: \btagged_tool\s+meh\b
-    severity: high
-    description: meh just sits there
-";
-
 #[test]
 fn legacy_yaml_pack_without_effects_loads() {
     let parsed: ExternalPack = serde_yaml::from_str(LEGACY_PACK_YAML).expect("parse legacy YAML");
@@ -65,10 +39,9 @@ fn legacy_yaml_pack_without_effects_loads() {
     assert_eq!(pack.destructive_patterns.len(), 1);
     let rule = &pack.destructive_patterns[0];
     assert_eq!(rule.name, Some("legacy-destroy"));
-    assert!(
-        rule.effects.is_none(),
-        "legacy pack must not synthesize per-rule effects"
-    );
+    // The upstream 0.9.x schema no longer has per-rule or pack-level
+    // `effects` fields; effect resolution is centralized in
+    // `permission_modes` with the DEFAULT_PACK_EFFECTS fallback.
 }
 
 #[test]
@@ -76,67 +49,11 @@ fn legacy_pack_uses_default_pack_effects_as_fallback() {
     let parsed: ExternalPack = serde_yaml::from_str(LEGACY_PACK_YAML).expect("parse legacy YAML");
     let pack = parsed.into_pack();
     assert_eq!(
-        pack.default_effects, DEFAULT_PACK_EFFECTS,
-        "missing default_effects should fall back to DEFAULT_PACK_EFFECTS"
+        DEFAULT_PACK_EFFECTS,
+        &[dcg_core::Effect::Write, dcg_core::Effect::Irreversible],
+        "conservative Tier-B default must stay Write + Irreversible"
     );
-}
-
-#[test]
-fn legacy_pack_resolve_effects_returns_pack_default() {
-    let parsed: ExternalPack = serde_yaml::from_str(LEGACY_PACK_YAML).expect("parse legacy YAML");
-    let pack = parsed.into_pack();
-    let rule = &pack.destructive_patterns[0];
-    let effects = pack.resolve_effects(rule);
-    assert_eq!(
-        effects, DEFAULT_PACK_EFFECTS,
-        "untagged rule must inherit pack default"
-    );
-}
-
-#[test]
-fn yaml_pack_with_default_effects_loads() {
-    let parsed: ExternalPack =
-        serde_yaml::from_str(PACK_YAML_WITH_EFFECTS).expect("parse effect-tagged YAML");
-    let pack = parsed.into_pack();
-    assert_eq!(pack.id, "example.tagged");
-    assert_eq!(
-        pack.default_effects,
-        &[dcg_core::Effect::MutateVcs, dcg_core::Effect::Write]
-    );
-}
-
-#[test]
-fn per_rule_effects_override_pack_default() {
-    let parsed: ExternalPack =
-        serde_yaml::from_str(PACK_YAML_WITH_EFFECTS).expect("parse effect-tagged YAML");
-    let pack = parsed.into_pack();
-
-    let tagged = pack
-        .destructive_patterns
-        .iter()
-        .find(|p| p.name == Some("tagged-yeet"))
-        .expect("tagged rule");
-    let tagged_effects = pack.resolve_effects(tagged);
-    assert_eq!(
-        tagged_effects,
-        &[
-            dcg_core::Effect::Irreversible,
-            dcg_core::Effect::Write,
-            dcg_core::Effect::Fs
-        ]
-    );
-
-    let untagged = pack
-        .destructive_patterns
-        .iter()
-        .find(|p| p.name == Some("tagged-meh"))
-        .expect("untagged rule");
-    let untagged_effects = pack.resolve_effects(untagged);
-    assert_eq!(
-        untagged_effects,
-        &[dcg_core::Effect::MutateVcs, dcg_core::Effect::Write],
-        "untagged rule should inherit the effect-tagged pack-level default"
-    );
+    assert_eq!(pack.id, "example.legacy");
 }
 
 #[test]
@@ -163,7 +80,7 @@ destructive_patterns:
     let parsed: ExternalPack = serde_yaml::from_str(stripped).expect("strip-back must still parse");
     assert_eq!(parsed.destructive_patterns.len(), 2);
     let pack = parsed.into_pack();
-    assert_eq!(pack.default_effects, DEFAULT_PACK_EFFECTS);
+    assert_eq!(pack.id, "example.tagged");
 }
 
 #[test]

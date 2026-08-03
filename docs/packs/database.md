@@ -9,6 +9,7 @@ This document describes packs in the `database` category.
 - [MongoDB](#databasemongodb)
 - [Redis](#databaseredis)
 - [SQLite](#databasesqlite)
+- [Snowflake CLI](#databasesnowflake)
 - [Supabase](#databasesupabase)
 
 ---
@@ -49,6 +50,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | psql receives indirect input that dcg cannot statically verify. | high |
 | `drop-database` | DROP DATABASE permanently deletes the entire database (even with IF EXISTS). Verify and back up first. | critical |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify and back up first. | high |
 | `drop-schema` | DROP SCHEMA permanently deletes the schema and all its objects (even with IF EXISTS). | critical |
@@ -118,6 +120,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | mysql/mariadb receives indirect input that dcg cannot statically verify. | high |
 | `drop-database` | DROP DATABASE permanently deletes the entire database. Verify and back up first. | critical |
 | `drop-table` | DROP TABLE permanently deletes the table. Verify and back up first. | high |
 | `truncate-table` | TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL. | high |
@@ -189,6 +192,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | mongosh receives indirect input that dcg cannot statically verify. | high |
 | `drop-database` | dropDatabase permanently deletes the entire database. | critical |
 | `drop-collection` | drop/dropCollection permanently deletes the collection. | high |
 | `delete-all` | remove({}) or deleteMany({}) deletes ALL documents. Add filter criteria. | high |
@@ -252,6 +256,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | redis-cli receives indirect input that dcg cannot statically verify. | high |
 | `flushall` | FLUSHALL permanently deletes ALL keys in ALL databases. | critical |
 | `flushdb` | FLUSHDB permanently deletes ALL keys in the current database. | high |
 | `config-resetstat` | CONFIG RESETSTAT clears Redis runtime counters and can hide recent incidents. | medium |
@@ -320,6 +325,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | sqlite3 receives indirect input that dcg cannot statically verify. | high |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify it is intended. | critical |
 | `delete-without-where` | DELETE without WHERE deletes ALL rows. Add a WHERE clause. | critical |
 | `vacuum-into` | VACUUM INTO overwrites the target file if it exists. | medium |
@@ -340,6 +346,118 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "database.sqlite:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Snowflake CLI
+
+**Pack ID:** `database.snowflake`
+
+Protects modern `snow sql` queries, files, stdin, nested sources, data, ingestion, compute, and account privileges
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `snow`
+- `Snow`
+- `SNOW`
+- `DROP`
+- `drop`
+- `TRUNCATE`
+- `truncate`
+- `DELETE`
+- `delete`
+- `UPDATE`
+- `update`
+- `ALTER`
+- `alter`
+- `GRANT`
+- `grant`
+- `REVOKE`
+- `revoke`
+- `REMOVE`
+- `remove`
+- `OVERWRITE`
+- `overwrite`
+- `EXECUTE`
+- `execute`
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `stdin-unverified` | snow sql receives SQL or a source that dcg cannot completely verify. | high |
+| `drop-database` | DROP DATABASE removes the database and every contained schema and object. | critical |
+| `drop-schema` | DROP SCHEMA removes the schema and can remove all contained objects. | critical |
+| `drop-table` | DROP TABLE removes the active table and its data. | critical |
+| `replace-database` | CREATE OR REPLACE DATABASE replaces a live database. | critical |
+| `replace-schema` | CREATE OR REPLACE SCHEMA replaces a live schema. | critical |
+| `replace-table` | CREATE OR REPLACE TABLE replaces the active table. | critical |
+| `truncate-table` | TRUNCATE TABLE removes every row from the target table. | critical |
+| `delete-all` | DELETE without a top-level WHERE clause removes every row. | critical |
+| `update-all` | UPDATE without a top-level WHERE clause modifies every row. | critical |
+| `drop-data-product` | DROP removes a live view, materialized view, or dynamic table. | high |
+| `drop-ingestion-object` | DROP removes a live stage, pipe, stream, or task. | high |
+| `drop-warehouse` | DROP WAREHOUSE removes compute used by applications, tasks, or users. | high |
+| `drop-principal` | DROP USER or DROP ROLE can break services and revoke access hierarchies. | high |
+| `drop-security-object` | DROP removes a live integration, network policy, or share. | high |
+| `drop-programmable-object` | DROP removes a file format, sequence, function, or procedure used by workloads. | medium |
+| `remove-stage-files` | REMOVE deletes files from an internal Snowflake stage. | high |
+| `pause-pipe` | ALTER PIPE pauses ingestion and can silently make downstream data stale. | high |
+| `suspend-task` | ALTER TASK SUSPEND stops scheduled execution. | high |
+| `execute-task` | EXECUTE TASK immediately starts a task run and may cascade a task graph. | high |
+| `suspend-warehouse` | ALTER WAREHOUSE SUSPEND can interrupt active or queued workloads. | high |
+| `broad-revoke` | REVOKE removes broad privileges or role membership and can break applications immediately. | high |
+| `broad-grant` | GRANT creates account-wide, all-privilege, or ACCOUNTADMIN access. | high |
+| `transfer-ownership` | GRANT OWNERSHIP transfers control and can revoke or copy existing grants. | high |
+| `alter-table-drop-column` | ALTER TABLE DROP COLUMN removes a column and its active data. | high |
+| `alter-table-swap` | ALTER TABLE SWAP WITH exchanges table identities atomically. | high |
+| `insert-overwrite` | INSERT OVERWRITE replaces the target table's current rows. | high |
+| `copy-overwrite` | COPY INTO a location with OVERWRITE = TRUE can replace exported files. | high |
+| `put-overwrite` | PUT with OVERWRITE = TRUE can replace files in an internal stage. | high |
+| `replace-live-object` | CREATE OR REPLACE replaces a live Snowflake object and may lose grants, state, or configuration. | high |
+| `bounded-delete` | DELETE mutates every row selected by its WHERE predicate. | medium |
+| `bounded-update` | UPDATE mutates every row selected by its WHERE predicate. | medium |
+| `merge-data` | MERGE can update, insert, or delete rows based on source matching. | medium |
+| `copy-into-table` | COPY INTO a table can load duplicate, corrupt, or unexpected data. | medium |
+| `rename-object` | Renaming a database, schema, or table can break fully qualified consumers. | medium |
+| `alter-column` | ALTER TABLE ALTER COLUMN can break writes and downstream consumers. | medium |
+| `warehouse-settings` | ALTER WAREHOUSE SET can create availability or cost risk. | medium |
+| `abort-query` | !abort cancels an active Snowflake query. | medium |
+| `interactive-edit` | !edit executes SQL modified in an external editor that dcg cannot inspect in advance. | high |
+| `execute-immediate` | EXECUTE IMMEDIATE runs generated SQL whose rendered semantics require explicit review. | medium |
+| `cli-object-drop-database` | snow object drop database/schema removes the object and everything inside it. | critical |
+| `cli-object-drop` | snow object drop permanently removes a Snowflake object. | high |
+| `cli-stage-drop` | snow stage drop removes the stage; internal staged files are not recoverable. | high |
+| `cli-stage-remove` | snow stage remove deletes files from a stage. | high |
+| `cli-app-teardown` | snow app teardown drops the Native App and (with --cascade) its owned objects. | high |
+| `cli-app-version-drop` | snow app version drop removes a Native App version definition. | medium |
+| `cli-snowpark-drop` | snow snowpark drop removes a deployed procedure or function from Snowflake. | medium |
+| `cli-spcs-drop` | snow spcs ... drop removes container services infrastructure. | high |
+| `cli-dbt-drop` | snow dbt drop removes a dbt project object from Snowflake. | medium |
+| `cli-dcm-drop` | snow dcm drop removes a DCM project object from Snowflake. | medium |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "database.snowflake:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "database.snowflake:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

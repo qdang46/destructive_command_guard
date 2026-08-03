@@ -310,6 +310,9 @@ pub fn validate_code(input: &str, expected: &str) -> bool {
 ///
 /// This is a critical security check. If stdin is not a TTY, we're likely
 /// receiving piped input from an AI agent, and interactive mode MUST be disabled.
+///
+/// # Errors
+/// Returns [`NotAvailableReason`] describing why interactive mode cannot be used.
 pub fn check_interactive_available(config: &InteractiveConfig) -> Result<(), NotAvailableReason> {
     let stdin_is_tty = io::stdin().is_terminal();
     let ci_environment = is_ci_environment();

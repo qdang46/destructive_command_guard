@@ -137,6 +137,7 @@ Protects against destructive SCP operations like overwrites to system paths.
 Commands containing these keywords are checked against this pack:
 
 - `scp`
+- `pscp`
 
 ### Safe Patterns (Allowed)
 
@@ -156,6 +157,9 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `scp-destination-unverified` | scp/pscp has a runtime-dependent or malformed destination that cannot be verified before execution. | high |
+| `scp-relative-traversal` | scp/pscp uses parent-directory traversal in a remote relative destination. | high |
+| `scp-to-windows-system` | scp/pscp targets a protected Windows system directory on the remote host. | critical |
 | `scp-recursive-root` | scp -r to root (/) is extremely dangerous. | critical |
 | `scp-to-etc` | scp to /etc/ can overwrite system configuration. | high |
 | `scp-to-var` | scp to /var/ can overwrite system data. | high |

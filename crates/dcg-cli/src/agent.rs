@@ -31,6 +31,11 @@
 //!   symlinked to it for backward compatibility).
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
+//! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
+//!   hook subprocess per its hook contract. Posit Assistant reads
+//!   Claude-Code-compatible `PreToolUse` hooks from
+//!   `~/.posit/assistant/settings.json`; the `pa` terminal client is also
+//!   recognized as a parent-process name.
 //!
 //! # Usage
 //!
@@ -87,6 +92,12 @@ pub enum Agent {
     /// earendil-works Pi coding agent (`pi`). Injects `PI_CODING_AGENT=true`
     /// into the environment of the subprocesses it spawns.
     Pi,
+    /// Posit Assistant (Posit Software, PBC), spanning the Positron/RStudio
+    /// extension and the `pa` terminal client. Reads Claude-Code-compatible
+    /// `PreToolUse` hooks from `~/.posit/assistant/settings.json` and sets
+    /// `PA_PROJECT_DIR=<workspace root>` in hook subprocesses.
+    /// See <https://positron.posit.co/assistant/>.
+    PositAssistant,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -113,6 +124,7 @@ impl Agent {
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
             Self::Pi => "pi",
+            Self::PositAssistant => "posit-assistant",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -135,6 +147,7 @@ impl Agent {
                 | Self::Grok
                 | Self::Antigravity
                 | Self::Pi
+                | Self::PositAssistant
         )
     }
 
@@ -157,6 +170,7 @@ impl Agent {
     /// - `"codex"`, `"codex-cli"`, `"codex_cli"` -> `CodexCli`
     /// - `"gemini"`, `"gemini-cli"`, `"gemini_cli"` -> `GeminiCli`
     /// - `"cursor"`, `"cursor-ide"`, `"cursor_ide"` -> `CursorIde`
+    /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -175,6 +189,7 @@ impl Agent {
             "grok" | "grokcli" | "grokbuild" | "xai" | "xaigrok" => Self::Grok,
             "agy" | "antigravity" | "antigravitycli" => Self::Antigravity,
             "pi" | "picli" | "picodingagent" => Self::Pi,
+            "positassistant" | "posit" | "pa" => Self::PositAssistant,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -196,6 +211,7 @@ impl fmt::Display for Agent {
             Self::Grok => write!(f, "Grok (xAI)"),
             Self::Antigravity => write!(f, "Antigravity CLI"),
             Self::Pi => write!(f, "Pi"),
+            Self::PositAssistant => write!(f, "Posit Assistant"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -542,19 +558,6 @@ fn detect_from_environment() -> Option<DetectionResult> {
             Some("GROK_HOOK_EVENT".to_string()),
         ));
     }
-
-    // Antigravity CLI (`agy`) detection. `agy` exports
-    // `ANTIGRAVITY_CONVERSATION_ID=<uuid>` into the environment of the
-    // subprocesses it spawns (confirmed in the `agy` binary: the format
-    // string `ANTIGRAVITY_CONVERSATION_ID=%s`). This is the canonical session
-    // marker, mirroring CLAUDE_SESSION_ID / GROK_SESSION_ID.
-    if std::env::var("ANTIGRAVITY_CONVERSATION_ID").is_ok() {
-        return Some(DetectionResult::new(
-            Agent::Antigravity,
-            DetectionMethod::Environment,
-            Some("ANTIGRAVITY_CONVERSATION_ID".to_string()),
-        ));
-    }
     if std::env::var("GROK_WORKSPACE_ROOT").is_ok() {
         return Some(DetectionResult::new(
             Agent::Grok,
@@ -585,6 +588,21 @@ fn detect_from_environment() -> Option<DetectionResult> {
             Agent::Pi,
             DetectionMethod::Environment,
             Some("PI_CODING_AGENT".to_string()),
+        ));
+    }
+
+    // Posit Assistant detection. Its hook contract sets
+    // `PA_PROJECT_DIR=<workspace root>` in every hook subprocess, which is what
+    // dcg sees when invoked as a `PreToolUse` hook. Presence-only, like the
+    // markers above. Deliberately checked LAST: the variable describes the
+    // surrounding workspace rather than the direct caller, so any agent that
+    // names itself explicitly (e.g. a Claude Code hook running in a terminal
+    // Posit Assistant spawned) must win.
+    if std::env::var("PA_PROJECT_DIR").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::PositAssistant,
+            DetectionMethod::Environment,
+            Some("PA_PROJECT_DIR".to_string()),
         ));
     }
 
@@ -805,6 +823,9 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "pi" | "pi-cli" => Some(Agent::Pi),
+        // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
+        // exact-match table is what keeps those from misclassifying.
+        "pa" | "posit-assistant" => Some(Agent::PositAssistant),
         _ => None,
     }
 }
@@ -852,6 +873,7 @@ mod tests {
         assert_eq!(Agent::Grok.config_key(), "grok");
         assert_eq!(Agent::Antigravity.config_key(), "antigravity");
         assert_eq!(Agent::Pi.config_key(), "pi");
+        assert_eq!(Agent::PositAssistant.config_key(), "posit-assistant");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -905,6 +927,12 @@ mod tests {
         assert_eq!(Agent::from_name("pi-cli"), Agent::Pi);
         assert_eq!(Agent::from_name("pi_cli"), Agent::Pi);
         assert_eq!(Agent::from_name("PI_CODING_AGENT"), Agent::Pi);
+        assert_eq!(Agent::from_name("posit-assistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("posit_assistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("PositAssistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("posit"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("pa"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("PA"), Agent::PositAssistant);
 
         // Custom agents
         assert_eq!(
@@ -927,6 +955,7 @@ mod tests {
         assert_eq!(format!("{}", Agent::Grok), "Grok (xAI)");
         assert_eq!(format!("{}", Agent::Antigravity), "Antigravity CLI");
         assert_eq!(format!("{}", Agent::Pi), "Pi");
+        assert_eq!(format!("{}", Agent::PositAssistant), "Posit Assistant");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -945,6 +974,7 @@ mod tests {
         assert!(Agent::Grok.is_known());
         assert!(Agent::Antigravity.is_known());
         assert!(Agent::Pi.is_known());
+        assert!(Agent::PositAssistant.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
     }
@@ -1028,6 +1058,24 @@ mod tests {
             agent_from_process_name("/home/user/.local/bin/pi"),
             Some(Agent::Pi)
         );
+        assert_eq!(agent_from_process_name("pa"), Some(Agent::PositAssistant));
+        assert_eq!(
+            agent_from_process_name("posit-assistant"),
+            Some(Agent::PositAssistant)
+        );
+        assert_eq!(
+            agent_from_process_name("/usr/local/bin/pa"),
+            Some(Agent::PositAssistant)
+        );
+        assert_eq!(
+            agent_from_process_name("pa.exe"),
+            Some(Agent::PositAssistant)
+        );
+        // Wrapper-style invocation of a script-hosted client.
+        assert_eq!(
+            agent_from_process_name("node /usr/local/lib/node_modules/pa"),
+            Some(Agent::PositAssistant)
+        );
     }
 
     #[test]
@@ -1080,6 +1128,17 @@ mod tests {
         assert_eq!(agent_from_process_name("pip3"), None);
         assert_eq!(agent_from_process_name("xpi"), None);
         assert_eq!(agent_from_process_name("pi-helper"), None);
+        // "pa" is even shorter and a common prefix; only the exact basename
+        // (or "posit-assistant") may match.
+        assert_eq!(agent_from_process_name("pacman"), None);
+        assert_eq!(agent_from_process_name("pactl"), None);
+        assert_eq!(agent_from_process_name("pass"), None);
+        assert_eq!(agent_from_process_name("patch"), None);
+        assert_eq!(agent_from_process_name("panic"), None);
+        assert_eq!(agent_from_process_name("pa-helper"), None);
+        assert_eq!(agent_from_process_name("xpa"), None);
+        assert_eq!(agent_from_process_name("posit"), None);
+        assert_eq!(agent_from_process_name("posit-assistant-helper"), None);
     }
 
     #[test]
@@ -1239,9 +1298,17 @@ mod env_tests {
         "GROK_WORKSPACE_ROOT",
         "ANTIGRAVITY_CONVERSATION_ID",
         "PI_CODING_AGENT",
+        "PA_PROJECT_DIR",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        with_env_vars(&[(key, value)], f)
+    }
+
+    fn with_env_vars<F, R>(vars: &[(&str, &str)], f: F) -> R
     where
         F: FnOnce() -> R,
     {
@@ -1264,8 +1331,10 @@ mod env_tests {
             for &k in AGENT_ENV_VARS {
                 std::env::remove_var(k);
             }
-            // Set the test env var
-            std::env::set_var(key, value);
+            // Set the test env vars
+            for &(key, value) in vars {
+                std::env::set_var(key, value);
+            }
         }
 
         // Run test
@@ -1274,10 +1343,10 @@ mod env_tests {
         // SAFETY: See above
         unsafe {
             // Clean up - restore original values
-            std::env::remove_var(key);
             for (k, v) in saved {
-                if let Some(val) = v {
-                    std::env::set_var(k, val);
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
                 }
             }
         }
@@ -1463,6 +1532,50 @@ mod env_tests {
             assert_eq!(result.method, DetectionMethod::Environment);
             assert_eq!(result.matched_value, Some("PI_CODING_AGENT".to_string()));
         });
+    }
+
+    #[test]
+    fn test_detect_posit_assistant_project_dir_env() {
+        // `PA_PROJECT_DIR` is the marker dcg actually sees: Posit Assistant's
+        // hook contract sets it in every hook subprocess.
+        with_env_var("PA_PROJECT_DIR", "/home/user/project", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::PositAssistant);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("PA_PROJECT_DIR".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_posit_assistant_env_loses_to_explicit_agent_markers() {
+        // `PA_PROJECT_DIR` describes the surrounding workspace, not the direct
+        // caller: another agent can invoke dcg from inside a Posit Assistant
+        // workspace (e.g. a Claude Code hook in a spawned terminal). An agent
+        // that identifies itself explicitly must win, so `PA_PROJECT_DIR` is
+        // checked last among the env markers.
+        with_env_vars(
+            &[
+                ("PA_PROJECT_DIR", "/home/user/project"),
+                ("CLAUDE_CODE", "1"),
+            ],
+            || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::ClaudeCode);
+            },
+        );
+
+        // Pi is the marker checked immediately before Posit Assistant, so this
+        // pins "last", not merely "after Claude Code".
+        with_env_vars(
+            &[
+                ("PA_PROJECT_DIR", "/home/user/project"),
+                ("PI_CODING_AGENT", "true"),
+            ],
+            || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::Pi);
+            },
+        );
     }
 
     #[test]

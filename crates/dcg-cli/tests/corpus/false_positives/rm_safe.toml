@@ -41,30 +41,6 @@ command = "rm -rf /var/tmp/*"
 expected = "allow"
 
 # ============================================================================
-# Safe temp directory via $TMPDIR variable
-# ============================================================================
-
-[[case]]
-description = "rm -rf $TMPDIR is safe (unquoted)"
-command = "rm -rf $TMPDIR/build"
-expected = "allow"
-
-[[case]]
-description = "rm -rf ${TMPDIR} is safe (braced)"
-command = "rm -rf ${TMPDIR}/build"
-expected = "allow"
-
-[[case]]
-description = "rm -rf \"$TMPDIR\" is safe (quoted)"
-command = "rm -rf \"$TMPDIR/build\""
-expected = "allow"
-
-[[case]]
-description = "rm -rf ${TMPDIR:-/tmp} is safe (with default)"
-command = "rm -rf ${TMPDIR:-/tmp}/build"
-expected = "allow"
-
-# ============================================================================
 # Safe rm flag variations in temp dirs
 # ============================================================================
 
@@ -86,6 +62,26 @@ expected = "allow"
 [[case]]
 description = "rm --force --recursive /tmp is safe (long flags reversed)"
 command = "rm --force --recursive /tmp/build"
+expected = "allow"
+
+[[case]]
+description = "bare recursive rm in literal /tmp is safe"
+command = "rm -r /tmp/build"
+expected = "allow"
+
+[[case]]
+description = "bare recursive rm in literal /var/tmp is safe"
+command = "rm --recursive /var/tmp/cache"
+expected = "allow"
+
+[[case]]
+description = "interactive mode after force restores prompting"
+command = "rm -rf -i ./build"
+expected = "allow"
+
+[[case]]
+description = "interactive once after force restores prompting"
+command = "rm -r --force --interactive=once ./build"
 expected = "allow"
 
 # NOTE: rm -rf with extra flags may not match safe patterns

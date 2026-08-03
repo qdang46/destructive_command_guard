@@ -664,7 +664,7 @@ fn fetch_latest_version() -> Result<VersionCheckResult, VersionCheckError> {
         current_version: current.to_string(),
         latest_version,
         update_available,
-        release_url: release_url_for_tag(latest.version()),
+        release_url: release_url_for_version(latest.version()),
         release_notes,
         checked_at,
     };
@@ -731,12 +731,12 @@ fn truncate_release_notes(body: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
-fn release_url_for_tag(tag: &str) -> String {
-    let trimmed = tag.trim();
-    if trimmed.is_empty() {
+fn release_url_for_version(version: &str) -> String {
+    let bare_version = version.trim().trim_start_matches('v');
+    if bare_version.is_empty() {
         format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest")
     } else {
-        format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/tag/{trimmed}")
+        format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/tag/v{bare_version}")
     }
 }
 
@@ -938,7 +938,9 @@ mod tests {
         let mut builder = Release::builder();
         builder
             .name(version)
-            .version(version)
+            // self_update 1.0 validates custom Release values as bare SemVer;
+            // forge adapters preserve the raw tag only in the display name.
+            .version(version.trim_start_matches('v'))
             .date("2026-01-01T00:00:00Z");
         builder.build().expect("valid test release")
     }
@@ -968,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_latest_release_with_v_prefix() {
+    fn test_select_latest_release_with_backend_normalized_v_tags() {
         let releases = vec![
             make_release("v1.0.0"),
             make_release("v2.1.0"),
@@ -976,25 +978,26 @@ mod tests {
         ];
 
         let selected = select_latest_release(&releases).expect("select");
-        assert_eq!(selected.version(), "v2.1.0");
+        assert_eq!(selected.version(), "2.1.0");
+        assert_eq!(selected.name(), "v2.1.0");
     }
 
     #[test]
-    fn test_release_url_for_tag_uses_exact_tag() {
+    fn test_release_url_for_version_uses_canonical_v_tag() {
         assert_eq!(
-            release_url_for_tag("v2.1.0"),
+            release_url_for_version("v2.1.0"),
             "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v2.1.0"
         );
         assert_eq!(
-            release_url_for_tag("2.1.0"),
-            "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/2.1.0"
+            release_url_for_version("2.1.0"),
+            "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v2.1.0"
         );
     }
 
     #[test]
-    fn test_release_url_for_tag_empty_uses_latest() {
+    fn test_release_url_for_version_empty_uses_latest() {
         assert_eq!(
-            release_url_for_tag(""),
+            release_url_for_version(""),
             "https://github.com/Dicklesworthstone/destructive_command_guard/releases/latest"
         );
     }

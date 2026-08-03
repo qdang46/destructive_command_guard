@@ -5,14 +5,13 @@ mod common;
 use chrono::Utc;
 use common::db::TestDb;
 use common::logging::init_test_logging;
-use dcg_cli::history::{CommandEntry, Outcome};
-use fsqlite_types::value::SqliteValue;
+use dcg_cli::history::{CommandEntry, Outcome, SqliteValue};
 
 fn sv_to_string(v: &SqliteValue) -> String {
     match v {
-        SqliteValue::Text(s) => s.to_string(),
+        SqliteValue::Text(s) => s.clone(),
         SqliteValue::Integer(i) => i.to_string(),
-        SqliteValue::Float(f) => f.to_string(),
+        SqliteValue::Real(f) => f.to_string(),
         SqliteValue::Null => String::new(),
         SqliteValue::Blob(_) => String::new(),
     }

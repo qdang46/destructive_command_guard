@@ -120,13 +120,15 @@ pub fn evaluate_with_mode_and_packs(
         .as_ref()
         .and_then(|m| m.pack_id.as_deref())
         .and_then(|id| {
-            registry.get(id).map(|pack| {
-                // Pattern-level Tier-A overrides pack default. We don't have
-                // direct access to the matched DestructivePattern from the
-                // result, only the rule name. For now use pack default —
-                // Phase 2 will plumb the pattern reference through.
-                pack.default_effects.to_vec()
-            })
+            if registry.get(id).is_some() {
+                // The upstream 0.9.x `Pack` no longer carries a
+                // `default_effects` field. Fall back to the conservative
+                // Tier-B default (Write + Irreversible) for any pack whose
+                // matched rule isn't explicitly tagged.
+                Some(crate::packs::DEFAULT_PACK_EFFECTS.to_vec())
+            } else {
+                None
+            }
         })
         .unwrap_or_default();
 

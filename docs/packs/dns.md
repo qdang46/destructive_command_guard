@@ -156,6 +156,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | nsupdate receives indirect input that dcg cannot statically verify. | high |
 | `dns-nsupdate-delete` | nsupdate delete commands remove DNS records. | high |
 | `dns-nsupdate-local` | nsupdate -l applies local updates which can modify DNS records. | medium |
 | `dns-dig-zone-transfer` | dig AXFR/IXFR zone transfers can exfiltrate full zone data. | medium |

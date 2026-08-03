@@ -116,24 +116,17 @@ impl AllowOnceEntry {
 
     #[must_use]
     pub fn matches_scope(&self, cwd: &Path) -> bool {
+        // Compare canonicalized paths: on macOS `/tmp` is a symlink to
+        // `/private/tmp`, and tempdirs under `/var` resolve through
+        // `/private/var`. Raw `Path` equality would miss a scope match even
+        // though the entry and the hook process refer to the same directory.
+        fn canonical(p: &Path) -> std::path::PathBuf {
+            std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+        }
         let scope_path = Path::new(&self.scope_path);
         match self.scope_kind {
-            AllowOnceScopeKind::Cwd => {
-                // On macOS, /var is a symlink to /private/var, so direct
-                // comparison can fail. Canonicalize both paths to normalize.
-                let cwd_canonical =
-                    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-                let scope_canonical =
-                    std::fs::canonicalize(scope_path).unwrap_or_else(|_| scope_path.to_path_buf());
-                cwd == scope_path || cwd_canonical == scope_canonical
-            }
-            AllowOnceScopeKind::Project => {
-                let cwd_canonical =
-                    std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-                let scope_canonical =
-                    std::fs::canonicalize(scope_path).unwrap_or_else(|_| scope_path.to_path_buf());
-                cwd.starts_with(scope_path) || cwd_canonical.starts_with(&scope_canonical)
-            }
+            AllowOnceScopeKind::Cwd => canonical(cwd) == canonical(scope_path),
+            AllowOnceScopeKind::Project => canonical(cwd).starts_with(canonical(scope_path)),
         }
     }
 }
@@ -254,6 +247,7 @@ impl PendingExceptionStore {
         command: &str,
         cwd: &str,
         reason: &str,
+
         redaction: &RedactionConfig,
         single_use: bool,
         source: Option<String>,

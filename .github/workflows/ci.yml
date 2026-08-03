@@ -1,7 +1,4 @@
 name: ci
-# - Full heredoc pipeline: 20ms panic
-# - Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)
-# Full heredoc pipeline benchmark exceeds 20ms budget
 
 on:
   pull_request:
@@ -27,9 +24,8 @@ jobs:
         run: |
           ruby -e 'require "yaml"; config = YAML.load_file(".github/dependabot.yml"); puts "Dependabot config:"; puts config.inspect'
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-06-06
           components: rustfmt, clippy
 
       - name: Install cargo-nextest
@@ -185,9 +181,8 @@ jobs:
       - name: Enable git long paths
         run: git config --global core.longpaths true
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-06-06
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
@@ -324,12 +319,12 @@ jobs:
           ./scripts/e2e_test.ps1 -Verbose -Artifacts "$env:RUNNER_TEMP/e2e-artifacts"
           if ($LASTEXITCODE -ne 0) { throw "e2e_test.ps1 reported failures (exit $LASTEXITCODE)" }
 
-      - name: History DB concurrency / stale-lock stress (real-Windows fsqlite)
+      - name: History DB concurrency / stale-lock stress (real Windows SQLite)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Validates the fsqlite history DB on a REAL Windows runtime (the
-          # cfg(not(unix)) WAL/lock fallback path): N concurrent writer PROCESSES
+          # Validates the bundled SQLite history DB on a REAL Windows runtime:
+          # N concurrent writer PROCESSES
           # must not corrupt the DB and a killed writer must not wedge later runs.
           # (History itself is best-effort telemetry — a few records may drop under
           # extreme contention by design; the test asserts no-corruption + no-wedge
@@ -420,9 +415,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-06-06
+          # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
+          # because libFuzzer + AddressSanitizer require statically-linked
+          # libc; without this target installed, the build fails with
+          # "sanitizer is incompatible with statically linked libc" and
+          # "can't find crate for `core`".
           targets: x86_64-unknown-linux-musl
 
       - name: Install cargo-fuzz
@@ -441,10 +440,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-fuzz-smoke-
 
-      - name: Run fuzz smoke test
+      - name: Run heredoc fuzz smoke
         run: |
           cd fuzz
-          cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=60
+          # Build/run the fuzzer for the gnu host target. AddressSanitizer is
+          # incompatible with musl's statically-linked libc (crt-static) and
+          # fails with "sanitizer is incompatible with statically linked libc";
+          # the default x86_64-unknown-linux-gnu (dynamic glibc) is the
+          # supported ASan target.
+          cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=30
 
   coverage:
     runs-on: ubuntu-latest
@@ -452,9 +456,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-06-06
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -556,13 +559,13 @@ jobs:
 
           echo "Coverage thresholds:"
           echo "  overall >= ${OVERALL_MIN}%"
-          echo "  crates/dcg-cli/src/evaluator.rs >= ${EVALUATOR_MIN}%"
-          echo "  crates/dcg-cli/src/hook.rs >= ${HOOK_MIN}%"
+          echo "  src/evaluator.rs >= ${EVALUATOR_MIN}%"
+          echo "  src/hook.rs >= ${HOOK_MIN}%"
           echo ""
           echo "Observed coverage:"
           printf "  overall=%.2f%%\n" "$overall"
-          printf "  crates/dcg-cli/src/evaluator.rs=%.2f%%\n" "$evaluator"
-          printf "  crates/dcg-cli/src/hook.rs=%.2f%%\n" "$hook"
+          printf "  src/evaluator.rs=%.2f%%\n" "$evaluator"
+          printf "  src/hook.rs=%.2f%%\n" "$hook"
 
           echo "coverage_overall=${overall}" >> "$GITHUB_OUTPUT"
           echo "coverage_evaluator=${evaluator}" >> "$GITHUB_OUTPUT"
@@ -578,18 +581,18 @@ jobs:
           fi
 
           if [ -z "$evaluator" ] || [ "$evaluator" = "null" ]; then
-            echo "::error::Failed to parse crates/dcg-cli/src/evaluator.rs coverage from coverage.json"
+            echo "::error::Failed to parse src/evaluator.rs coverage from coverage.json"
             failures=$((failures + 1))
           elif awk -v v="$evaluator" -v min="$EVALUATOR_MIN" 'BEGIN{exit !(v+0 < min+0)}'; then
-            printf "::error::crates/dcg-cli/src/evaluator.rs coverage %.2f%% is below ${EVALUATOR_MIN}%%\n" "$evaluator"
+            printf "::error::src/evaluator.rs coverage %.2f%% is below ${EVALUATOR_MIN}%%\n" "$evaluator"
             failures=$((failures + 1))
           fi
 
           if [ -z "$hook" ] || [ "$hook" = "null" ]; then
-            echo "::error::Failed to parse crates/dcg-cli/src/hook.rs coverage from coverage.json"
+            echo "::error::Failed to parse src/hook.rs coverage from coverage.json"
             failures=$((failures + 1))
           elif awk -v v="$hook" -v min="$HOOK_MIN" 'BEGIN{exit !(v+0 < min+0)}'; then
-            printf "::error::crates/dcg-cli/src/hook.rs coverage %.2f%% is below ${HOOK_MIN}%%\n" "$hook"
+            printf "::error::src/hook.rs coverage %.2f%% is below ${HOOK_MIN}%%\n" "$hook"
             failures=$((failures + 1))
           fi
 
@@ -607,9 +610,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-06-06
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -727,9 +728,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-06-06
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -761,7 +760,7 @@ jobs:
           # - Pattern match: 1ms panic
           # - Heredoc extract: 2ms panic
           # - Full heredoc pipeline: 20ms panic
-          # - Hook fail-open deadline: 200ms
+          # - Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)
           echo "## Performance Budget Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
@@ -802,9 +801,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-06-06
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -878,9 +875,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-06-06
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -905,7 +900,7 @@ jobs:
         id: bats
         run: |
           set +e
-          bats --tap crates/dcg-cli/tests/install/*.bats 2>&1 | tee bats-output.log
+          bats --tap tests/install/*.bats 2>&1 | tee bats-output.log
           EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
@@ -940,9 +935,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-06-06
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -1079,9 +1072,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-06-06
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -1157,9 +1148,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
-        with:
-          toolchain: nightly-2026-06-06
+      - uses: dtolnay/rust-toolchain@nightly
 
       - name: Cache cargo registry and target
         uses: actions/cache@v6
@@ -1313,6 +1302,51 @@ jobs:
           echo "::error::Perf regression gate failed (exit code ${{ steps.perf.outputs.exit_code }}). See 'perf-regression-artifacts' and the step summary."
           exit 1
 
+      # ABSOLUTE latency gate (#245). The comparison above is a RELATIVE
+      # ratchet against a recorded baseline: if a change makes every case
+      # uniformly slower, the baseline is simply re-recorded and the product's
+      # fixed hook deadline is never consulted. That is exactly how a ~215ms
+      # per-invocation cost shipped against a 200ms budget and turned ordinary
+      # commands into fail-closed review prompts for every user. This gate
+      # asserts cold p95 against the SHIPPED default budget with a hermetic
+      # HOME and no DCG_* overrides, so it fails on absolute cost regardless of
+      # what the baseline says.
+      - name: Absolute hook-latency gate vs shipped default budget
+        run: |
+          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
+          if [ -z "$BUDGET_MS" ]; then
+            echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
+            exit 1
+          fi
+          echo "Shipped default hook budget: ${BUDGET_MS}ms"
+          python3 scripts/perf_baseline.py \
+            --bin target/release/dcg \
+            --skip-trace --warmup 5 --runs 40 \
+            --assert-budget-ms "$BUDGET_MS" \
+            --assert-margin-pct 50 \
+            --output perf-latency-gate.json
+
+      - name: Harness protocol matrix (real binary, every agent wire format)
+        run: |
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq
+          bash scripts/e2e_harness_matrix.sh --binary target/release/dcg
+
+      - name: Local installer + hook e2e (public release path)
+        # Verifies the LATEST PUBLISHED artifact for this runner's platform
+        # still installs and guards commands. Non-blocking: it exercises the
+        # published release, not this PR's code, so a release-side problem must
+        # not block unrelated PRs — it surfaces as a warning annotation.
+        # GH_TOKEN is required or `gh release view` cannot resolve the version
+        # and the step would silently no-op.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if bash scripts/e2e_fleet_install.sh --local-only; then
+            echo "Published-release install path verified on this runner."
+          else
+            echo "::warning::local installer e2e failed against the published release — check release assets, installer target triples, and checksum/signature sidecars"
+          fi
+
   # Deep suite: fuzzing (scheduled or manual only)
   fuzz:
     runs-on: ubuntu-latest
@@ -1321,9 +1355,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          toolchain: nightly-2026-06-06
           components: llvm-tools-preview
           # See fuzz-smoke job above — cargo-fuzz needs the musl target to
           # link libFuzzer + AddressSanitizer with a statically-linked libc.
@@ -1364,3 +1397,103 @@ jobs:
           path: fuzz/artifacts/
           retention-days: 30
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Published-release install matrix.
+  #
+  # Every other job tests THIS tree. Nothing verifies that the artifact users
+  # actually download still exists, installs, and guards commands on a clean
+  # machine of each supported OS. That is how #238 happened: macOS artifacts
+  # were missing for six releases while `dcg update` reported no update
+  # available, so Mac users silently sat on a pre-0.7.0 build with a known
+  # security fix missing.
+  #
+  # These runners are stock, unconfigured machines — the closest thing to a
+  # real new user that CI can offer. Scheduled + manual only: it exercises the
+  # published release, not the commit under test.
+  # ---------------------------------------------------------------------------
+  published-release-matrix:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            shell: bash
+          - os: macos-latest        # Apple Silicon
+            shell: bash
+          - os: macos-15-intel      # x86_64 macOS
+            shell: bash
+          - os: windows-latest
+            shell: pwsh
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install from the published release and verify it guards (Unix)
+        if: matrix.shell == 'bash'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/e2e_fleet_install.sh --local-only
+
+      # The Windows path uses the README's scriptblock invocation, which is
+      # what users actually run (and what a default Restricted ExecutionPolicy
+      # requires). Assertions mirror the Unix probe.
+      - name: Install from the published release and verify it guards (Windows)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
+            Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
+          }
+          $env:DCG_SELF_HEAL_HOOK = '0'
+          $env:DCG_HISTORY_DISABLED = '1'
+
+          $version = (gh release view -R ${{ github.repository }} --json tagName --jq .tagName)
+          if (-not $version) { throw "could not resolve the latest published release" }
+          Write-Output "Testing published release $version"
+
+          $dest = Join-Path $env:RUNNER_TEMP 'dcg-bin'
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          $src = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1"
+          & ([scriptblock]::Create($src)) -Version $version -Dest $dest -Verify -NoConfigure
+
+          $bin = Join-Path $dest 'dcg.exe'
+          if (-not (Test-Path $bin)) { throw "installer produced no dcg.exe" }
+          $got = (& $bin --version 2>&1 | Select-Object -First 1) -join ''
+          if ($got -notlike "*$($version.TrimStart('v'))*") {
+            throw "installed binary reports '$got', expected $version"
+          }
+
+          # The guard must actually deny, and must stay silent on safe input.
+          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}'
+          $out = ($deny | & $bin 2>$null | Out-String)
+          if ($out -notmatch '"permissionDecision"\s*:\s*"deny"') {
+            throw "published Windows binary did NOT deny 'git reset --hard'"
+          }
+          $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
+          $out = ($allow | & $bin 2>$null | Out-String).Trim()
+          if (-not [string]::IsNullOrEmpty($out)) {
+            throw "published Windows binary emitted output for a safe command"
+          }
+
+          # Native-Windows packs must be default-ON (docs/windows.md).
+          $ps = '{"tool_name":"PowerShell","tool_input":{"command":"Remove-Item -Recurse -Force C:\\data"}}'
+          $out = ($ps | & $bin 2>$null | Out-String)
+          if ($out -notmatch 'deny|block') {
+            throw "windows.filesystem is not default-on in the published build"
+          }
+
+          # #245 guard: ordinary commands must reach a verdict on the stock budget.
+          foreach ($c in @('echo hi 2>NUL', 'cp report.txt backup.txt', 'rm ./scratch.txt')) {
+            $p = '{"tool_name":"Bash","tool_input":{"command":"' + $c.Replace('\','\\').Replace('"','\"') + '"}}'
+            $o = ($p | & $bin 2>$null | Out-String)
+            if ($o -match 'could not complete safety evaluation' -or $o -match '"ask"') {
+              throw "published build returned an indeterminate verdict for '$c' on the stock budget (#245 class)"
+            }
+          }
+          Write-Output "Published release verified on native Windows."

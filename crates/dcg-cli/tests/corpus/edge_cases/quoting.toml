@@ -171,6 +171,23 @@ description = "sed with quoted expression is safe"
 command = "sed 's/old/new/g' file.txt"
 expected = "allow"
 
+[[case]]
+description = "sed substitution containing >/ is not a shell redirect (#198)"
+command = "echo a=b | sed -E 's/=.*/=<set>/'"
+expected = "allow"
+
+[[case]]
+description = "sed e command executes its program and must stay visible"
+command = "sed 'e rm -rf /' file.txt"
+expected = "deny"
+rule_id = "core.filesystem:rm-rf-root-home"
+
+[[case]]
+description = "sed substitution e flag executes the replacement as a command"
+command = "sed -e 's|x|rm -rf /|e' file.txt"
+expected = "deny"
+rule_id = "core.filesystem:rm-rf-root-home"
+
 # ============================================================================
 # Complex command line patterns
 # ============================================================================

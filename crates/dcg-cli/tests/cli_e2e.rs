@@ -1667,7 +1667,22 @@ mod config_tests {
         let claude_dir = home_dir.join(".claude");
         std::fs::create_dir_all(&claude_dir).expect("claude dir");
         let settings_path = claude_dir.join("settings.json");
-        std::fs::write(&settings_path, "{}").expect("write settings");
+        std::fs::write(
+            &settings_path,
+            r#"{
+  "theme": "dark",
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Bash|PowerShell",
+      "hooks": [
+        {"type": "command", "command": "dcg"},
+        {"type": "command", "command": "coexisting-hook"}
+      ]
+    }]
+  }
+}"#,
+        )
+        .expect("write settings");
 
         let output = Command::new(dcg_binary())
             .env_clear()
@@ -1694,8 +1709,9 @@ mod config_tests {
             .and_then(|h| h.get("PreToolUse"))
             .and_then(|arr| arr.as_array())
             .expect("PreToolUse array");
+        let expected_dcg = dcg_binary().to_string_lossy().into_owned();
         let has_dcg = hooks.iter().any(|entry| {
-            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash")
+            entry.get("matcher").and_then(|m| m.as_str()) == Some("Bash|PowerShell")
                 && entry
                     .get("hooks")
                     .and_then(|h| h.as_array())
@@ -1703,17 +1719,127 @@ mod config_tests {
                         hooks.iter().any(|hook| {
                             hook.get("command")
                                 .and_then(|c| c.as_str())
-                                .is_some_and(|c| c == "dcg")
+                                .is_some_and(|command| command.contains(&expected_dcg))
                         })
                     })
         });
-        assert!(has_dcg, "expected dcg hook to be installed");
+        assert!(
+            has_dcg,
+            "expected dcg hook to use the absolute test binary path"
+        );
+        assert_eq!(settings_json["theme"], "dark");
+        assert!(
+            hooks.iter().any(|entry| {
+                entry
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|entry_hooks| {
+                        entry_hooks.iter().any(|hook| {
+                            hook.get("command").and_then(serde_json::Value::as_str)
+                                == Some("coexisting-hook")
+                        })
+                    })
+            }),
+            "doctor --fix must preserve coexisting hooks"
+        );
 
         let config_path = xdg_config_dir.join("dcg").join("config.toml");
         let config_contents = std::fs::read_to_string(&config_path).expect("read config.toml");
         assert!(
             !config_contents.trim().is_empty(),
             "expected config.toml to be created"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_install_hook_runs_without_interactive_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join(".git")).expect(".git dir");
+
+        let binary = dcg_binary();
+        let install = Command::new(&binary)
+            .env_clear()
+            .current_dir(temp.path())
+            .args(["install", "--project"])
+            .output()
+            .expect("run project hook install");
+        assert!(
+            install.status.success(),
+            "project install failed: {}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+
+        let settings_path = temp.path().join(".claude").join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).expect("read project settings"))
+                .expect("parse project settings");
+        let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("hook command");
+        assert_ne!(command, "dcg");
+        assert!(
+            command.contains(binary.to_string_lossy().as_ref()),
+            "hook must name the exact test binary: {command}"
+        );
+
+        let mut hook = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch hook through non-interactive /bin/sh");
+        hook.stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#)
+            .expect("write hook input");
+        let output = hook.wait_with_output().expect("wait for hook");
+        assert!(
+            output.status.success(),
+            "absolute hook invocation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "safe hook invocation must remain silent"
+        );
+
+        let mut destructive_hook = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("DCG_NO_SELF_HEAL", "1")
+            .current_dir(temp.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch destructive hook check through non-interactive /bin/sh");
+        destructive_hook
+            .stdin
+            .take()
+            .expect("hook stdin")
+            .write_all(br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#)
+            .expect("write destructive hook input");
+        let destructive_output = destructive_hook
+            .wait_with_output()
+            .expect("wait for destructive hook check");
+        assert!(
+            destructive_output.status.success(),
+            "dcg denials use protocol JSON with exit 0: {}",
+            String::from_utf8_lossy(&destructive_output.stderr)
+        );
+        let denial: serde_json::Value =
+            serde_json::from_slice(&destructive_output.stdout).expect("parse denial JSON");
+        assert_eq!(
+            denial["hookSpecificOutput"]["permissionDecision"], "deny",
+            "absolute hook must actively deny a destructive command"
         );
     }
 
@@ -1880,6 +2006,9 @@ mod hook_mode_tests {
             .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            // Match the top-level hook helper: these are semantic E2E tests,
+            // while deadline behavior has deterministic unit coverage.
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
             .env("DCG_PACKS", "core.git,core.filesystem")
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -2146,6 +2275,15 @@ block = [
             "\"/bin/rm\" -rf /etc",
             "sudo \"/bin/rm\" -rf /etc",
             "FOO=1 \"/bin/rm\" -rf /etc",
+            "FOO=1 rm -rf /",
+            "FOO=1 rm -rf /etc",
+            "FOO=bar rm -rf /home/example/probe",
+            "FOO=\"bar baz\" rm -rf /home/example/probe",
+            "A=1 B=2 rm -rf /home/example/probe",
+            "  FOO=1 rm -rf /home/example/probe",
+            "FOO=1 sudo rm -rf /home/example/probe",
+            "FOO=1 dd if=/dev/zero of=/dev/sda",
+            "FOO=1 mkfs.ext4 /dev/sda1",
         ];
 
         for cmd in deny_cases {
@@ -2161,6 +2299,49 @@ block = [
 
         for cmd in allow_cases {
             assert_hook_allows(cmd);
+        }
+    }
+
+    #[test]
+    fn hook_mode_posix_control_flow_git_commands_are_blocked() {
+        for command in [
+            "for i in 1; do git reset --hard HEAD~1; done",
+            "while read -r x; do git push --force origin main; done",
+            "if true; then git reset --merge HEAD~1; fi",
+            "if git reset --hard HEAD~1; then true; fi",
+            "until git push -f origin main; do true; done",
+            "{ git branch -D stale; }",
+            "if false; then true; elif git branch --delete stale; then true; fi",
+            "if true; then { sudo git push --force origin main; }; fi",
+            "git config alias.x 'reset --hard'; if true; then git x; fi",
+            "coproc git reset --hard HEAD~1",
+            "then coproc git reset --hard HEAD~1",
+            "coproc JOB { git push --force origin main; }",
+            "coproc JOB if git reset --hard HEAD~1; then true; fi",
+            "function f { git reset --hard HEAD~1; }; f",
+            "function f if git push --force origin main; then true; fi; f",
+        ] {
+            assert_hook_denies(command);
+        }
+
+        for command in [
+            "command then git reset --hard",
+            "env then git reset --hard",
+            "sudo then git reset --hard",
+            "/usr/bin/then git reset --hard",
+            "'then' git reset --hard",
+            "then else git reset --hard",
+            "do then git reset --hard",
+            "coproc echo git reset --hard",
+            "coproc printf '%s' 'git reset --hard'",
+            "coproc JOB { echo git reset --hard; }",
+            "function f { echo git reset --hard; }; f",
+            "command coproc git reset --hard",
+            "env coproc git reset --hard",
+            "/usr/bin/coproc git reset --hard",
+            "'coproc' git reset --hard",
+        ] {
+            assert_hook_allows(command);
         }
     }
 
@@ -4309,7 +4490,7 @@ mod stats_rules_tests {
         // Don't seed any data
 
         // Create the database, then close the setup handle before the dcg
-        // subprocess opens the same FrankenSQLite file.
+        // subprocess opens the same SQLite file.
         let db = HistoryDb::open(Some(env.db_path.clone())).expect("create db");
         drop(db);
 

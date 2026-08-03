@@ -46,7 +46,6 @@ const VM_SUGGESTIONS: &[PatternSuggestion] = &[PatternSuggestion::new(
 pub fn create_pack() -> Pack {
     Pack {
         id: "windows.powershell".to_string(),
-        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
         name: "Windows PowerShell Cmdlets",
         description: "Protects against destructive PowerShell cmdlets: registry/provider deletes \
                       (`Remove-Item HKLM:\\`, `Remove-ItemProperty`, `Remove-PSDrive`), account/task \

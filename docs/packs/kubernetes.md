@@ -35,7 +35,6 @@ These patterns match safe commands that are always allowed:
 | `kubectl-get` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+get(?=\s\|$)` |
 | `kubectl-describe` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+describe(?=\s\|$)` |
 | `kubectl-logs` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s\|$)` |
-| `kubectl-dry-run` | `kubectl\b.*--dry-run(?:=(?:client\|server))?(?:\s\|$)` |
 | `kubectl-diff` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
 | `kubectl-explain` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+explain(?=\s\|$)` |
 | `kubectl-top` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+top(?=\s\|$)` |
@@ -61,6 +60,7 @@ These patterns match potentially destructive commands:
 | `scale-to-zero` | kubectl scale --replicas=0 stops all pods for the workload. | high |
 | `delete-force` | kubectl delete --force --grace-period=0 immediately removes resources without graceful shutdown. | critical |
 | `apply-force` | kubectl apply --force deletes and recreates resources, causing downtime. | high |
+| `delete-from-stdin` | kubectl delete -f - deletes every resource described by stdin without a reviewable manifest path. | high |
 | `delete-from-directory` | kubectl delete -f with directories or --recursive deletes many resources at once. | high |
 
 ### Allowlist Guidance

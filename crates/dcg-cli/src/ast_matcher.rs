@@ -10,16 +10,17 @@
 //!      │
 //!      ▼
 //! ┌─────────────────┐
-//! │   AstMatcher    │ ─── Parse error ──► ALLOW + diagnostic
-//! │   (ast-grep)    │ ─── Timeout ──► ALLOW + diagnostic
-//! │   <5ms typical  │ ─── No match ──► ALLOW
-//! │   20ms max      │ ─── Match ──► BLOCK
+//! │   AstMatcher    │ ─── Parse error ──► ERROR to bounded fallback
+//! │   (ast-grep)    │ ─── Timeout ──► ERROR to bounded fallback
+//! │   <5ms typical  │ ─── No match ──► EMPTY result to evaluator
+//! │   20ms max      │ ─── Match ──► MATCH result to evaluator
 //! └─────────────────┘
 //! ```
 //!
 //! # Error Handling
 //!
-//! All errors result in fail-open behavior (ALLOW) with diagnostics:
+//! All errors are returned to the evaluator, which applies the configured
+//! bounded-fallback or strict-block policy:
 //! - Parse errors: Language syntax not recognized
 //! - Timeouts: Pattern matching exceeded time budget
 //! - Unknown language: No grammar available
@@ -47,7 +48,7 @@ use std::time::{Duration, Instant};
 /// Tests use a much more generous budget because the full suite runs thousands
 /// of AST-heavy cases in parallel.  On a loaded CI host a worker can be
 /// descheduled for hundreds of milliseconds before it parses even this tiny
-/// fixture; production builds retain the strict 20ms fail-open ceiling below.
+/// fixture; production builds retain the strict 20ms tier-local ceiling below.
 #[cfg(not(test))]
 const AST_TIMEOUT_MS: u64 = 20;
 #[cfg(test)]
@@ -57,7 +58,7 @@ const AST_TIMEOUT_MS: u64 = 5_000;
 ///
 /// Heredoc extraction already defaults to a 1 MiB body cap; keeping the direct
 /// matcher aligned prevents library callers and fuzz targets from bypassing the
-/// same fail-open budget by invoking AST parsing on much larger inputs.
+/// same bounded parsing budget by invoking AST parsing on much larger inputs.
 const MAX_AST_INPUT_BYTES: usize = 1024 * 1024;
 
 /// Severity level for pattern matches.
@@ -115,7 +116,7 @@ pub struct PatternMatch {
     pub suggestion: Option<String>,
 }
 
-/// Error during AST matching (all errors are non-fatal, fail-open).
+/// Error during AST matching (all errors are non-fatal and returned to the evaluator).
 #[derive(Debug, Clone)]
 pub enum MatchError {
     /// Language not supported by ast-grep.
@@ -252,7 +253,8 @@ impl AstMatcher {
     /// - Parse failure
     /// - Timeout
     ///
-    /// All errors are non-fatal; callers should fail-open (allow the command).
+    /// All errors are non-fatal; callers must apply their configured bounded
+    /// fallback or strict-block policy.
     pub fn find_matches(
         &self,
         code: &str,
@@ -403,8 +405,7 @@ pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Opt
 /// Ruby `FileUtils.*` and JavaScript/TypeScript `fs.rmSync()` calls that start a
 /// source line and use a catastrophic literal target. That avoids firing on
 /// common inert cases such as comments or strings while still catching the
-/// highest-risk deletes before a fail-open timeout can turn them into false
-/// negatives.
+/// highest-risk deletes before an AST timeout can reduce analysis coverage.
 #[must_use]
 pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
     let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
@@ -763,7 +764,7 @@ fn run_ast_match_with_timeout(
 
     // We don't `join` the handle on timeout — the worker may still hold a
     // tree-sitter parser mid-iteration and joining would block the hook past
-    // its 200ms hard ceiling. The cancellation flag bounds the worker's own
+    // its wall-clock deadline. The cancellation flag bounds the worker's own
     // wall clock so a leaked handle still terminates promptly on its next
     // `check_ast_timeout` call.
     let _worker = thread::Builder::new()
@@ -1395,7 +1396,7 @@ fn precompile_perl_patterns() {
     // Perl uses the bounded regex fallback rather than ast-grep. Compile its
     // fixed patterns while constructing the matcher so first-use compilation
     // cannot consume the per-match timeout and turn a valid first Perl scan
-    // into a fail-open timeout. Construction remains covered by the caller's
+    // into a tier-local timeout. Construction remains covered by the caller's
     // absolute hook deadline.
     LazyLock::force(&PERL_SYSTEM_EXEC_LITERAL);
     LazyLock::force(&PERL_BACKTICKS_LITERAL);

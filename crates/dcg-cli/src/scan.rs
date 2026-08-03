@@ -29,8 +29,8 @@
 
 use crate::config::{Config, HeredocSettings};
 use crate::evaluator::{
-    EvaluationDecision, MatchSource, PatternMatch,
-    evaluate_command_with_pack_order_at_path_in_dialect,
+    EvaluationDecision, PatternMatch, evaluate_command_with_pack_order_at_path_in_dialect,
+    resolve_effective_mode,
 };
 use crate::normalize::ShellDialect;
 use crate::packs::{DecisionMode, REGISTRY, Severity};
@@ -495,6 +495,8 @@ pub fn evaluate_extracted_command(
         }
     }
 
+    let decision_mode = resolve_effective_mode(config, &extracted.command, &result);
+
     let Some(pattern) = result.pattern_info else {
         return Some(ScanFinding {
             file: extracted.file.clone(),
@@ -510,10 +512,10 @@ pub fn evaluate_extracted_command(
         });
     };
 
-    let (rule_id, severity, decision_mode) = resolve_severity_and_rule_id(config, &pattern);
+    let (rule_id, severity) = resolve_severity_and_rule_id(&pattern);
 
     let scan_decision = match decision_mode {
-        Some(DecisionMode::Deny) | None => ScanDecision::Deny,
+        Some(DecisionMode::Deny | DecisionMode::Ask) | None => ScanDecision::Deny,
         Some(DecisionMode::Warn) => ScanDecision::Warn,
         Some(DecisionMode::Log) => ScanDecision::Allow,
     };
@@ -545,33 +547,19 @@ pub fn evaluate_extracted_command(
     })
 }
 
-fn resolve_severity_and_rule_id(
-    config: &Config,
-    pattern: &PatternMatch,
-) -> (Option<String>, Option<Severity>, Option<DecisionMode>) {
+fn resolve_severity_and_rule_id(pattern: &PatternMatch) -> (Option<String>, Option<Severity>) {
     let Some(pack_id) = pattern.pack_id.as_deref() else {
-        return (None, None, None);
+        return (None, None);
     };
 
     let Some(pattern_name) = pattern.pattern_name.as_deref() else {
-        return (None, None, None);
+        return (None, None);
     };
 
     let rule_id = Some(format!("{pack_id}:{pattern_name}"));
-
     let severity = pattern.severity;
 
-    // Never downgrade explicit blocks; packs/AST matches are policy-controlled.
-    let mode = match pattern.source {
-        MatchSource::Pack | MatchSource::HeredocAst => {
-            config
-                .policy()
-                .resolve_mode(Some(pack_id), Some(pattern_name), severity, None)
-        }
-        MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
-    };
-
-    (rule_id, severity, Some(mode))
+    (rule_id, severity)
 }
 
 fn redact_and_truncate(command: &str, options: &ScanOptions) -> String {
@@ -1531,29 +1519,7 @@ fn contains_shell_command_substitution(s: &str) -> bool {
 }
 
 fn is_shell_assignment_word(word: &str) -> bool {
-    let Some(eq) = word.find('=') else {
-        return false;
-    };
-
-    if eq == 0 {
-        return false;
-    }
-
-    let var = &word[..eq];
-    is_shell_var_name(var)
-}
-
-fn is_shell_var_name(s: &str) -> bool {
-    let mut it = s.chars();
-    let Some(first) = it.next() else {
-        return false;
-    };
-
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-
-    it.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    crate::normalize::is_env_assignment(word)
 }
 
 fn keyword_contains_whitespace(keyword: &str) -> bool {
@@ -3109,47 +3075,294 @@ fn powershell_line_continues(line: &str) -> bool {
     escaped && !in_single
 }
 
-fn find_powershell_assignment_rhs(candidate: &str) -> Option<&str> {
+const POWERSHELL_MAX_CONTINUATION_LINES: usize = 20;
+const POWERSHELL_MAX_JOINED_CHARS: usize = 8 * 1024;
+const POWERSHELL_MAX_STATEFUL_LINES: usize = 128;
+const POWERSHELL_MAX_STATEFUL_CHARS: usize = 32 * 1024;
+
+/// Split comment-stripped PowerShell into logical statements while preserving
+/// backtick-newline continuation boundaries.
+fn powershell_logical_statements(content: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut statements = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < lines.len() {
+        let start_line = idx + 1;
+        let mut logical = String::new();
+        let mut continuation_lines = 0usize;
+
+        loop {
+            let segment = strip_powershell_inline_comment(lines[idx]).trim_end();
+            if !logical.is_empty() {
+                // Keep the dialect's actual continuation boundary. The
+                // normalizer removes the backtick-newline pair; injecting a
+                // space here would change an obfuscated token (`g` + `it`).
+                logical.push('\n');
+            }
+            logical.push_str(segment);
+
+            let continues = powershell_line_continues(segment)
+                && continuation_lines < POWERSHELL_MAX_CONTINUATION_LINES
+                && logical.len() < POWERSHELL_MAX_JOINED_CHARS;
+            idx += 1;
+            if !continues || idx >= lines.len() {
+                break;
+            }
+            continuation_lines += 1;
+        }
+
+        statements.push((start_line, logical));
+    }
+
+    statements
+}
+
+fn powershell_statement_is_executable(statement: &str) -> bool {
+    let candidate = strip_powershell_inline_comment(statement).trim();
+    if candidate.is_empty() || candidate.starts_with('#') {
+        return false;
+    }
+
+    if let Some(rhs) = crate::normalize::powershell_assignment_rhs(candidate) {
+        !rhs.is_empty() && !is_complete_powershell_string_literal(rhs)
+    } else {
+        !is_complete_powershell_string_literal(candidate)
+    }
+}
+
+/// Return true when a PowerShell member invocation such as `.Send(` appears
+/// outside ordinary quoted strings and comments.
+fn powershell_contains_member_call(statement: &str, member: &str) -> bool {
+    let bytes = statement.as_bytes();
+    let mut index = 0usize;
     let mut in_single = false;
     let mut in_double = false;
-    let mut escaped = false;
 
-    for (idx, ch) in candidate.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '`' && !in_single {
-            escaped = true;
-            continue;
-        }
-
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            '=' if !in_single && !in_double => {
-                let mut lhs = candidate[..idx].trim();
-                lhs = lhs.trim_end_matches(['+', '-', '*', '/', '%', '?']);
-                lhs = lhs.trim_end();
-
-                // Cover ordinary/scoped variables and a leading type
-                // constraint (`[string]$name`). More elaborate expressions
-                // stay conservative and are treated as executable contexts.
-                if let Some(after_type) = lhs.strip_prefix('[').and_then(|rest| {
-                    let close = rest.find(']')?;
-                    Some(rest[close + 1..].trim_start())
-                }) {
-                    lhs = after_type;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' if !in_single => {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            b'\'' if !in_double => {
+                if in_single && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
                 }
-                if lhs.starts_with('$') && !lhs.bytes().any(|byte| byte.is_ascii_whitespace()) {
-                    return Some(candidate[idx + 1..].trim());
+                in_single = !in_single;
+                index += 1;
+                continue;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                index += 1;
+                continue;
+            }
+            b'#' if !in_single && !in_double => break,
+            b'.' if !in_single && !in_double => {
+                let mut cursor = index + 1;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                let end = cursor.saturating_add(member.len());
+                if statement
+                    .get(cursor..end)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(member))
+                    && bytes
+                        .get(end)
+                        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                {
+                    cursor = end;
+                    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                        cursor += 1;
+                    }
+                    if bytes.get(cursor) == Some(&b'(') {
+                        return true;
+                    }
                 }
             }
             _ => {}
         }
+        index += 1;
+    }
+
+    false
+}
+
+/// Locate an ASCII token in executable PowerShell syntax, rather than inside an
+/// ordinary string or trailing comment.
+fn powershell_find_code_token(statement: &str, token: &str) -> Option<usize> {
+    let bytes = statement.as_bytes();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'`' if !in_single => {
+                index = (index + 2).min(bytes.len());
+                continue;
+            }
+            b'\'' if !in_double => {
+                if in_single && bytes.get(index + 1) == Some(&b'\'') {
+                    index += 2;
+                    continue;
+                }
+                in_single = !in_single;
+                index += 1;
+                continue;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                index += 1;
+                continue;
+            }
+            b'#' if !in_single && !in_double => break,
+            _ if !in_single && !in_double => {
+                let end = index.saturating_add(token.len());
+                let token_matches = statement
+                    .get(index..end)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(token));
+                let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+                let bounded_before = index == 0 || !is_word(bytes[index - 1]);
+                let bounded_after = bytes.get(end).is_none_or(|byte| !is_word(*byte));
+                if token_matches && bounded_before && bounded_after {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+        index += 1;
     }
 
     None
+}
+
+fn powershell_literal_argument_is(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.trim_start();
+    let Some(first) = candidate.as_bytes().first().copied() else {
+        return false;
+    };
+
+    if matches!(first, b'\'' | b'"') {
+        let quote = char::from(first);
+        let Some(end) = candidate[1..].find(quote) else {
+            return false;
+        };
+        return candidate[1..=end].eq_ignore_ascii_case(expected);
+    }
+
+    let end = candidate
+        .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | ')' | ';' | '|' | '&'))
+        .unwrap_or(candidate.len());
+    candidate[..end].eq_ignore_ascii_case(expected)
+}
+
+fn powershell_constructs_com_object(statement: &str, prog_id: &str) -> bool {
+    if let (Some(new_object), Some(com_object)) = (
+        powershell_find_code_token(statement, "new-object"),
+        powershell_find_code_token(statement, "-comobject"),
+    ) {
+        let same_command = new_object < com_object
+            && !statement[new_object..com_object]
+                .bytes()
+                .any(|byte| matches!(byte, b';' | b'|' | b'&' | b'\n' | b'\r'));
+        if same_command
+            && statement
+                .get(com_object + "-comobject".len()..)
+                .is_some_and(|argument| powershell_literal_argument_is(argument, prog_id))
+        {
+            return true;
+        }
+    }
+
+    for method in ["getactiveobject", "gettypefromprogid"] {
+        let Some(position) = powershell_find_code_token(statement, method) else {
+            continue;
+        };
+        let Some(arguments) = statement.get(position + method.len()..) else {
+            continue;
+        };
+        let arguments = arguments.trim_start();
+        if arguments
+            .strip_prefix('(')
+            .is_some_and(|argument| powershell_literal_argument_is(argument, prog_id))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn powershell_com_mail_flow_kind(statement: &str) -> (bool, bool) {
+    (
+        powershell_constructs_com_object(statement, "Outlook.Application"),
+        powershell_constructs_com_object(statement, "CDO.Message"),
+    )
+}
+
+/// Preserve the bounded, stateful part of an Outlook/CDO mail flow for the
+/// evaluator. A line-at-a-time scanner otherwise sees the COM object creation
+/// and the later `.Send()` independently, so neither line can prove a send.
+fn extract_powershell_mail_sequences(
+    file: &str,
+    statements: &[(usize, String)],
+    extractor_id: &str,
+) -> Vec<ExtractedCommand> {
+    let mut out = Vec::new();
+
+    for (start_index, (start_line, start_statement)) in statements.iter().enumerate() {
+        if !powershell_statement_is_executable(start_statement) {
+            continue;
+        }
+
+        let (outlook, cdo) = powershell_com_mail_flow_kind(start_statement);
+        if !outlook && !cdo {
+            continue;
+        }
+
+        // A one-line send is already emitted by the ordinary keyword-aware
+        // extractor. Only add a compound command when context crosses a
+        // physical statement boundary.
+        if powershell_contains_member_call(start_statement, "send") {
+            continue;
+        }
+
+        let mut compound = String::new();
+        let mut saw_create_item = false;
+
+        for (_, statement) in statements
+            .iter()
+            .skip(start_index)
+            .take(POWERSHELL_MAX_STATEFUL_LINES)
+        {
+            if !compound.is_empty() {
+                compound.push('\n');
+            }
+            compound.push_str(statement);
+            if compound.len() > POWERSHELL_MAX_STATEFUL_CHARS {
+                break;
+            }
+
+            saw_create_item |= powershell_contains_member_call(statement, "createitem");
+            let saw_send = powershell_contains_member_call(statement, "send");
+            if saw_send && (cdo || saw_create_item) {
+                out.push(ExtractedCommand {
+                    file: file.to_string(),
+                    line: *start_line,
+                    col: None,
+                    extractor_id: extractor_id.to_string(),
+                    command: compound,
+                    metadata: None,
+                });
+                break;
+            }
+        }
+    }
+
+    out
 }
 
 fn is_complete_powershell_string_literal(candidate: &str) -> bool {
@@ -3207,7 +3420,7 @@ fn extract_powershell_command_line(
     // A standalone string expression and a string-literal assignment are data,
     // not a command invocation. Assignments whose RHS is an invocation remain
     // executable (`$result = git ...`), so evaluate the RHS itself.
-    let candidate = if let Some(rhs) = find_powershell_assignment_rhs(candidate) {
+    let candidate = if let Some(rhs) = crate::normalize::powershell_assignment_rhs(candidate) {
         if rhs.is_empty() || is_complete_powershell_string_literal(rhs) {
             return None;
         }
@@ -3253,48 +3466,32 @@ pub fn extract_powershell_from_str(
     enabled_keywords: &[&'static str],
 ) -> Vec<ExtractedCommand> {
     const EXTRACTOR_ID: &str = "powershell.script";
-    const MAX_CONTINUATION_LINES: usize = 20;
-    const MAX_JOINED_CHARS: usize = 8 * 1024;
 
     let stripped = strip_powershell_block_comments(content);
     let mut out = Vec::new();
-    let lines: Vec<&str> = stripped.lines().collect();
-    let mut idx = 0usize;
-
-    while idx < lines.len() {
-        let start_line = idx + 1;
-        let mut logical = String::new();
-        let mut continuation_lines = 0usize;
-
-        loop {
-            let segment = strip_powershell_inline_comment(lines[idx]).trim_end();
-            if !logical.is_empty() {
-                // Keep the dialect's actual continuation boundary. The
-                // normalizer removes the backtick-newline pair; injecting a
-                // space here would change an obfuscated token (`g` + `it`).
-                logical.push('\n');
-            }
-            logical.push_str(segment);
-
-            let continues = powershell_line_continues(segment)
-                && continuation_lines < MAX_CONTINUATION_LINES
-                && logical.len() < MAX_JOINED_CHARS;
-            idx += 1;
-            if !continues || idx >= lines.len() {
-                break;
-            }
-            continuation_lines += 1;
-        }
-
+    let statements = powershell_logical_statements(&stripped);
+    for (start_line, logical) in &statements {
         if let Some(cmd) = extract_powershell_command_line(
             file,
-            start_line,
-            &logical,
+            *start_line,
+            logical,
             enabled_keywords,
             EXTRACTOR_ID,
         ) {
             out.push(cmd);
         }
+    }
+    let mail_flow_relevant = enabled_keywords.is_empty()
+        || enabled_keywords.iter().any(|keyword| {
+            keyword.eq_ignore_ascii_case("Outlook.Application")
+                || keyword.eq_ignore_ascii_case("CDO.Message")
+        });
+    if mail_flow_relevant {
+        out.extend(extract_powershell_mail_sequences(
+            file,
+            &statements,
+            EXTRACTOR_ID,
+        ));
     }
     out
 }
@@ -4496,6 +4693,39 @@ fail_on = "nope"
     }
 
     #[test]
+    fn evaluator_integration_applies_confidence_policy() {
+        let mut config = default_config();
+        config.confidence.enabled = true;
+        config.confidence.warn_threshold = 1.0;
+
+        let ctx = ScanEvalContext::from_config(&config);
+        let options = ScanOptions {
+            format: ScanFormat::Pretty,
+            fail_on: ScanFailOn::Error,
+            max_file_size_bytes: 1024 * 1024,
+            max_findings: 100,
+            redact: ScanRedactMode::None,
+            truncate: 0,
+        };
+        let extracted = ExtractedCommand {
+            file: "test".to_string(),
+            line: 1,
+            col: None,
+            extractor_id: "shell.script".to_string(),
+            command: "rm -rf ./some/path".to_string(),
+            metadata: None,
+        };
+
+        let finding = evaluate_extracted_command(&extracted, &options, &config, &ctx)
+            .expect("confidence-downgraded matches remain visible as scan findings");
+        assert_eq!(finding.decision, ScanDecision::Warn);
+        assert_eq!(
+            finding.rule_id.as_deref(),
+            Some("core.filesystem:rm-rf-general")
+        );
+    }
+
+    #[test]
     fn evaluator_integration_blocks_sh_c_with_embedded_dangerous_command() {
         // Regression test: sh -c "git reset --hard" should be blocked via heredoc AST scanning
         let config = default_config();
@@ -4762,6 +4992,104 @@ $note = \"g`it branch -`d is inert data\"\n\
         assert_eq!(extracted.len(), 1, "got: {extracted:?}");
         assert_eq!(extracted[0].line, 1);
         assert_eq!(extracted[0].command, "g`\nit branch -`\nd feature");
+    }
+
+    #[test]
+    fn powershell_extractor_preserves_multiline_outlook_send_sequence() {
+        let content = "$outlook = New-Object -ComObject Outlook.Application\n\
+                       $mail = $outlook.CreateItem(0)\n\
+                       $mail.To = 'outside@example.test'\n\
+                       $mail.Subject = 'Daily dossier'\n\
+                       $mail.Send()\n";
+        let extracted =
+            extract_powershell_from_str("send-dossier.ps1", content, &["Outlook.Application"]);
+        let sequence = extracted
+            .iter()
+            .find(|command| {
+                command.command.contains("Outlook.Application")
+                    && command.command.contains("$mail.Send()")
+            })
+            .unwrap_or_else(|| panic!("stateful Outlook send not extracted: {extracted:?}"));
+
+        assert_eq!(sequence.line, 1);
+        assert_eq!(sequence.extractor_id, "powershell.script");
+        assert!(sequence.command.contains("$outlook.CreateItem(0)"));
+    }
+
+    #[test]
+    fn powershell_extractor_skips_mail_state_when_mail_rules_are_irrelevant() {
+        let content = "$outlook = New-Object -ComObject Outlook.Application\n\
+                       $mail = $outlook.CreateItem(0)\n\
+                       $mail.Send()\n";
+        let extracted = extract_powershell_from_str("mailer.ps1", content, &["git branch"]);
+
+        assert!(
+            extracted.iter().all(|command| {
+                !(command.command.contains("Outlook.Application")
+                    && command.command.contains("$mail.Send()"))
+            }),
+            "mail-only state must not be injected for unrelated pack keywords: {extracted:?}"
+        );
+    }
+
+    #[test]
+    fn powershell_com_mail_flow_requires_the_matching_constructor_argument() {
+        for statement in [
+            "$outlook = New-Object -ComObject Outlook.Application",
+            "$outlook = New-Object -ComObject 'Outlook.Application'",
+            "$type = [type]::GetTypeFromProgID('Outlook.Application')",
+            "$outlook = [Runtime.InteropServices.Marshal]::GetActiveObject(\"Outlook.Application\")",
+        ] {
+            assert!(
+                powershell_com_mail_flow_kind(statement).0,
+                "Outlook constructor not recognized: {statement}"
+            );
+        }
+
+        for statement in [
+            "Write-Host 'New-Object -ComObject Outlook.Application'",
+            "$other = New-Object -ComObject Scripting.Dictionary; Write-Host 'Outlook.Application'",
+            "$type = [type]::GetTypeFromProgID('Scripting.Dictionary'); Write-Host 'Outlook.Application'",
+        ] {
+            assert_eq!(
+                powershell_com_mail_flow_kind(statement),
+                (false, false),
+                "inert or unrelated constructor was attributed to Outlook: {statement}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_extractor_does_not_turn_outlook_drafts_or_strings_into_sends() {
+        for content in [
+            "$outlook = New-Object -ComObject Outlook.Application\n\
+             $mail = $outlook.CreateItem(0)\n\
+             $mail.Subject = 'Draft only'\n\
+             $mail.Display()\n",
+            "$outlook = New-Object -ComObject Outlook.Application\n\
+             $mail = $outlook.CreateItem(0)\n\
+             $example = '$mail.Send()'\n\
+             Write-Host $example\n",
+            "$progId = 'Outlook.Application'\n\
+             $mail = $other.CreateItem(0)\n\
+             $mail.Send()\n",
+            "Write-Host 'New-Object -ComObject Outlook.Application'\n\
+             $mail = $other.CreateItem(0)\n\
+             $mail.Send()\n",
+            "$other = New-Object -ComObject Scripting.Dictionary; Write-Host 'Outlook.Application'\n\
+             $mail = $other.CreateItem(0)\n\
+             $mail.Send()\n",
+        ] {
+            let extracted =
+                extract_powershell_from_str("draft.ps1", content, &["Outlook.Application"]);
+            assert!(
+                extracted.iter().all(|command| {
+                    !(command.command.contains("Outlook.Application")
+                        && command.command.contains(".Send()"))
+                }),
+                "inert/draft Outlook content produced a send sequence: {extracted:?}"
+            );
+        }
     }
 
     #[test]

@@ -27,7 +27,7 @@
 //!
 //! # Absolute Maximum
 //!
-//! Hook evaluation exceeding 200ms returns an explicit indeterminate decision;
+//! Hook evaluation exceeding 1000ms returns an explicit indeterminate decision;
 //! it never turns incomplete analysis into a silent allow.
 //! This ensures dcg never blocks a user's workflow indefinitely.
 
@@ -155,7 +155,9 @@ impl Deadline {
     /// Check if the deadline has been exceeded.
     #[must_use]
     pub fn is_exceeded(&self) -> bool {
-        self.start.elapsed() > self.max_duration
+        // `>=` so a zero-duration deadline is exceeded immediately even when
+        // the monotonic clock has not advanced between construction and check.
+        self.start.elapsed() >= self.max_duration
     }
 
     /// Get the remaining time before the deadline, or None if exceeded.
@@ -275,17 +277,31 @@ pub const FULL_HEREDOC_PIPELINE: Budget = Budget::from_ms(
 
 /// Absolute maximum time available to hook safety evaluation.
 /// Exhaustion produces an explicit indeterminate result rather than an allow.
-pub const ABSOLUTE_MAX: Duration = Duration::from_millis(200);
+pub const ABSOLUTE_MAX: Duration = Duration::from_millis(1_000);
 
 /// Hook evaluation time budget in milliseconds.
 ///
-/// Typical commands should complete in <10ms, but heredoc/inline-script
-/// analysis may take longer on pathological inputs. Exhaustion is surfaced as
-/// indeterminate so clients can request review or block conservatively.
-pub const HOOK_EVALUATION_BUDGET_MS: u64 = 200;
+/// Typical commands complete in well under 50ms, but a one-shot hook process
+/// pays lazy pattern compilation for every keyword-matched pack, and loaded
+/// hosts can multiply that cost. The previous 200ms default was exceeded
+/// *deterministically* by ordinary single-construct commands on fast hardware
+/// (#245, #248), turning routine agent commands into fail-closed review
+/// prompts. The deadline exists to catch pathological hangs (#189), which sit
+/// orders of magnitude above normal evaluation, so 1000ms preserves that
+/// backstop with real headroom. Exhaustion is still surfaced as indeterminate
+/// so clients can request review or block conservatively — never allow.
+pub const HOOK_EVALUATION_BUDGET_MS: u64 = 1_000;
 
 /// Hook evaluation time budget as a Duration.
 pub const HOOK_EVALUATION_BUDGET: Duration = Duration::from_millis(HOOK_EVALUATION_BUDGET_MS);
+
+/// Default hook budget when the broad Windows company preset is enabled.
+///
+/// That preset activates enough packs that cold process startup and lazy
+/// pattern compilation can exceed the ordinary 1000ms budget on older Windows
+/// workstations. The larger budget lets the same fail-closed evaluation
+/// finish; it does not change any allow/deny rule.
+pub const CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS: u64 = 3_000;
 
 /// Check whether a duration exceeds the absolute hook evaluation budget.
 #[must_use]
@@ -305,7 +321,7 @@ pub const FAST_PATH_BUDGET_US: u64 = 500;
 ///
 /// This mirrors the absolute hook deadline, not the Tier 6 benchmark panic
 /// threshold. Tier-specific heredoc budgets are defined above.
-pub const SLOW_PATH_BUDGET_MS: u64 = 200;
+pub const SLOW_PATH_BUDGET_MS: u64 = 1_000;
 
 /// Minimum hook evaluation timeout in milliseconds.
 ///
@@ -313,7 +329,7 @@ pub const SLOW_PATH_BUDGET_MS: u64 = 200;
 /// every request immediately into the indeterminate review/block path.
 ///
 /// 10ms is enough for the fast path (quick-reject + safe pattern matching)
-/// while being well below the default 200ms budget.
+/// while being well below the default 1000ms budget.
 pub const MIN_HOOK_TIMEOUT_MS: u64 = 10;
 
 #[cfg(test)]
@@ -348,11 +364,58 @@ mod tests {
         );
     }
 
+    /// The absolute latency gate must stay wired to the shipped budget.
+    ///
+    /// #245 shipped because nothing tied the *product's* deadline to a test
+    /// that could fail on absolute cost: the perf job only ratcheted against a
+    /// recorded baseline. This test asserts the CI gate still reads
+    /// `HOOK_EVALUATION_BUDGET_MS` out of this file and still runs the two
+    /// suites that catch the failure at the protocol layer. If someone renames
+    /// the constant, drops the gate, or removes the harness matrix, this test
+    /// fails rather than silently re-opening the hole.
+    #[test]
+    fn ci_enforces_absolute_latency_gate_against_shipped_budget() {
+        let ci = include_str!("../../../.github/workflows/ci.yml");
+
+        assert!(
+            ci.contains("HOOK_EVALUATION_BUDGET_MS"),
+            "CI must derive the latency gate's budget by reading \
+             HOOK_EVALUATION_BUDGET_MS out of src/perf.rs — a hard-coded number \
+             in the workflow silently decouples the gate from the shipped \
+             default (#245)"
+        );
+        assert!(
+            ci.contains("--assert-budget-ms"),
+            "CI must invoke scripts/perf_baseline.py with --assert-budget-ms; \
+             the relative baseline comparison alone cannot catch a uniform \
+             slowdown that eats the fixed hook deadline (#245)"
+        );
+        assert!(
+            ci.contains("scripts/e2e_harness_matrix.sh"),
+            "CI must run the harness protocol matrix: it is the only gate that \
+             asserts each agent's wire contract against the real binary"
+        );
+
+        // The margin must leave real headroom: a gate set at ~100% of the
+        // budget passes right up until the moment users start failing closed.
+        let margin = ci
+            .split("--assert-margin-pct")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .expect("CI must pass an explicit --assert-margin-pct value");
+        assert!(
+            margin <= 60,
+            "latency gate margin is {margin}% of the budget; keep it <=60% so \
+             the gate trips before real users hit indeterminate verdicts"
+        );
+    }
+
     #[test]
     fn fail_open_threshold() {
-        assert!(!exceeds_absolute_budget(Duration::from_millis(199)));
-        assert!(!exceeds_absolute_budget(Duration::from_millis(200)));
-        assert!(exceeds_absolute_budget(Duration::from_millis(201)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(999)));
+        assert!(!exceeds_absolute_budget(Duration::from_millis(1_000)));
+        assert!(exceeds_absolute_budget(Duration::from_millis(1_001)));
     }
 
     #[test]
@@ -387,10 +450,8 @@ mod tests {
 
     #[test]
     fn deadline_exceeded_with_zero_duration() {
-        // Create a zero-duration deadline and ensure it's exceeded by sleeping
-        // briefly to let the Instant pass the zero point.
         let deadline = Deadline::new(Duration::ZERO);
-        std::thread::sleep(Duration::from_nanos(100));
+        // A zero-duration deadline should be immediately exceeded
         assert!(deadline.is_exceeded());
         assert!(deadline.remaining().is_none());
     }
@@ -447,30 +508,49 @@ mod tests {
             );
         }
 
+        // Derive the deadline prose from the constant rather than hard-coding
+        // it. A literal here only proves the docs say some fixed number — it
+        // cannot detect the constant moving underneath them, which is the
+        // exact drift this test exists to prevent (a build with the budget
+        // reverted to 200ms passed this test while the docs still claimed
+        // 1000ms).
+        let deadline_prose = format!(
+            "- Hook evaluation deadline: {HOOK_EVALUATION_BUDGET_MS}ms \
+             (exhaustion is indeterminate, never a silent allow)"
+        );
         for expected in [
             "- Quick reject: < 50us panic",
             "- Fast path: < 500us panic",
             "- Pattern match: < 1ms panic",
             "- Heredoc extract: < 2ms panic",
             "- Full heredoc pipeline: < 20ms panic",
-            "- Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
+            deadline_prose.as_str(),
         ] {
             assert!(
                 agents.contains(expected),
-                "AGENTS.md benchmark budget prose drifted; missing: {expected}"
+                "AGENTS.md benchmark budget prose drifted from src/perf.rs; missing: {expected}"
             );
         }
 
+        let ci_deadline_prose = format!("# {deadline_prose}");
         for expected in [
             "# - Full heredoc pipeline: 20ms panic",
-            "# - Hook evaluation deadline: 200ms (exhaustion is indeterminate, never a silent allow)",
+            ci_deadline_prose.as_str(),
             "Full heredoc pipeline benchmark exceeds 20ms budget",
         ] {
             assert!(
                 ci.contains(expected),
-                ".github/workflows/ci.yml budget prose drifted; missing: {expected}"
+                ".github/workflows/ci.yml budget prose drifted from src/perf.rs; missing: {expected}"
             );
         }
+
+        // The README states the same deadline in prose; keep it in lockstep so
+        // users are never told a budget the binary does not use.
+        assert!(
+            readme.contains(&format!("default is **{HOOK_EVALUATION_BUDGET_MS}ms**")),
+            "README hook-deadline prose drifted from HOOK_EVALUATION_BUDGET_MS \
+             ({HOOK_EVALUATION_BUDGET_MS}ms)"
+        );
 
         assert!(
             bench.contains("- Full heredoc pipeline: < 20ms (panic threshold)"),

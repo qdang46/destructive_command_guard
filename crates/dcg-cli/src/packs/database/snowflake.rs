@@ -367,7 +367,6 @@ pub fn create_pack() -> Pack {
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: true,
-        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
     }
 }
 
@@ -2131,6 +2130,10 @@ pub enum SnowflakeSource {
 }
 
 /// Extract bounded `!source` / `!load` references outside comments and strings.
+///
+/// # Errors
+/// Returns [`SnowflakeSqlError`] when a directive fails to parse or the
+/// recursion bound is exceeded.
 pub fn source_references(payload: &str) -> Result<Vec<SnowflakeSource>, SnowflakeSqlError> {
     let directives = scan_directives(payload)?;
     let mut references = Vec::new();

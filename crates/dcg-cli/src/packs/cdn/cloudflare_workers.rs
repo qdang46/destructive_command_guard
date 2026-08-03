@@ -1546,6 +1546,26 @@ fn wrangler_segment_semantic_decision(
         // fail-closed even when the payload itself is statically decoded.
         return WranglerSemanticDecision::Unverified;
     }
+    // Enforce the token budget against the submitted segment before wrapper
+    // normalization. Otherwise a long assignment/env prefix can be partially
+    // stripped by the separately bounded wrapper pass and turn an over-budget
+    // command into a deceptively small, fully classified Wrangler invocation.
+    let Some(original_decoded) = decode_words(segment, dialect) else {
+        return WranglerSemanticDecision::NoMatch;
+    };
+    if original_decoded.over_limit {
+        return match find_wrangler_index(&original_decoded.words, dialect) {
+            WranglerExecutableDecision::Found(_) | WranglerExecutableDecision::Unverified => {
+                WranglerSemanticDecision::Unverified
+            }
+            WranglerExecutableDecision::NoMatch
+                if words_prove_irrelevant_executable(&original_decoded.words, dialect) =>
+            {
+                WranglerSemanticDecision::NoMatch
+            }
+            WranglerExecutableDecision::NoMatch => WranglerSemanticDecision::Unverified,
+        };
+    }
     let stripped = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
         .then(|| strip_wrapper_prefixes(segment));
     let segment = stripped
@@ -1898,7 +1918,6 @@ pub fn create_pack() -> Pack {
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
-        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
     }
 }
 
@@ -1975,7 +1994,6 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 "Review the fully expanded Wrangler executable and command path before allowing execution. Dynamic shell values and commands beyond the semantic parser's bounds can hide destructive Worker, KV, R2, D1, or deployment operations.",
             ),
             suggestions: &[],
-            effects: None,
         },
         // Worker deletion
         destructive_pattern!(

@@ -2,7 +2,7 @@
 //! Focused coverage for `dcg test` command behavior.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 /// Path to the dcg binary compiled for this test run.
 fn dcg_binary() -> PathBuf {
@@ -48,6 +48,8 @@ fn run_dcg_with_home(
     cmd.args(args)
         .env("HOME", home)
         .env("USERPROFILE", home)
+        .env("TEMP", home)
+        .env("TMP", home)
         .env("XDG_CONFIG_HOME", &xdg)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "");
 
@@ -60,6 +62,35 @@ fn run_dcg_with_home(
     }
 
     cmd.output().expect("run dcg")
+}
+
+fn run_dcg_isolated_with_stdin(args: &[&str], input: &str) -> Output {
+    use std::io::Write as _;
+
+    let home = tempfile::tempdir().expect("temp home");
+    let xdg = home.path().join("xdg");
+    std::fs::create_dir_all(&xdg).expect("create xdg config dir");
+
+    let mut child = Command::new(dcg_binary())
+        .args(args)
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("TEMP", home.path())
+        .env("TMP", home.path())
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dcg");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(input.as_bytes())
+        .expect("write command to dcg stdin");
+    child.wait_with_output().expect("wait for dcg")
 }
 
 fn parse_json(output: &Output) -> serde_json::Value {
@@ -94,6 +125,59 @@ fn test_basic_allowed_command_exits_zero() {
 
     let json = parse_json(&output);
     assert_eq!(json["decision"], "allow");
+}
+
+#[test]
+fn test_stdin_keeps_blocked_command_off_the_cli_arguments() {
+    let output = run_dcg_isolated_with_stdin(
+        &[
+            "test",
+            "--stdin",
+            "--format",
+            "json",
+            "--with-packs",
+            "careful_company_running_windows.email",
+        ],
+        "Send-MailMessage -To outside@example.test -Body dossier\r\n",
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdin candidate should be denied\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "careful_company_running_windows.email");
+    assert_eq!(json["pattern_name"], "send-mailmessage");
+}
+
+#[test]
+fn test_stdin_preserves_multiline_commands_and_rejects_empty_input() {
+    let multiline = "echo preparing\ngit reset --hard\n";
+    let blocked = run_dcg_isolated_with_stdin(&["test", "--stdin", "--format", "json"], multiline);
+    assert_eq!(
+        blocked.status.code(),
+        Some(1),
+        "multiline stdin candidate should be denied\nstdout: {}\nstderr: {}",
+        stdout_text(&blocked),
+        stderr_text(&blocked)
+    );
+    let blocked_json = parse_json(&blocked);
+    assert_eq!(blocked_json["pattern_name"], "reset-hard");
+
+    let empty = run_dcg_isolated_with_stdin(&["test", "--stdin"], "");
+    assert!(!empty.status.success());
+    assert!(stderr_text(&empty).contains("stdin did not contain a command"));
+}
+
+#[test]
+fn test_stdin_and_positional_command_are_mutually_exclusive() {
+    let output = run_dcg_isolated(&["test", "--stdin", "git status"], None);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_text(&output).contains("cannot be used with"));
 }
 
 #[test]
@@ -529,6 +613,65 @@ block = [
 }
 
 #[test]
+fn test_documented_mailer_filename_override_blocks_only_that_filename() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config_path = temp.path().join("custom.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[overrides]
+block = [
+  { pattern = '(?i)\bsend-dossier\.ps1\b', reason = "Daily dossier mail is paused pending review" },
+]
+"#,
+    )
+    .expect("write config");
+    let config_arg = config_path.to_string_lossy().to_string();
+
+    let blocked = run_dcg_isolated(
+        &[
+            "test",
+            "--format",
+            "json",
+            "--config",
+            config_arg.as_str(),
+            r".\send-dossier.ps1",
+        ],
+        None,
+    );
+    assert_eq!(
+        blocked.status.code(),
+        Some(1),
+        "documented mailer override should deny the script\nstdout: {}\nstderr: {}",
+        stdout_text(&blocked),
+        stderr_text(&blocked)
+    );
+    assert!(
+        stdout_text(&blocked).contains("Daily dossier mail is paused pending review"),
+        "block reason should survive config parsing"
+    );
+
+    let allowed = run_dcg_isolated(
+        &[
+            "test",
+            "--format",
+            "json",
+            "--config",
+            config_arg.as_str(),
+            r".\show-dossier.ps1",
+        ],
+        None,
+    );
+    assert_eq!(
+        allowed.status.code(),
+        Some(0),
+        "a different script filename should remain allowed\nstdout: {}\nstderr: {}",
+        stdout_text(&allowed),
+        stderr_text(&allowed)
+    );
+}
+
+#[test]
 fn test_untrusted_project_config_cannot_allow_blocked_command() {
     let repo = tempfile::tempdir().expect("temp repo");
     std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
@@ -836,7 +979,8 @@ fn test_test_subcommand_help_text_includes_key_flags() {
         stdout_text(&output),
         stderr_text(&output)
     );
-    assert!(combined.contains("Usage: dcg test [OPTIONS] <COMMAND>"));
+    assert!(combined.contains("Usage: dcg test [OPTIONS] [COMMAND]"));
+    assert!(combined.contains("--stdin"));
     assert!(combined.contains("--config"));
     assert!(combined.contains("--with-packs"));
     assert!(combined.contains("--format"));

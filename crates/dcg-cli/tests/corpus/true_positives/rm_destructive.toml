@@ -49,3 +49,39 @@ description = "rm with recursive and force flags separate"
 command = "rm -r -f ./build"
 expected = "deny"
 rule_id = "core.filesystem:rm-r-f-separate"
+
+[[case]]
+description = "bare recursive rm on an ordinary tree is blocked"
+command = "rm -r ./build"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-general"
+
+[[case]]
+description = "uppercase recursive flag on an ordinary tree is blocked"
+command = "rm -R Desktop"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-general"
+
+[[case]]
+description = "long recursive rm on an absolute system tree is critical"
+command = "rm --recursive /etc"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-root-home"
+
+[[case]]
+description = "home recursive deletion is critical without force"
+command = "rm -r $HOME"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-root-home"
+
+[[case]]
+description = "a trailing force overrides earlier interactive mode"
+command = "rm -r -i -f ./build"
+expected = "deny"
+rule_id = "core.filesystem:rm-r-f-separate"
+
+[[case]]
+description = "interactive never does not make recursive deletion safe"
+command = "rm -r --interactive=never ./build"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-general"

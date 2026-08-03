@@ -230,7 +230,7 @@
           "default": false
         },
         "hook_timeout_ms": {
-          "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget.",
+          "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget. Values below\n10 milliseconds are clamped to the minimum safe evaluation window.",
           "type": [
             "integer",
             "null"
@@ -240,7 +240,7 @@
           "default": null
         },
         "max_hook_input_bytes": {
-          "description": "Maximum bytes to read from stdin in hook mode.\nCommands exceeding this limit are allowed (fail-open) with a warning.\nDefault: 262144 (256 KiB).",
+          "description": "Maximum bytes to read from stdin in hook mode.\nOversized hook envelopes are allowed with an audit warning by default;\n`fail_closed` blocks them because their size is attacker-controlled.\nDefault: 262144 (256 KiB).",
           "type": [
             "integer",
             "null"
@@ -377,7 +377,7 @@
       }
     },
     "PolicyConfig": {
-      "description": "Decision mode policy configuration.\n\nControls how matched patterns are handled: deny (block), warn (allow with warning),\nor log (silent allow with optional logging).\n\nDefaults respect severity: Critical/High → deny, Medium → warn, Low → log.\nThis config allows overriding the default behavior per pack or per specific rule.",
+      "description": "Decision mode policy configuration.\n\nControls how matched patterns are handled: deny (block), ask (require\noperator review), warn (allow with warning), or log (silent allow with\noptional logging).\n\nDefaults respect severity: Critical/High → deny, Medium → warn, Low → log.\nThis config allows overriding the default behavior per pack or per specific rule.",
       "type": "object",
       "properties": {
         "default_mode": {
@@ -411,13 +411,6 @@
           "additionalProperties": {
             "$ref": "#/$defs/PolicyMode"
           }
-        },
-        "tools": {
-          "description": "Per-tool mode overrides.\nKey is the tool kind (e.g., \"bash\", \"edit\", \"write\", \"read\", \"network\").\nValue is the mode to use for all rules triggered by that tool kind.\nTakes precedence over pack-level and rule-level overrides for the matching tool.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/$defs/PolicyMode"
-          }
         }
       }
     },
@@ -428,6 +421,11 @@
           "description": "Block the command (output JSON deny, print warning).",
           "type": "string",
           "const": "deny"
+        },
+        {
+          "description": "Require explicit operator review; fail closed if the client cannot ask.",
+          "type": "string",
+          "const": "ask"
         },
         {
           "description": "Warn but allow (print warning to stderr, no JSON deny).",
@@ -625,7 +623,7 @@
       }
     },
     "HeredocConfig": {
-      "description": "Heredoc and inline-script scanning configuration.\n\nThis configuration controls Tier 1/2/3 heredoc scanning behavior. Because the\nhook is performance- and UX-sensitive, defaults are conservative and fail-open\non extraction/parse errors.",
+      "description": "Heredoc and inline-script scanning configuration.\n\nThis configuration controls Tier 1/2/3 heredoc scanning behavior. Because the\nhook is performance- and UX-sensitive, extraction/parse errors use a bounded\nfallback scanner by default.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -688,7 +686,7 @@
           "default": null
         },
         "fallback_on_parse_error": {
-          "description": "Fail-open when AST parsing fails for embedded code.",
+          "description": "Use bounded fallback scanning when AST parsing fails for embedded code.\nWhen false, block on the incomplete analysis instead.",
           "type": [
             "boolean",
             "null"
@@ -696,7 +694,7 @@
           "default": null
         },
         "fallback_on_timeout": {
-          "description": "Fail-open when extraction/parsing exceeds the timeout budget.",
+          "description": "Use bounded fallback scanning when extraction/parsing exceeds its timeout.\nWhen false, block on the incomplete analysis instead.",
           "type": [
             "boolean",
             "null"
@@ -964,14 +962,15 @@
           "description": "Retention window in days.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
+          "maximum": 3650,
           "default": 90
         },
         "max_size_mb": {
           "description": "Maximum database size in megabytes.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 500
         },
         "database_path": {
@@ -991,21 +990,21 @@
           "description": "Interval in hours between automatic prune checks.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 24
         },
         "batch_size": {
           "description": "Batch size for write operations (improves performance).",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 50
         },
         "batch_flush_interval_ms": {
           "description": "Flush interval in milliseconds for batched writes.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 100
         }
       }

@@ -36,6 +36,7 @@
 //! ```
 
 mod schema;
+mod sqlite;
 
 use crate::config::{HistoryConfig, HistoryRedactionMode};
 use crate::logging::{RedactionConfig, RedactionMode};
@@ -53,6 +54,7 @@ pub use schema::{
     PotentialGap, ProjectStat, RecommendationType, RuleMetrics, RuleTrend, StatsTrends,
     SuggestionAction, SuggestionAuditEntry, SuggestionCandidate,
 };
+pub use sqlite::{Connection as HistoryConnection, Row as HistoryRow, SqliteValue};
 
 /// Environment variable to override the history database path.
 pub const ENV_HISTORY_DB_PATH: &str = "DCG_HISTORY_DB";
@@ -63,7 +65,7 @@ pub const ENV_HISTORY_DISABLED: &str = "DCG_HISTORY_DISABLED";
 enum HistoryMessage {
     Entry(Box<CommandEntry>),
     Flush(mpsc::Sender<()>),
-    Shutdown,
+    Shutdown(mpsc::Sender<()>),
 }
 
 /// Configuration for the history worker thread.
@@ -74,6 +76,7 @@ struct WorkerConfig {
     auto_prune: bool,
     retention_days: u32,
     prune_check_interval: Duration,
+    max_size_bytes: u64,
 }
 
 impl Default for WorkerConfig {
@@ -84,6 +87,7 @@ impl Default for WorkerConfig {
             auto_prune: false,
             retention_days: 90,
             prune_check_interval: Duration::from_secs(24 * 3600),
+            max_size_bytes: 500 * 1024 * 1024,
         }
     }
 }
@@ -91,13 +95,16 @@ impl Default for WorkerConfig {
 impl From<&HistoryConfig> for WorkerConfig {
     fn from(config: &HistoryConfig) -> Self {
         Self {
-            batch_size: config.batch_size as usize,
-            flush_interval: Duration::from_millis(u64::from(config.batch_flush_interval_ms)),
+            batch_size: config.batch_size.max(1) as usize,
+            flush_interval: Duration::from_millis(u64::from(config.batch_flush_interval_ms.max(1))),
             auto_prune: config.auto_prune,
-            retention_days: config.retention_days,
+            retention_days: config
+                .retention_days
+                .clamp(1, HistoryConfig::MAX_RETENTION_DAYS),
             prune_check_interval: Duration::from_secs(
-                u64::from(config.prune_check_interval_hours) * 3600,
+                u64::from(config.prune_check_interval_hours.max(1)) * 3600,
             ),
+            max_size_bytes: u64::from(config.max_size_mb.max(1)).saturating_mul(1024 * 1024),
         }
     }
 }
@@ -108,13 +115,23 @@ pub struct HistoryFlushHandle {
 }
 
 impl HistoryFlushHandle {
-    /// Flush and wait for pending writes to complete.
+    /// Request a flush and wait up to the hook-safe bounded timeout.
+    ///
+    /// History is best-effort telemetry, so lock contention or a stalled
+    /// storage worker may cause this to return before the write lands.
     pub fn flush_sync(&self) {
-        const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+        let _ = self.flush_sync_with_timeout(Duration::from_millis(40));
+    }
+
+    /// Request a flush and wait for at most `timeout`.
+    ///
+    /// Returns `true` only when the worker acknowledged that every entry
+    /// queued before this request was processed.
+    #[must_use]
+    pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
         let (ack_tx, ack_rx) = mpsc::channel();
-        if self.sender.send(HistoryMessage::Flush(ack_tx)).is_ok() {
-            let _ = ack_rx.recv_timeout(FLUSH_TIMEOUT);
-        }
+        self.sender.send(HistoryMessage::Flush(ack_tx)).is_ok()
+            && ack_rx.recv_timeout(timeout).is_ok()
     }
 }
 
@@ -125,14 +142,15 @@ pub struct HistoryWriter {
     redaction_mode: HistoryRedactionMode,
     session_id: String,
     wait_for_worker_on_drop: bool,
+    drop_wait_deadline: Option<Instant>,
 }
 
 impl HistoryWriter {
     /// Create a new history writer.
     ///
     /// The database path is passed to the worker thread, which opens the
-    /// connection itself. This avoids needing `Send` on `HistoryDb` (which
-    /// uses `Rc`-based `fsqlite::Connection` internally).
+    /// connection itself. This keeps all connection use on the dedicated
+    /// history thread.
     ///
     /// The writer is disabled when `config.enabled` is false.
     #[must_use]
@@ -177,6 +195,7 @@ impl HistoryWriter {
             redaction_mode: config.redaction_mode,
             session_id,
             wait_for_worker_on_drop: true,
+            drop_wait_deadline: None,
         }
     }
 
@@ -188,6 +207,7 @@ impl HistoryWriter {
             redaction_mode: HistoryRedactionMode::Pattern,
             session_id: String::new(),
             wait_for_worker_on_drop: true,
+            drop_wait_deadline: None,
         }
     }
 
@@ -230,11 +250,21 @@ impl HistoryWriter {
         }
     }
 
-    /// Flush and wait for pending writes to complete.
+    /// Request a flush and wait up to the hook-safe bounded timeout.
     pub fn flush_sync(&self) {
         if let Some(handle) = self.flush_handle() {
             handle.flush_sync();
         }
+    }
+
+    /// Request a flush and wait for at most `timeout`.
+    ///
+    /// Returns `true` for a disabled writer or when the storage worker
+    /// acknowledges the flush before the deadline.
+    #[must_use]
+    pub fn flush_sync_with_timeout(&self, timeout: Duration) -> bool {
+        self.flush_handle()
+            .is_none_or(|handle| handle.flush_sync_with_timeout(timeout))
     }
 
     /// Queue normal worker shutdown without waiting for storage during drop.
@@ -247,21 +277,45 @@ impl HistoryWriter {
     pub fn detach_worker_on_drop(&mut self) {
         self.wait_for_worker_on_drop = false;
     }
+
+    /// Bound the normal drop wait to a budget measured from this call.
+    ///
+    /// Hook mode uses the evaluator's remaining absolute deadline so history
+    /// shutdown can never extend a safety decision past its total budget.
+    pub fn limit_drop_wait_to(&mut self, timeout: Duration) {
+        let now = Instant::now();
+        self.drop_wait_deadline = Some(now.checked_add(timeout).unwrap_or(now));
+    }
 }
 
 impl Drop for HistoryWriter {
     fn drop(&mut self) {
-        if self.wait_for_worker_on_drop {
-            self.flush_sync();
+        if let Some(sender) = self.sender.take() {
+            let (ack_tx, ack_rx) = mpsc::channel();
+            if sender.send(HistoryMessage::Shutdown(ack_tx)).is_ok() && self.wait_for_worker_on_drop
+            {
+                if let Some(deadline) = self.drop_wait_deadline {
+                    // Hook mode never lets best-effort telemetry extend the
+                    // guarded decision beyond its absolute deadline.
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    let _ = ack_rx.recv_timeout(timeout);
+                } else {
+                    // Library and CLI callers without a hook deadline receive
+                    // the conventional writer guarantee: queued entries are
+                    // drained before Drop returns.
+                    let _ = ack_rx.recv();
+                }
+            }
         }
 
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(HistoryMessage::Shutdown);
-        }
-        if let Some(handle) = self.handle.take() {
-            if self.wait_for_worker_on_drop {
+        if self.wait_for_worker_on_drop && self.drop_wait_deadline.is_none() {
+            if let Some(handle) = self.handle.take() {
                 let _ = handle.join();
             }
+        } else {
+            // Hook deadlines and explicit detach requests must not inherit an
+            // unbounded scheduler or storage wait.
+            drop(self.handle.take());
         }
     }
 }
@@ -298,12 +352,33 @@ fn history_worker(
     let mut last_flush = Instant::now();
     let mut last_prune_check = Instant::now();
     let db_path = db.path().map(std::path::Path::to_path_buf);
-    let mut history_disabled = false;
 
-    // Check if we need auto-prune on startup
+    // Reclaim expired rows before deciding whether an existing database is
+    // irreducibly over its hard cap. Otherwise a database composed mostly of
+    // expired data can disable this long-lived writer even though pruning
+    // immediately brings it back under the configured limit.
     if config.auto_prune {
         check_and_prune(&db, config.retention_days);
     }
+
+    let mut history_disabled = match db.enforce_size_limit(config.max_size_bytes) {
+        Ok(true) => false,
+        Ok(false) => {
+            warn!(
+                max_size_bytes = config.max_size_bytes,
+                "History database already exceeds max_size_mb with live data; disabling writes"
+            );
+            true
+        }
+        Err(e) => {
+            error!(
+                error = %e,
+                max_size_bytes = config.max_size_bytes,
+                "Failed to enforce history max_size_mb; disabling writes"
+            );
+            true
+        }
+    };
 
     loop {
         // Use recv_timeout to enable periodic flushing
@@ -323,6 +398,7 @@ fn history_worker(
                         &mut batch,
                         db_path.as_ref(),
                         &mut history_disabled,
+                        config.max_size_bytes,
                     );
                     last_flush = Instant::now();
                 }
@@ -333,13 +409,15 @@ fn history_worker(
                 // to ensure the entire channel is emptied before sending the ack.
                 let mut pending_acks = vec![ack];
                 let mut should_shutdown = false;
+                let mut shutdown_ack = None;
                 loop {
                     while let Some(msg) =
                         drain_entries_into_batch(&receiver, &mut batch, config.batch_size)
                     {
                         match msg {
                             HistoryMessage::Flush(pending_ack) => pending_acks.push(pending_ack),
-                            HistoryMessage::Shutdown => {
+                            HistoryMessage::Shutdown(ack) => {
+                                shutdown_ack = Some(ack);
                                 should_shutdown = true;
                                 break;
                             }
@@ -354,6 +432,7 @@ fn history_worker(
                         &mut batch,
                         db_path.as_ref(),
                         &mut history_disabled,
+                        config.max_size_bytes,
                     );
                 }
                 // Final flush for any remaining entries
@@ -362,6 +441,7 @@ fn history_worker(
                     &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
+                    config.max_size_bytes,
                 );
                 last_flush = Instant::now();
                 // Send all pending acks
@@ -369,21 +449,31 @@ fn history_worker(
                     let _ = pending_ack.send(());
                 }
                 if should_shutdown {
-                    if let Err(e) = db.checkpoint() {
-                        warn!(error = %e, "WAL checkpoint failed on shutdown");
+                    // The shutdown acknowledgement is also a connection-close
+                    // barrier. Closing the final SQLite connection performs
+                    // normal WAL close handling; forcing TRUNCATE here would
+                    // add an exclusive-lock round trip to every hook. Drop
+                    // SQLite before waking the caller so an immediate
+                    // hook-style reopen cannot race journal setup.
+                    drop(db);
+                    if let Some(ack) = shutdown_ack {
+                        let _ = ack.send(());
                     }
-                    break;
+                    return;
                 }
             }
-            Ok(HistoryMessage::Shutdown) => {
+            Ok(HistoryMessage::Shutdown(shutdown_ack)) => {
                 // Final flush before shutdown
                 let mut pending_acks = Vec::new();
+                let mut shutdown_acks = vec![shutdown_ack];
                 while let Some(msg) =
                     drain_entries_into_batch(&receiver, &mut batch, config.batch_size)
                 {
                     match msg {
                         HistoryMessage::Flush(pending_ack) => pending_acks.push(pending_ack),
-                        HistoryMessage::Shutdown => {} // Already shutting down
+                        HistoryMessage::Shutdown(pending_ack) => {
+                            shutdown_acks.push(pending_ack);
+                        }
                         HistoryMessage::Entry(_) => unreachable!(),
                     }
                 }
@@ -392,18 +482,19 @@ fn history_worker(
                     &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
+                    config.max_size_bytes,
                 );
                 // Send all pending acks before shutdown
                 for pending_ack in pending_acks {
                     let _ = pending_ack.send(());
                 }
-                // Checkpoint WAL before closing
-                if let Err(e) = db.checkpoint() {
-                    warn!(error = %e, "WAL checkpoint failed during shutdown");
-                } else {
-                    debug!("WAL checkpoint completed successfully");
+                // See the flush-plus-shutdown path above: acknowledge only
+                // after the file handles and SQLite locks are gone.
+                drop(db);
+                for pending_ack in shutdown_acks {
+                    let _ = pending_ack.send(());
                 }
-                break;
+                return;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Periodic flush on timeout
@@ -413,6 +504,7 @@ fn history_worker(
                         &mut batch,
                         db_path.as_ref(),
                         &mut history_disabled,
+                        config.max_size_bytes,
                     );
                     last_flush = Instant::now();
                 }
@@ -434,8 +526,9 @@ fn history_worker(
                     &mut batch,
                     db_path.as_ref(),
                     &mut history_disabled,
+                    config.max_size_bytes,
                 );
-                if let Err(e) = db.checkpoint() {
+                if let Err(e) = db.checkpoint_truncate() {
                     warn!(error = %e, "WAL checkpoint failed on channel disconnect");
                 }
                 break;
@@ -444,16 +537,38 @@ fn history_worker(
     }
 }
 
-fn recover_history_db(db: &mut HistoryDb, db_path: Option<&std::path::PathBuf>) -> bool {
+fn recover_history_db(
+    db: &mut HistoryDb,
+    db_path: Option<&std::path::PathBuf>,
+    max_size_bytes: u64,
+) -> bool {
     let Some(path) = db_path else {
         return false;
     };
 
     match HistoryDb::open(Some(path.clone())) {
-        Ok(recovered_db) => {
-            *db = recovered_db;
-            true
-        }
+        Ok(recovered_db) => match recovered_db.enforce_size_limit(max_size_bytes) {
+            Ok(true) => {
+                *db = recovered_db;
+                true
+            }
+            Ok(false) => {
+                error!(
+                    max_size_bytes,
+                    path = %path.display(),
+                    "Recovered history DB exceeds max_size_mb with live data"
+                );
+                false
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    path = %path.display(),
+                    "Failed to reapply max_size_mb after history DB recovery"
+                );
+                false
+            }
+        },
         Err(e) => {
             error!(
                 error = %e,
@@ -470,6 +585,7 @@ fn flush_batch_with_recovery(
     batch: &mut Vec<CommandEntry>,
     db_path: Option<&std::path::PathBuf>,
     history_disabled: &mut bool,
+    max_size_bytes: u64,
 ) {
     if *history_disabled {
         batch.clear();
@@ -478,18 +594,40 @@ fn flush_batch_with_recovery(
 
     match flush_batch(db, batch) {
         FlushOutcome::Success => {}
+        FlushOutcome::Contended => {
+            batch.clear();
+            debug!("History database is busy; dropped best-effort telemetry batch");
+        }
+        FlushOutcome::CapacityReached => {
+            *history_disabled = true;
+            batch.clear();
+            warn!("History max_size_mb reached; disabling history writes for this process");
+        }
         FlushOutcome::Fatal => {
             warn!("Detected fatal history storage error; attempting DB recovery");
-            if recover_history_db(db, db_path) {
+            if recover_history_db(db, db_path, max_size_bytes) {
                 match flush_batch(db, batch) {
                     FlushOutcome::Success => {
                         debug!("History DB recovery succeeded");
+                    }
+                    FlushOutcome::Contended => {
+                        batch.clear();
+                        debug!(
+                            "Recovered history database is busy; dropped best-effort telemetry batch"
+                        );
                     }
                     FlushOutcome::Fatal => {
                         *history_disabled = true;
                         batch.clear();
                         error!(
                             "History DB remained unusable after recovery; disabling history writes for this process"
+                        );
+                    }
+                    FlushOutcome::CapacityReached => {
+                        *history_disabled = true;
+                        batch.clear();
+                        warn!(
+                            "History max_size_mb reached after storage recovery; disabling history writes"
                         );
                     }
                 }
@@ -522,7 +660,7 @@ fn drain_entries_into_batch(
                     return None;
                 }
             }
-            Ok(msg @ (HistoryMessage::Flush(_) | HistoryMessage::Shutdown)) => {
+            Ok(msg @ (HistoryMessage::Flush(_) | HistoryMessage::Shutdown(_))) => {
                 // Return control message so caller can handle it
                 return Some(msg);
             }
@@ -537,11 +675,42 @@ fn drain_entries_into_batch(
 enum FlushOutcome {
     Success,
     Fatal,
+    CapacityReached,
+    Contended,
 }
 
 fn is_fatal_storage_error(error: &HistoryError) -> bool {
-    let lower = error.to_string().to_ascii_lowercase();
-    lower.contains("io_uring") && (lower.contains("panicked") || lower.contains("lock poisoned"))
+    matches!(
+        error,
+        HistoryError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt
+                    | rusqlite::ErrorCode::NotADatabase
+                    | rusqlite::ErrorCode::SystemIoFailure
+                    | rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::OutOfMemory
+            )
+    )
+}
+
+fn is_capacity_error(error: &HistoryError) -> bool {
+    matches!(
+        error,
+        HistoryError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if code.code == rusqlite::ErrorCode::DiskFull
+    )
+}
+
+fn is_contention_error(error: &HistoryError) -> bool {
+    matches!(
+        error,
+        HistoryError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 /// Flush the batch to the database.
@@ -560,6 +729,16 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                 trace!(count = batch_len, "Batch insert succeeded");
             }
             Err(e) => {
+                if is_contention_error(&e) {
+                    debug!(
+                        batch_size = batch_len,
+                        "History database is busy; dropping best-effort telemetry batch"
+                    );
+                    return FlushOutcome::Contended;
+                }
+                if is_capacity_error(&e) {
+                    return FlushOutcome::CapacityReached;
+                }
                 if is_fatal_storage_error(&e) {
                     error!(
                         error = %e,
@@ -580,6 +759,15 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
                     match db.log_command(entry) {
                         Ok(_id) => success_count += 1,
                         Err(insert_err) => {
+                            if is_contention_error(&insert_err) {
+                                debug!(
+                                    "History database became busy during fallback; dropping remaining telemetry"
+                                );
+                                return FlushOutcome::Contended;
+                            }
+                            if is_capacity_error(&insert_err) {
+                                return FlushOutcome::CapacityReached;
+                            }
                             if is_fatal_storage_error(&insert_err) {
                                 error!(
                                     error = %insert_err,
@@ -621,6 +809,13 @@ fn flush_batch(db: &HistoryDb, batch: &mut Vec<CommandEntry>) -> FlushOutcome {
             match db.log_command(entry) {
                 Ok(_id) => trace!(command = %entry.command, "Inserted history entry"),
                 Err(e) => {
+                    if is_contention_error(&e) {
+                        debug!("History database is busy; dropping best-effort telemetry entry");
+                        return FlushOutcome::Contended;
+                    }
+                    if is_capacity_error(&e) {
+                        return FlushOutcome::CapacityReached;
+                    }
                     if is_fatal_storage_error(&e) {
                         error!(
                             error = %e,
@@ -652,6 +847,14 @@ fn check_and_prune(db: &HistoryDb, retention_days: u32) {
             match db.prune_older_than_days(u64::from(retention_days), false) {
                 Ok(pruned_count) => {
                     debug!(pruned = pruned_count, "Auto-prune completed");
+                    if pruned_count > 0 {
+                        if let Err(e) = db.vacuum() {
+                            warn!(error = %e, "Failed to reclaim pages after auto-prune");
+                        }
+                        if let Err(e) = db.checkpoint_truncate() {
+                            warn!(error = %e, "Failed to truncate WAL after auto-prune");
+                        }
+                    }
                     if let Err(e) = db.record_prune_timestamp() {
                         warn!(error = %e, "Failed to record prune timestamp");
                     }
@@ -690,6 +893,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_config_defensively_clamps_zero_runtime_limits() {
+        let history = HistoryConfig {
+            retention_days: 0,
+            max_size_mb: 0,
+            prune_check_interval_hours: 0,
+            batch_size: 0,
+            batch_flush_interval_ms: 0,
+            ..HistoryConfig::default()
+        };
+        let worker = WorkerConfig::from(&history);
+        assert_eq!(worker.retention_days, 1);
+        assert_eq!(worker.max_size_bytes, 1024 * 1024);
+        assert_eq!(worker.prune_check_interval, Duration::from_secs(3600));
+        assert_eq!(worker.batch_size, 1);
+        assert_eq!(worker.flush_interval, Duration::from_millis(1));
+    }
+
+    #[test]
     fn detached_drop_never_waits_for_history_worker() {
         let (release_tx, release_rx) = mpsc::channel();
         let handle = thread::spawn(move || {
@@ -704,6 +925,7 @@ mod tests {
             redaction_mode: HistoryRedactionMode::Pattern,
             session_id: String::new(),
             wait_for_worker_on_drop: true,
+            drop_wait_deadline: None,
         };
         writer.detach_worker_on_drop();
 

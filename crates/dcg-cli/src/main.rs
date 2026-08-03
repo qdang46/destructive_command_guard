@@ -23,9 +23,11 @@ use dcg_cli::agent::{Agent, detect_agent};
 use dcg_cli::allowlist::LayeredAllowlist;
 use dcg_cli::cli::{self, Cli};
 // Exit codes are used by cli.rs for robot mode; main.rs uses them for hook mode errors
-use dcg_cli::config::Config;
+use dcg_cli::config::{CompiledOverrides, Config, HeredocSettings};
+#[cfg(test)]
+use dcg_cli::evaluator::evaluate_command_with_pack_order_deadline_at_path;
 use dcg_cli::evaluator::{
-    EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
+    EvaluationDecision, evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
 use dcg_cli::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
@@ -34,14 +36,15 @@ use dcg_cli::history::{
 };
 use dcg_cli::hook;
 use dcg_cli::load_default_allowlists;
+use dcg_cli::normalize::ShellDialect;
+#[cfg(test)]
 use dcg_cli::normalize::normalize_command;
 use dcg_cli::packs::load_external_packs;
 #[cfg(test)]
 use dcg_cli::packs::pack_aware_quick_reject;
-use dcg_cli::packs::{DecisionMode, REGISTRY};
+use dcg_cli::packs::{DecisionMode, EnabledKeywordIndex, REGISTRY};
 use dcg_cli::pending_exceptions::{PendingExceptionStore, log_maintenance};
 use dcg_cli::perf::{Deadline, HOOK_EVALUATION_BUDGET};
-use dcg_cli::sanitize_for_pattern_matching;
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use dcg_cli::hook::HookInput;
@@ -49,7 +52,7 @@ use dcg_cli::hook::HookInput;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // Build metadata from vergen (set by build.rs)
@@ -160,6 +163,19 @@ fn effective_agent_for_hook_protocol(
 const INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
 const INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
 
+/// The indeterminate reason published when a command exceeds
+/// `general.max_command_bytes`.
+///
+/// Shared by the pre-writer primary-command refusal and the per-entry batch
+/// refusal so the two sites cannot drift: both must emit identical bytes.
+fn format_oversized_command_reason(command_len: usize, max_command_bytes: usize) -> String {
+    format!(
+        "Command is {command_len} bytes and exceeds limit {max_command_bytes} bytes; \
+         DCG did not evaluate it. Reduce the command size or raise \
+         general.max_command_bytes after review."
+    )
+}
+
 fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
     format!(
         "DCG could not complete safety evaluation within {}ms (stage: {stage}); \
@@ -175,9 +191,8 @@ fn format_indeterminate_reason(stage: &str, budget: Duration) -> String {
 /// response. The protocol response is flushed before best-effort history is
 /// queued, and the history worker is detached before return: once the
 /// evaluation budget is exhausted, no audit sink may delay hook-process exit.
-/// History uses `Warn` as the closest existing non-Allow audit outcome and an
-/// internal synthetic rule identity so deadline events remain independently
-/// queryable without a schema migration.
+/// History records deadline decisions as denied because no supported protocol
+/// lets the command execute without a subsequent human approval.
 fn handle_indeterminate_evaluation(
     protocol: hook::HookProtocol,
     history_writer: Option<&mut HistoryWriter>,
@@ -198,7 +213,7 @@ fn handle_indeterminate_evaluation(
             history_agent_type,
             command,
             working_dir,
-            HistoryOutcome::Warn,
+            HistoryOutcome::Deny,
             elapsed,
             Some(INDETERMINATE_HISTORY_PACK),
             Some(INDETERMINATE_HISTORY_PATTERN),
@@ -265,7 +280,8 @@ fn handle_unparseable_hook_input(
         } else {
             HistoryOutcome::Allow
         };
-        let writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        writer.limit_drop_wait_to(HOOK_EVALUATION_BUDGET);
         let entry = build_history_entry(
             detected_agent.config_key(),
             "<unparseable hook input>",
@@ -436,6 +452,13 @@ fn remove_disabled_packs_for_agent(
 ) {
     let profile = config.agents.profile_for_agent(agent);
     for disabled in &profile.disabled_packs {
+        // `Config::enabled_pack_ids_for_agent` preserves the mandatory core
+        // category after profile expansion. This second pass exists so
+        // profile exclusions also apply to auto-enabled external packs; it
+        // must not undo the core invariant while doing so.
+        if disabled == "core" || disabled.starts_with("core.") {
+            continue;
+        }
         enabled_packs.remove(disabled);
         enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
     }
@@ -459,6 +482,459 @@ fn apply_agent_allowlist_profile(
 
 fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> LayeredAllowlist {
     apply_agent_allowlist_profile(config, agent, load_default_allowlists())
+}
+
+/// A hook command whose evaluation resolved to the deny family
+/// (deny / ask / warn), carrying everything needed to publish the protocol
+/// response later — after every batch entry has been resolved.
+struct ResolvedDenyFamily {
+    command: String,
+    result: dcg_cli::evaluator::EvaluationResult,
+    mode: DecisionMode,
+    eval_duration: Duration,
+}
+
+/// Outcome of resolving (evaluating, mode-resolving, and rebase-recovery
+/// checking) one hook command, WITHOUT publishing any protocol response.
+///
+/// Responses are deferred because hook protocols are one-JSON-document
+/// streams and a `toolCalls[]` batch may contain several non-allow entries:
+/// answering mid-batch would both risk emitting two decision documents and —
+/// the confirmed fail-open — end the request on a Warn entry with later
+/// destructive entries UNEVALUATED. All entries are resolved first, then
+/// exactly one response is chosen by [`outcome_rank`] precedence.
+enum ResolvedCommandOutcome {
+    /// Entry may run; stdout untouched. Covers plain allows, allowlist
+    /// overrides, rebase-recovery conversions, and `Log`-mode matches (the
+    /// latter two log their own history rows at resolve time, as before).
+    /// Carries the would-be history Allow row (built only when history is
+    /// enabled and only for plain allows) so an all-allow request can record
+    /// exactly one Allow row for the primary command.
+    Allow(Option<Box<CommandEntry>>),
+    /// Command exceeds `max_command_bytes` and cannot be evaluated. Publishes
+    /// the size-limit indeterminate message (no history row, as before).
+    OversizedCommand { command_len: usize },
+    /// The shared wall-clock deadline was exhausted before or while
+    /// evaluating this entry. Publishes the conservative indeterminate
+    /// response — never a silent allow of unscanned entries.
+    DeadlineExhausted {
+        command: String,
+        stage: &'static str,
+    },
+    /// Deny / Ask / Warn candidate awaiting decisive selection.
+    DenyFamily(Box<ResolvedDenyFamily>),
+}
+
+/// Precedence ranks for decisive-response selection across a batch.
+/// Higher wins; ties keep the earliest entry (scan order).
+const RANK_ALLOW: u8 = 0;
+const RANK_WARN: u8 = 1;
+const RANK_ASK: u8 = 2;
+const RANK_INDETERMINATE: u8 = 3;
+const RANK_DENY: u8 = 4;
+
+/// Rank a deny-family decision mode: Deny > Ask > Warn.
+///
+/// Indeterminate outcomes rank between Deny and Ask (see [`outcome_rank`]): a
+/// proven destructive entry must deny even if another entry could not be
+/// evaluated, while an unevaluated entry must escalate over ask/warn/allow.
+const fn deny_family_rank(mode: DecisionMode) -> u8 {
+    match mode {
+        DecisionMode::Deny => RANK_DENY,
+        DecisionMode::Ask => RANK_ASK,
+        DecisionMode::Warn => RANK_WARN,
+        // Log-mode entries are fully handled at resolve time and never enter
+        // the deny-family candidate set; ranked as allow for exhaustiveness.
+        DecisionMode::Log => RANK_ALLOW,
+    }
+}
+
+/// Precedence of a resolved outcome: Deny > Indeterminate > Ask > Warn >
+/// Log/Allow.
+fn outcome_rank(outcome: &ResolvedCommandOutcome) -> u8 {
+    match outcome {
+        ResolvedCommandOutcome::Allow(_) => RANK_ALLOW,
+        ResolvedCommandOutcome::OversizedCommand { .. }
+        | ResolvedCommandOutcome::DeadlineExhausted { .. } => RANK_INDETERMINATE,
+        ResolvedCommandOutcome::DenyFamily(resolved) => deny_family_rank(resolved.mode),
+    }
+}
+
+/// Shared per-request state for evaluating hook commands.
+///
+/// The VS Code Agent Host batches several shell commands into one hook
+/// request (issue #252). Each entry is evaluated independently against this
+/// shared context — same config, allowlists, packs, and wall-clock
+/// [`Deadline`] — so a batch cannot buy itself extra evaluation budget.
+struct HookEvalContext<'a> {
+    config: &'a Config,
+    enabled_keywords: &'a [&'static str],
+    ordered_packs: &'a [String],
+    keyword_index: Option<&'a EnabledKeywordIndex>,
+    compiled_overrides: &'a CompiledOverrides,
+    allowlists: &'a LayeredAllowlist,
+    heredoc_settings: &'a HeredocSettings,
+    cwd_path: Option<&'a Path>,
+    working_dir: &'a str,
+    deadline: &'a Deadline,
+    hook_protocol: hook::HookProtocol,
+    history_agent_type: &'a str,
+    max_command_bytes: usize,
+}
+
+/// Resolve one hook command end-to-end WITHOUT publishing a protocol
+/// response.
+///
+/// This is the single evaluate-and-resolve path for both the primary command
+/// and every additional `toolCalls[]` batch entry: evaluation, per-entry mode
+/// resolution, and the per-entry rebase-recovery conversion all happen here,
+/// so the decisive selection afterwards compares RESOLVED outcomes. Resolve-
+/// time side effects deliberately kept from the old flow: rebase-recovery
+/// conversions log their history row (and stderr note) immediately, and
+/// `Log`-mode matches log their history row and optional file log
+/// immediately — both are stdout-silent and never mask later entries.
+#[allow(clippy::too_many_lines)]
+fn resolve_hook_command(
+    ctx: &HookEvalContext<'_>,
+    command: &str,
+    shell_dialect: ShellDialect,
+    history_writer: Option<&HistoryWriter>,
+) -> ResolvedCommandOutcome {
+    // Refuse oversized commands conservatively. The limit bounds every later
+    // parser and scanner, so truncating or treating the command as clean would
+    // let an attacker hide a destructive tail beyond the inspected prefix.
+    if command.len() > ctx.max_command_bytes {
+        return ResolvedCommandOutcome::OversizedCommand {
+            command_len: command.len(),
+        };
+    }
+
+    if ctx.deadline.is_exceeded() {
+        return ResolvedCommandOutcome::DeadlineExhausted {
+            command: command.to_string(),
+            stage: "pre_evaluation",
+        };
+    }
+
+    // Use the shared evaluator for hook mode parity with `dcg test`.
+    let eval_start = Instant::now();
+    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        ctx.enabled_keywords,
+        ctx.ordered_packs,
+        ctx.keyword_index,
+        ctx.compiled_overrides,
+        ctx.allowlists,
+        ctx.heredoc_settings,
+        None,         // allow_once_audit
+        ctx.cwd_path, // project_path: scopes path-aware allowlist entries (#186)
+        Some(ctx.deadline),
+        shell_dialect,
+    );
+
+    // NOTE: External packs from custom_paths are now checked in evaluate_command()
+    // alongside built-in packs, so no separate fallback check is needed here.
+
+    let eval_duration = eval_start.elapsed();
+
+    if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
+        return ResolvedCommandOutcome::DeadlineExhausted {
+            command: command.to_string(),
+            stage: "evaluation",
+        };
+    }
+
+    if result.decision != EvaluationDecision::Deny {
+        // Build the would-be Allow history row only when history is enabled;
+        // the caller logs it only when this entry is the primary and the
+        // whole request resolves all-allow.
+        let allow_row = history_writer.map(|_| {
+            let mut pack_id = None;
+            let mut pattern_name = None;
+            let mut allowlist_layer = None;
+
+            if let Some(override_) = result.allowlist_override.as_ref() {
+                allowlist_layer = Some(override_.layer.label());
+                pack_id = override_.matched.pack_id.as_deref();
+                pattern_name = override_.matched.pattern_name.as_deref();
+            }
+
+            Box::new(build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                pack_id,
+                pattern_name,
+                allowlist_layer,
+            ))
+        });
+        return ResolvedCommandOutcome::Allow(allow_row);
+    }
+
+    let Some(ref info) = result.pattern_info else {
+        // Fail open: structurally unexpected, but hook safety wins.
+        let allow_row = history_writer.map(|_| {
+            Box::new(build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                None,
+                None,
+                None,
+            ))
+        });
+        return ResolvedCommandOutcome::Allow(allow_row);
+    };
+
+    let pack = info.pack_id.as_deref();
+    let mode = dcg_cli::evaluator::resolve_effective_mode(ctx.config, command, &result)
+        .unwrap_or(DecisionMode::Deny);
+
+    let pattern = info.pattern_name.as_deref();
+
+    // Rebase-recovery unblock (issue #104), applied per command.
+    //
+    // Before emitting a hard deny, check whether this is one of the narrow
+    // "recovery" patterns (`checkout-discard`, `restore-worktree`, etc.)
+    // AND a recovery signal is active: either a rebase is in progress
+    // (`.git/rebase-merge/` or `.git/rebase-apply/`) or a short-lived
+    // `dcg rebase-recover` permit was issued. If yes, convert the deny
+    // into an allow with a stderr note and (for the permit case) consume
+    // the cookie so subsequent unrelated commands stay blocked.
+    //
+    // Safety: only fires when BOTH (a) the matched pattern is on the
+    // small recovery allowlist, AND (b) a recovery signal is active.
+    // Outside this narrow window the original deny path is unchanged. The
+    // conversion leaves stdout untouched, so later batch entries are still
+    // evaluated.
+    if matches!(mode, DecisionMode::Deny) {
+        if let Some(cwd_ref) = ctx.cwd_path {
+            if let Some(reason) =
+                dcg_cli::rebase_recovery::should_allow_recovery(cwd_ref, pack, pattern)
+            {
+                // Consume the permit if that's why we allowed (single-shot).
+                if matches!(
+                    reason,
+                    dcg_cli::rebase_recovery::RecoveryReason::ActivePermit(_)
+                ) {
+                    dcg_cli::rebase_recovery::consume_permit(cwd_ref);
+                }
+                // Inform on stderr (visible to the agent and to humans).
+                // Stays silent when stderr isn't a TTY and robot mode is on,
+                // but the message itself is always safe to emit.
+                eprintln!(
+                    "[dcg] Allowing `{}` → rebase-recovery mode ({})",
+                    pattern.unwrap_or("<unknown>"),
+                    reason.label()
+                );
+                if let Some(writer) = history_writer {
+                    let entry = build_history_entry(
+                        ctx.history_agent_type,
+                        command,
+                        ctx.working_dir,
+                        HistoryOutcome::Allow,
+                        eval_duration,
+                        pack,
+                        pattern,
+                        Some("rebase-recovery"),
+                    );
+                    writer.log(entry);
+                }
+                return ResolvedCommandOutcome::Allow(None);
+            }
+        }
+    }
+
+    if mode == DecisionMode::Log {
+        // Silent allow with its own audit row; never a response candidate, so
+        // it can never mask later batch entries.
+        if let Some(writer) = history_writer {
+            let entry = build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                pack,
+                pattern,
+                None,
+            );
+            writer.log(entry);
+        }
+        if let Some(log_file) = &ctx.config.general.log_file {
+            let _ = hook::log_blocked_command(log_file, command, &info.reason, pack);
+        }
+        return ResolvedCommandOutcome::Allow(None);
+    }
+
+    ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
+        command: command.to_string(),
+        result,
+        mode,
+        eval_duration,
+    }))
+}
+
+/// Publish the single protocol response for the decisive resolved outcome,
+/// with its history row — the decisive entry's row, exactly as the
+/// single-command flow records it.
+#[allow(clippy::too_many_lines)]
+fn publish_decisive_response(
+    ctx: &HookEvalContext<'_>,
+    outcome: ResolvedCommandOutcome,
+    history_writer: &mut Option<HistoryWriter>,
+) {
+    let resolved = match outcome {
+        // Never selected as decisive; the caller only publishes non-allow
+        // outcomes.
+        ResolvedCommandOutcome::Allow(_) => return,
+        ResolvedCommandOutcome::OversizedCommand { command_len } => {
+            let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
+            hook::output_indeterminate_for_protocol(ctx.hook_protocol, &reason);
+            return;
+        }
+        ResolvedCommandOutcome::DeadlineExhausted { command, stage } => {
+            handle_indeterminate_evaluation(
+                ctx.hook_protocol,
+                history_writer.as_mut(),
+                ctx.history_agent_type,
+                &command,
+                ctx.working_dir,
+                stage,
+                ctx.deadline,
+            );
+            return;
+        }
+        ResolvedCommandOutcome::DenyFamily(resolved) => resolved,
+    };
+
+    let ResolvedDenyFamily {
+        command,
+        result,
+        mode,
+        eval_duration,
+    } = *resolved;
+    let Some(ref info) = result.pattern_info else {
+        // Unreachable by construction: resolve_hook_command only builds a
+        // DenyFamily when pattern_info is present.
+        return;
+    };
+    let pack = info.pack_id.as_deref();
+    let pattern = info.pattern_name.as_deref();
+    let explanation = info.explanation.as_deref();
+
+    if let Some(writer) = history_writer.as_ref() {
+        let outcome = match mode {
+            DecisionMode::Deny | DecisionMode::Ask => HistoryOutcome::Deny,
+            DecisionMode::Warn => HistoryOutcome::Warn,
+            DecisionMode::Log => HistoryOutcome::Allow,
+        };
+        let entry = build_history_entry(
+            ctx.history_agent_type,
+            &command,
+            ctx.working_dir,
+            outcome,
+            eval_duration,
+            pack,
+            pattern,
+            None,
+        );
+        writer.log(entry);
+    }
+
+    match mode {
+        DecisionMode::Deny | DecisionMode::Ask => {
+            let store_path = PendingExceptionStore::default_path(ctx.cwd_path);
+            let store = PendingExceptionStore::new(store_path);
+            let reason = match (pack, pattern) {
+                (Some(pack_id), Some(pattern_name)) => {
+                    format!("{pack_id}:{pattern_name} - {}", info.reason)
+                }
+                _ => info.reason.clone(),
+            };
+
+            let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
+            if let Ok((record, maintenance)) = store.record_block(
+                &command,
+                ctx.working_dir,
+                &reason,
+                &ctx.config.logging.redaction,
+                false,
+                Some(format!("{:?}", info.source)),
+                None,
+            ) {
+                allow_once_info = Some(hook::AllowOnceInfo {
+                    code: record.short_code,
+                    full_hash: record.full_hash,
+                });
+                if let Some(log_file) = ctx.config.general.log_file.as_deref() {
+                    let _ = log_maintenance(log_file, maintenance, "record_block");
+                }
+            }
+
+            let branch_ctx = if ctx.config.git_awareness.should_show_branch_in_output() {
+                result.branch_context.as_ref()
+            } else {
+                None
+            };
+            if mode == DecisionMode::Ask {
+                hook::output_review_request_for_protocol(
+                    ctx.hook_protocol,
+                    &command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    None, // confidence not yet available in PatternMatch
+                    info.suggestions,
+                    branch_ctx,
+                );
+            } else {
+                hook::output_denial_for_protocol(
+                    ctx.hook_protocol,
+                    &command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    None, // confidence not yet available in PatternMatch
+                    info.suggestions,
+                    branch_ctx,
+                );
+            }
+
+            // Log if configured
+            if let Some(log_file) = &ctx.config.general.log_file {
+                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
+            }
+
+            // Review-capable clients receive ask; all others receive their
+            // ordinary blocking response. Returning normally lets
+            // `HistoryWriter::Drop` flush the buffered audit entry.
+        }
+        DecisionMode::Warn => {
+            hook::output_warning_for_protocol(
+                ctx.hook_protocol,
+                &command,
+                &info.reason,
+                pack,
+                pattern,
+                explanation,
+            );
+        }
+        // Unreachable: Log-mode entries are handled at resolve time.
+        DecisionMode::Log => {}
+    }
 }
 
 // NOTE: Denial output functions (format_denial_message, print_colorful_warning, deny)
@@ -648,35 +1124,36 @@ fn main() {
     // Start evaluation deadline after input size checks (includes evaluation).
     // Enforce a minimum timeout so a zero-valued override cannot force every
     // hook request immediately into the conservative indeterminate path.
-    let deadline = Deadline::new(
-        config
-            .general
-            .hook_timeout_ms
-            .map_or(HOOK_EVALUATION_BUDGET, |ms| {
-                Duration::from_millis(ms.max(dcg_cli::perf::MIN_HOOK_TIMEOUT_MS))
-            }),
-    );
+    let deadline = Deadline::new(Duration::from_millis(config.effective_hook_timeout_ms()));
 
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
         return;
     };
-    let command = extracted_command.command;
-    let hook_protocol = extracted_command.protocol;
-    let shell_dialect = extracted_command.dialect;
+    let hook::ExtractedHookCommand {
+        command,
+        protocol: hook_protocol,
+        dialect: shell_dialect,
+        additional_commands,
+    } = extracted_command;
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, &detected_agent);
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, &detected_agent);
-
-    // Refuse oversized commands conservatively. The limit bounds every later
-    // parser and scanner, so truncating or treating the command as clean would
-    // let an attacker hide a destructive tail beyond the inspected prefix.
     let max_command_bytes = config.general.max_command_bytes();
-    if command.len() > max_command_bytes {
-        let reason = format!(
-            "Command is {} bytes and exceeds limit {} bytes; DCG did not evaluate it. \
-             Reduce the command size or raise general.max_command_bytes after review.",
-            command.len(),
-            max_command_bytes
-        );
+
+    // Refuse an oversized single-command request before ANY per-request
+    // machinery exists — allowlist loading, pack expansion, and especially the
+    // history writer, whose construction creates the database, spawns a worker
+    // thread, and installs a shutdown handler. A payload dcg refuses to
+    // evaluate must not be able to provoke that work (it did not before the
+    // batch refactor moved the check behind the writer).
+    //
+    // Requests that carry additional batch entries deliberately fall through
+    // to the per-entry check inside `resolve_hook_command`: the other entries
+    // are still evaluable, and a proven Deny there must outrank this
+    // indeterminate answer rather than be pre-empted by it. Both sites format
+    // the reason through `format_oversized_command_reason`, so the emitted
+    // bytes are identical either way.
+    if additional_commands.is_empty() && command.len() > max_command_bytes {
+        let reason = format_oversized_command_reason(command.len(), max_command_bytes);
         hook::output_indeterminate_for_protocol(hook_protocol, &reason);
         return;
     }
@@ -726,10 +1203,9 @@ fn main() {
     );
 
     let mut history_writer = if config.history.enabled {
-        Some(HistoryWriter::new(
-            history_db_path(&config.history),
-            &config.history,
-        ))
+        let mut writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+        Some(writer)
     } else {
         None
     };
@@ -740,283 +1216,74 @@ fn main() {
         }
     }
 
-    if deadline.is_exceeded() {
-        handle_indeterminate_evaluation(
-            hook_protocol,
-            history_writer.as_mut(),
-            history_agent_type,
-            &command,
-            &working_dir,
-            "pre_evaluation",
-            &deadline,
-        );
-        return;
-    }
-
-    // Use the shared evaluator for hook mode parity with `dcg test`.
-    let eval_start = Instant::now();
-    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
-        &command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
-        &allowlists,
-        &heredoc_settings,
-        None,                // allow_once_audit
-        cwd_path.as_deref(), // project_path: scopes path-aware allowlist entries (#186)
-        Some(&deadline),
-        shell_dialect,
-    );
-
-    // NOTE: External packs from custom_paths are now checked in evaluate_command()
-    // alongside built-in packs, so no separate fallback check is needed here.
-
-    let eval_duration = eval_start.elapsed();
-
-    if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
-        handle_indeterminate_evaluation(
-            hook_protocol,
-            history_writer.as_mut(),
-            history_agent_type,
-            &command,
-            &working_dir,
-            "evaluation",
-            &deadline,
-        );
-        return;
-    }
-
-    if result.decision != EvaluationDecision::Deny {
-        if let Some(writer) = history_writer.as_ref() {
-            let mut pack_id = None;
-            let mut pattern_name = None;
-            let mut allowlist_layer = None;
-
-            if let Some(override_) = result.allowlist_override.as_ref() {
-                allowlist_layer = Some(override_.layer.label());
-                pack_id = override_.matched.pack_id.as_deref();
-                pattern_name = override_.matched.pattern_name.as_deref();
-            }
-
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                pack_id,
-                pattern_name,
-                allowlist_layer,
-            );
-            writer.log(entry);
-        }
-        return;
-    }
-
-    let Some(ref info) = result.pattern_info else {
-        // Fail open: structurally unexpected, but hook safety wins.
-        if let Some(writer) = history_writer.as_ref() {
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                None,
-                None,
-                None,
-            );
-            writer.log(entry);
-        }
-        return;
+    let eval_context = HookEvalContext {
+        config: &config,
+        enabled_keywords: &enabled_keywords,
+        ordered_packs: &ordered_packs,
+        keyword_index: keyword_index.as_ref(),
+        compiled_overrides: &compiled_overrides,
+        allowlists: &allowlists,
+        heredoc_settings: &heredoc_settings,
+        cwd_path: cwd_path.as_deref(),
+        working_dir: &working_dir,
+        deadline: &deadline,
+        hook_protocol,
+        history_agent_type,
+        max_command_bytes,
     };
 
-    let pack = info.pack_id.as_deref();
-    let mut mode = match info.source {
-        MatchSource::Pack | MatchSource::HeredocAst => {
-            config
-                .policy()
-                .resolve_mode(pack, info.pattern_name.as_deref(), info.severity, None)
-        }
-        // Never downgrade explicit blocks.
-        MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
-    };
+    // Resolve EVERY command in the request before publishing anything (issue
+    // #252 batches): each entry is evaluated independently, with its own
+    // dialect, against the same shared wall-clock deadline. Responding
+    // mid-batch was a confirmed fail-open — a Warn-mode entry ended the
+    // request with later destructive entries unevaluated — and also risked
+    // emitting two decision documents on one-JSON-document protocols.
+    // Exactly one response is chosen afterwards by precedence:
+    // Deny > Indeterminate > Ask > Warn > Log/Allow (ties keep scan order).
+    let mut decisive: Option<ResolvedCommandOutcome> = None;
+    let mut primary_allow_row: Option<Box<CommandEntry>> = None;
 
-    // Apply confidence scoring (if enabled) to potentially downgrade Deny to Warn.
-    // Only applies to pack/heredoc matches, not config overrides.
-    if matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst) {
-        let sanitized = sanitize_for_pattern_matching(&command);
-        let normalized_command = normalize_command(&command);
-        let normalized_sanitized = normalize_command(sanitized.as_ref());
-
-        let mut confidence_command = command.as_str();
-        let mut confidence_sanitized: Option<&str> = None;
-
-        if normalized_command.len() == normalized_sanitized.len() {
-            confidence_command = normalized_command.as_ref();
-            if sanitized.as_ref() != command {
-                confidence_sanitized = Some(normalized_sanitized.as_ref());
-            }
-        }
-
-        let confidence_result = dcg_cli::apply_confidence_scoring(
-            confidence_command,
-            confidence_sanitized,
-            &result,
-            mode,
-            &config.confidence,
+    for (index, (entry_command, entry_dialect)) in std::iter::once((command, shell_dialect))
+        .chain(additional_commands)
+        .enumerate()
+    {
+        let outcome = resolve_hook_command(
+            &eval_context,
+            &entry_command,
+            entry_dialect,
+            history_writer.as_ref(),
         );
-        mode = confidence_result.mode;
-    }
-
-    let pattern = info.pattern_name.as_deref();
-    let explanation = info.explanation.as_deref();
-
-    // Rebase-recovery unblock (issue #104).
-    //
-    // Before emitting a hard deny, check whether this is one of the narrow
-    // "recovery" patterns (`checkout-discard`, `restore-worktree`, etc.)
-    // AND a recovery signal is active: either a rebase is in progress
-    // (`.git/rebase-merge/` or `.git/rebase-apply/`) or a short-lived
-    // `dcg rebase-recover` permit was issued. If yes, convert the deny
-    // into an allow with a stderr note and (for the permit case) consume
-    // the cookie so subsequent unrelated commands stay blocked.
-    //
-    // Safety: only fires when BOTH (a) the matched pattern is on the
-    // small recovery allowlist, AND (b) a recovery signal is active.
-    // Outside this narrow window the original deny path is unchanged.
-    if matches!(mode, DecisionMode::Deny) {
-        if let Some(cwd_ref) = cwd_path.as_deref() {
-            if let Some(reason) =
-                dcg_cli::rebase_recovery::should_allow_recovery(cwd_ref, pack, pattern)
-            {
-                // Consume the permit if that's why we allowed (single-shot).
-                if matches!(
-                    reason,
-                    dcg_cli::rebase_recovery::RecoveryReason::ActivePermit(_)
-                ) {
-                    dcg_cli::rebase_recovery::consume_permit(cwd_ref);
+        match outcome {
+            ResolvedCommandOutcome::Allow(row) => {
+                if index == 0 {
+                    primary_allow_row = row;
                 }
-                // Inform on stderr (visible to the agent and to humans).
-                // Stays silent when stderr isn't a TTY and robot mode is on,
-                // but the message itself is always safe to emit.
-                eprintln!(
-                    "[dcg] Allowing `{}` → rebase-recovery mode ({})",
-                    pattern.unwrap_or("<unknown>"),
-                    reason.label()
-                );
-                if let Some(writer) = history_writer.as_ref() {
-                    let entry = build_history_entry(
-                        history_agent_type,
-                        &command,
-                        &working_dir,
-                        HistoryOutcome::Allow,
-                        eval_duration,
-                        pack,
-                        pattern,
-                        Some("rebase-recovery"),
-                    );
-                    writer.log(entry);
+            }
+            other => {
+                // Nothing outranks a Deny, and once the shared deadline is
+                // exhausted every later entry would resolve DeadlineExhausted
+                // too — stop scanning for both. Oversized entries keep the
+                // scan going: later entries remain evaluable and a proven
+                // Deny outranks the indeterminate answer.
+                let stop = outcome_rank(&other) == RANK_DENY
+                    || matches!(other, ResolvedCommandOutcome::DeadlineExhausted { .. });
+                if decisive.as_ref().map_or(RANK_ALLOW, outcome_rank) < outcome_rank(&other) {
+                    decisive = Some(other);
                 }
-                return;
+                if stop {
+                    break;
+                }
             }
         }
     }
 
-    if let Some(writer) = history_writer.as_ref() {
-        let outcome = match mode {
-            DecisionMode::Deny => HistoryOutcome::Deny,
-            DecisionMode::Warn => HistoryOutcome::Warn,
-            DecisionMode::Log => HistoryOutcome::Allow,
-        };
-        let entry = build_history_entry(
-            history_agent_type,
-            &command,
-            &working_dir,
-            outcome,
-            eval_duration,
-            pack,
-            pattern,
-            None,
-        );
-        writer.log(entry);
-    }
-
-    match mode {
-        DecisionMode::Deny => {
-            let store_path = PendingExceptionStore::default_path(cwd_path.as_deref());
-            let store = PendingExceptionStore::new(store_path);
-            let reason = match (pack, pattern) {
-                (Some(pack_id), Some(pattern_name)) => {
-                    format!("{pack_id}:{pattern_name} - {}", info.reason)
-                }
-                _ => info.reason.clone(),
-            };
-
-            let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
-            if let Ok((record, maintenance)) = store.record_block(
-                &command,
-                &working_dir,
-                &reason,
-                &config.logging.redaction,
-                false,
-                Some(format!("{:?}", info.source)),
-                None,
-            ) {
-                allow_once_info = Some(hook::AllowOnceInfo {
-                    code: record.short_code,
-                    full_hash: record.full_hash,
-                });
-                if let Some(log_file) = config.general.log_file.as_deref() {
-                    let _ = log_maintenance(log_file, maintenance, "record_block");
-                }
-            }
-
-            let branch_ctx = if config.git_awareness.should_show_branch_in_output() {
-                result.branch_context.as_ref()
-            } else {
-                None
-            };
-            hook::output_denial_for_protocol(
-                hook_protocol,
-                &command,
-                &info.reason,
-                pack,
-                pattern,
-                explanation,
-                allow_once_info.as_ref(),
-                info.matched_span.as_ref(),
-                info.severity,
-                None, // confidence not yet available in PatternMatch
-                info.suggestions,
-                branch_ctx,
-            );
-
-            // Log if configured
-            if let Some(log_file) = &config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
-            }
-
-            // All deny protocols, including current Codex, return normally so
-            // buffered history is flushed by `HistoryWriter::Drop`. Codex gets
-            // a minimal stdout JSON denial from `output_denial_for_protocol`.
-        }
-        DecisionMode::Warn => {
-            hook::output_warning_for_protocol(
-                hook_protocol,
-                &command,
-                &info.reason,
-                pack,
-                pattern,
-                explanation,
-            );
-        }
-        DecisionMode::Log => {
-            // Silent allow; optionally log to file for history.
-            if let Some(log_file) = &config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
-            }
+    if let Some(outcome) = decisive {
+        publish_decisive_response(&eval_context, outcome, &mut history_writer);
+    } else if let Some(entry) = primary_allow_row {
+        // All-allow request: record exactly one history Allow row, for the
+        // primary command, matching the single-command flow.
+        if let Some(writer) = history_writer.as_ref() {
+            writer.log(*entry);
         }
     }
 }
@@ -1051,23 +1318,11 @@ fn print_help() {
     eprintln!();
     eprintln!(
         "    {}",
-        "╭──────────────────────────────────────────────────────────────╮".bright_black()
+        "Hook commands must use the resolved absolute dcg executable path.".white()
     );
     eprintln!(
-        "    {} {} {}",
-        "│".bright_black(),
-        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash","#.white(),
-        "│".bright_black()
-    );
-    eprintln!(
-        "    {}   {} {}",
-        "│".bright_black(),
-        r#""hooks": [{"type": "command", "command": "dcg"}]}]}}"#.white(),
-        "│".bright_black()
-    );
-    eprintln!(
-        "    {}",
-        "╰──────────────────────────────────────────────────────────────╯".bright_black()
+        "    Run {} to install or repair it safely.",
+        "dcg install".green()
     );
     eprintln!();
 
@@ -1282,6 +1537,33 @@ mod tests {
             "reason: {reason}"
         );
         assert!(reason.contains("hook_timeout_ms"), "reason: {reason}");
+    }
+
+    #[test]
+    fn decisive_precedence_is_deny_indeterminate_ask_warn_allow() {
+        // The batch-response selection must escalate in exactly this order;
+        // anything weaker lets a low-severity entry mask a stronger one
+        // (the confirmed fail-open was a Warn entry ending the request
+        // before a destructive sibling was evaluated).
+        assert!(deny_family_rank(DecisionMode::Deny) > RANK_INDETERMINATE);
+        assert!(RANK_INDETERMINATE > deny_family_rank(DecisionMode::Ask));
+        assert!(deny_family_rank(DecisionMode::Ask) > deny_family_rank(DecisionMode::Warn));
+        assert!(deny_family_rank(DecisionMode::Warn) > RANK_ALLOW);
+        // Log-mode entries never become response candidates.
+        assert_eq!(deny_family_rank(DecisionMode::Log), RANK_ALLOW);
+
+        // Both indeterminate flavors share the tier between Deny and Ask.
+        let oversized = ResolvedCommandOutcome::OversizedCommand { command_len: 99 };
+        let exhausted = ResolvedCommandOutcome::DeadlineExhausted {
+            command: "echo hi".to_string(),
+            stage: "evaluation",
+        };
+        assert_eq!(outcome_rank(&oversized), RANK_INDETERMINATE);
+        assert_eq!(outcome_rank(&exhausted), RANK_INDETERMINATE);
+        assert_eq!(
+            outcome_rank(&ResolvedCommandOutcome::Allow(None)),
+            RANK_ALLOW
+        );
     }
 
     mod top_level_dispatch_tests {
@@ -1804,7 +2086,7 @@ mod tests {
             let allowlists =
                 apply_agent_allowlist_profile(config, agent, LayeredAllowlist::default());
 
-            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            evaluate_command_with_pack_order_deadline_at_path(
                 command,
                 &enabled_keywords,
                 &ordered_packs,
@@ -1815,7 +2097,6 @@ mod tests {
                 None,
                 None,
                 None,
-                dcg_cli::normalize::ShellDialect::Unknown,
             )
         }
 
@@ -1923,6 +2204,29 @@ mod tests {
 
             assert_eq!(result.decision, EvaluationDecision::Allow);
             assert!(result.pattern_info.is_none());
+        }
+
+        #[test]
+        fn hook_agent_cannot_disable_mandatory_core_packs() {
+            let mut config = Config::default();
+            config.agents.profiles.insert(
+                "unknown".to_string(),
+                AgentProfile {
+                    disabled_packs: vec!["core".to_string(), "core.git".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let result = evaluate_with_agent(&config, &Agent::Unknown, "git reset --hard HEAD~1");
+
+            assert_eq!(result.decision, EvaluationDecision::Deny);
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some("core.git")
+            );
         }
     }
 

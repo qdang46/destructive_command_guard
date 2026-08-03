@@ -27,7 +27,8 @@ pub struct HookInput {
     #[serde(alias = "hookEventName")]
     pub hook_event_name: Option<String>,
 
-    /// Gemini session id.
+    /// Session id (Gemini snake_case; VS Code Agent Host camelCase).
+    #[serde(alias = "sessionId")]
     pub session_id: Option<String>,
 
     /// Gemini transcript path.
@@ -72,6 +73,28 @@ pub struct HookInput {
     /// capturing the stdin `agy` passes to a `PreToolUse` hook.
     #[serde(alias = "toolCall")]
     pub tool_call: Option<ToolCall>,
+
+    /// VS Code "Agent Host" batched tool-call envelope (issue #252). The
+    /// newer Copilot Agent Host (and the Agents window built on it) sends
+    /// `{"sessionId": "...", "cwd": "...", "toolCalls": [{"name":
+    /// "powershell", "args": "{\"command\":\"...\"}"}]}` — an *array* under
+    /// plural `toolCalls`, with each entry's `args` JSON-encoded as a string.
+    /// Before this field existed the envelope deserialized without any
+    /// recognized command and the hook silently failed open.
+    ///
+    /// The field is deliberately shape-tolerant: a `toolCalls` value that is
+    /// not an array (or an entry that does not fit [`ToolCall`]) must degrade
+    /// to `None` (or be skipped) instead of aborting the whole [`HookInput`]
+    /// parse. A whole-payload parse failure fails open, which would let a
+    /// malformed `toolCalls` mask a perfectly good `tool_input` command
+    /// elsewhere in the same payload.
+    #[serde(
+        alias = "toolCalls",
+        alias = "toolcalls",
+        default,
+        deserialize_with = "deserialize_tool_calls_tolerant"
+    )]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 /// Tool-specific input containing the command to execute.
@@ -93,6 +116,38 @@ pub struct ToolCall {
 
     /// Tool arguments. For `run_command`, this carries `CommandLine`.
     pub args: Option<serde_json::Value>,
+}
+
+/// Deserialize the plural `toolCalls` field without ever failing the parse.
+///
+/// A typed `Option<Vec<ToolCall>>` aborts the entire [`HookInput`]
+/// deserialization when the field arrives in an unexpected shape (for example
+/// an object keyed by index), and an aborted parse fails open — silently
+/// allowing a destructive command carried by `tool_input` in the same payload.
+/// This deserializer therefore accepts:
+/// - absent / `null` → `None`;
+/// - a JSON array → each entry parsed individually as [`ToolCall`], with
+///   entries that do not fit silently skipped (the ones that do fit are kept);
+/// - any non-array shape → `None`, so the rest of the payload still parses and
+///   the `tool_input` / `toolCall` extraction paths keep working.
+fn deserialize_tool_calls_tolerant<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ToolCall>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let serde_json::Value::Array(entries) = value else {
+        return Ok(None);
+    };
+    Ok(Some(
+        entries
+            .into_iter()
+            .filter_map(|entry| serde_json::from_value::<ToolCall>(entry).ok())
+            .collect(),
+    ))
 }
 
 /// Output structure for denying a command.
@@ -328,6 +383,14 @@ pub enum HookProtocol {
     /// Claude Code / Augment-compatible `hookSpecificOutput` protocol.
     /// Tolerant JSON parser; accepts dcg's full deny payload with
     /// `allowOnceCode`, `ruleId`, `severity`, `remediation`, etc.
+    ///
+    /// Posit Assistant also speaks this protocol: its `PreToolUse` stdin is
+    /// the snake_case Claude shape (`tool_name`, `tool_input.command`,
+    /// `tool_use_id`, `permission_mode`), exit code 2 blocks with stderr as
+    /// the reason, and `hookSpecificOutput.permissionDecision` is read on
+    /// exit 0 — so no dedicated variant is needed. Its hook env var
+    /// `PA_PROJECT_DIR` is consulted in [`detect_protocol`] only to keep a
+    /// `powershell`-named shell tool from being classified as Codex.
     ClaudeCompatible,
     /// Copilot hook protocol (top-level permission decision and reason).
     Copilot,
@@ -394,6 +457,13 @@ pub struct ExtractedHookCommand {
     pub protocol: HookProtocol,
     /// Shell syntax proven by the hook tool name, or `Unknown`.
     pub dialect: ShellDialect,
+    /// Remaining batch entries from a plural `toolCalls[]` envelope (issue
+    /// #252), each carrying its own per-entry dialect. Empty on every
+    /// single-command path. Entries are deliberately NOT joined into one
+    /// string: an entry ending in an unterminated quote or trailing backslash
+    /// would swallow the following entry during tokenization and mask its
+    /// destructive command, so each entry must be evaluated independently.
+    pub additional_commands: Vec<(String, ShellDialect)>,
 }
 
 /// Allow-once metadata for denial output.
@@ -500,6 +570,12 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
 /// and `CLAUDE_CODE` env var), then Gemini-specific markers (tool name
 /// `"run_shell_command"` with hook event `"BeforeTool"`).
 ///
+/// Posit Assistant uses the Claude wire shape, so it resolves to
+/// [`HookProtocol::ClaudeCompatible`] through the shared shell-tool names. Its
+/// hook env var `PA_PROJECT_DIR` is consulted only to steer a
+/// `powershell`-named shell tool away from the unconditional Windows-shell →
+/// Codex rule.
+///
 /// See: <https://github.com/Dicklesworthstone/destructive_command_guard/issues/77>
 #[must_use]
 pub fn detect_protocol(input: &HookInput) -> HookProtocol {
@@ -509,6 +585,30 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
     let hook_event_name = input.hook_event_name.as_deref().unwrap_or_default();
+
+    // --- VS Code Agent Host indicators (checked first) ---
+    // The Copilot "Agent Host" batches tool calls in a plural `toolCalls`
+    // array (issue #252); no other supported agent emits that field. VS Code
+    // consumes Claude-shaped hook output through its Claude-hooks
+    // compatibility layer (#184), so the Claude-compatible deny payload is
+    // the documented answer shape.
+    //
+    // The branch is gated on the batch actually containing a SHELL entry —
+    // the same [`is_batch_shell_call`] predicate extraction and
+    // [`is_shell_hook_candidate`] use. A `toolCalls` array carrying only
+    // non-shell entries (`readFile`, `editFile`, …) is not proof of the Agent
+    // Host: another agent's envelope can carry one while its real shell
+    // command sits in `tool_input`, and answering that payload in Claude
+    // shape would hand Gemini/Hermes/Grok/Codex a deny document their parsers
+    // drop (a silent fail-open). Such a batch falls through to the ordinary
+    // markers below.
+    if input
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| calls.iter().any(is_batch_shell_call))
+    {
+        return HookProtocol::ClaudeCompatible;
+    }
 
     // --- Antigravity CLI (`agy`) indicators (checked first) ---
     // `agy` is the only agent that nests the tool name and arguments under a
@@ -603,32 +703,65 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return HookProtocol::Codex;
     }
 
-    // PowerShell tool names ("powershell"/"pwsh") are only ever emitted by
-    // Codex-style payloads -- Claude Code's shell tool is always "Bash" (or
-    // "launch-process"), never a PowerShell name, so this cannot collide with
-    // Claude Code. On Windows, Codex drives commands through PowerShell but
-    // does not always populate `turn_id` (issue #125), so the turn_id-gated
-    // check above misses it and the destructive command would otherwise slip
-    // through as a ClaudeCompatible result whose extension fields Codex's
-    // strict parser drops. Classify a PowerShell tool name as Codex
-    // unconditionally so the minimal Codex JSON path is used.
+    // --- Posit Assistant indicator (env var, checked before the Windows-shell
+    // rule below) ---
+    // Posit Assistant sets `PA_PROJECT_DIR=<workspace root>` in every hook
+    // subprocess and speaks the snake_case Claude wire shape, so it needs no
+    // protocol of its own. This branch exists to deliberately override the
+    // issue-#125 bare-Windows-shell → Codex heuristic below when
+    // `PA_PROJECT_DIR` is present: on a Windows host Posit Assistant's shell
+    // tool is named `powershell`, and Codex's minimal deny shape would drop
+    // the `hookSpecificOutput.permissionDecision` payload Posit Assistant
+    // reads on exit 0. The trade-off is explicit and accepted: a Codex session
+    // running with ambient `PA_PROJECT_DIR` and no `turn_id` loses the #125
+    // minimal-shape mitigation, because the env marker is the stronger signal
+    // that a Posit Assistant parser is on the other end.
+    //
+    // The gate is deliberately narrow so ambient `PA_PROJECT_DIR` cannot
+    // misroute other agents' payloads into Claude-shaped answers their parsers
+    // do not read: it fires only for the shell tool names Posit Assistant
+    // actually sends (`bash`, plus the Windows shells the #125 rule below
+    // would otherwise claim) AND a Claude-shaped event (absent or
+    // `PreToolUse`). It must never fire for `run_shell_command`
+    // (Gemini/Copilot), `terminal` (Hermes), `run_terminal_cmd` (Grok), or any
+    // event-marked payload — those keep their own protocols via the checks
+    // above and below.
+    let has_posit_assistant_env = std::env::var_os("PA_PROJECT_DIR").is_some();
+    let is_posit_assistant_event =
+        hook_event_name.is_empty() || hook_event_name.eq_ignore_ascii_case("pretooluse");
+    let is_posit_assistant_shell_tool = matches!(
+        tool_name.as_str(),
+        "bash" | "powershell" | "pwsh" | "cmd" | "cmd.exe"
+    );
+    if has_posit_assistant_env && is_posit_assistant_event && is_posit_assistant_shell_tool {
+        return HookProtocol::ClaudeCompatible;
+    }
+
+    // Explicit Windows-shell tool names ("powershell"/"pwsh"/"cmd"/"cmd.exe")
+    // are only ever emitted by Codex-style payloads -- Claude Code's shell
+    // tool is always "Bash" (or "launch-process"), so this cannot collide with
+    // Claude Code. On Windows, Codex does not always populate `turn_id`
+    // (issue #125), so the turn_id-gated check above misses these tools and the
+    // destructive command would otherwise slip through as a ClaudeCompatible
+    // result whose extension fields Codex's strict parser drops. Classify an
+    // explicit Windows shell as Codex unconditionally so the minimal Codex
+    // JSON path is used.
     // (`bash`/`launch-process` stay turn_id-gated because Claude Code
     // legitimately uses those names.)
-    let is_powershell_tool = matches!(tool_name.as_str(), "powershell" | "pwsh");
-    if is_powershell_tool {
+    let is_explicit_windows_shell = matches!(
+        tool_name.as_str(),
+        "powershell" | "pwsh" | "cmd" | "cmd.exe"
+    );
+    if is_explicit_windows_shell {
         return HookProtocol::Codex;
     }
 
     // --- Claude-compatible indicators ---
     // Claude Code uses tool_name="Bash" or "launch-process"; Codex-style
-    // shell payloads can also use PowerShell names (handled above). These
-    // tool names are not Gemini's shell tool names, so check them before
-    // Gemini envelope fields. Claude Code payloads also include
-    // session_id/cwd/transcript_path, which would otherwise trigger a false
-    // Gemini classification (issue #77).
-    // NOTE: "powershell"/"pwsh" are included in is_claude_compatible_shell_tool
-    // but will never reach this branch because they are unconditionally
-    // classified as Codex by the PowerShell-specific check above.
+    // shell payloads can also use PowerShell names. These tool names are not
+    // Gemini's shell tool names, so check them before Gemini envelope fields.
+    // Claude Code payloads also include session_id/cwd/transcript_path, which
+    // would otherwise trigger a false Gemini classification (issue #77).
     if is_claude_compatible_shell_tool {
         return HookProtocol::ClaudeCompatible;
     }
@@ -720,10 +853,7 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
             // Grok (xAI) shell tool. Grok aliases Claude-style "Bash" to its
             // internal name `run_terminal_cmd` before invoking hooks, so the
             // toolName field on the wire is always this canonical form.
-            // Antigravity CLI (`agy`) shell tool name.
-            // `agy` uses `name: "run_command"` under the `toolCall` envelope.
             | "run_terminal_cmd"
-            | "run_command"
         )
 }
 
@@ -765,29 +895,51 @@ pub(crate) fn is_shell_hook_candidate(input: &HookInput) -> bool {
         }
     }
 
+    // VS Code Agent Host: any batched entry that looks like a shell call
+    // (issue #252).
+    if input
+        .tool_calls
+        .as_ref()
+        .is_some_and(|calls| calls.iter().any(is_batch_shell_call))
+    {
+        return true;
+    }
+
     input.tool_name.is_none()
         && matches!(detect_protocol(input), HookProtocol::Copilot)
         && (input.tool_input.is_some() || input.tool_args.is_some())
 }
 
+/// Return whether a batched `toolCalls[]` entry should be treated as a shell
+/// invocation.
+///
+/// Mirrors the singular `toolCall` posture so the batch path can never be the
+/// weaker gate (a fail-open direction): a supported shell tool name, the
+/// Antigravity CLI's `run_command`, or a nameless entry that still carries
+/// args all qualify.
+fn is_batch_shell_call(call: &ToolCall) -> bool {
+    let name = call
+        .name
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if name.is_empty() {
+        return call.args.is_some();
+    }
+    name == "run_command" || is_supported_shell_tool(Some(&name))
+}
+
 /// Extract the shell command from an Antigravity (`agy`) `toolCall` envelope.
 ///
 /// `agy`'s `run_command` tool carries the command in
-/// `toolCall.args.CommandLine` (PascalCase). For robustness we also accept the
-/// lowercase `command` key used by other agents in case `agy` ever normalizes.
+/// `toolCall.args.CommandLine` (PascalCase); the shared args extraction also
+/// accepts the lowercase `command` key used by other agents in case `agy` ever
+/// normalizes.
 fn extract_command_from_tool_call(tool_call: &ToolCall) -> Option<String> {
-    let args = tool_call.args.as_ref()?;
-    let serde_json::Value::Object(map) = args else {
-        return None;
-    };
-    for key in ["CommandLine", "commandLine", "command", "Command"] {
-        if let Some(serde_json::Value::String(s)) = map.get(key) {
-            if !s.is_empty() {
-                return Some(s.clone());
-            }
-        }
-    }
-    None
+    tool_call
+        .args
+        .as_ref()
+        .and_then(extract_command_from_tool_args)
 }
 
 fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
@@ -797,12 +949,27 @@ fn extract_command_from_tool_input(tool_input: &ToolInput) -> Option<String> {
     }
 }
 
+/// Extract the shell command from a `toolArgs` / `toolCall.args` /
+/// `toolCalls[].args` value.
+///
+/// Accepts the dominant lowercase `command` object key (Claude / Copilot / VS
+/// Code Agent Host), the `CommandLine` / `commandLine` / `Command` variants
+/// (agy and Windows-shell payloads), a JSON-encoded string carrying any of
+/// those object forms (the Agent Host stringifies `args`), and a bare
+/// non-empty string as the command itself. `command` is checked first so
+/// precedence is unchanged for payloads that carry several keys.
 fn extract_command_from_tool_args(tool_args: &serde_json::Value) -> Option<String> {
     match tool_args {
-        serde_json::Value::Object(map) => map.get("command").and_then(|v| match v {
-            serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-            _ => None,
-        }),
+        serde_json::Value::Object(map) => {
+            for key in ["command", "CommandLine", "commandLine", "Command"] {
+                if let Some(serde_json::Value::String(s)) = map.get(key) {
+                    if !s.is_empty() {
+                        return Some(s.clone());
+                    }
+                }
+            }
+            None
+        }
         serde_json::Value::String(s) => {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
                 extract_command_from_tool_args(&parsed)
@@ -830,6 +997,63 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
         return None;
     }
 
+    // VS Code Agent Host batches shell invocations in `toolCalls[]`, each
+    // with a JSON-encoded `args` string (issue #252). Every shell entry is
+    // extracted as its OWN command with its OWN per-entry dialect — never
+    // joined into one string. Joining let an entry ending in an unterminated
+    // quote or a trailing backslash absorb the following entry during
+    // tokenization, masking its destructive command from the evaluator
+    // (fail-open). The first extracted command is the primary; the rest ride
+    // along in `additional_commands` for the hook driver to evaluate
+    // independently.
+    //
+    // Every OTHER command-bearing field of the same envelope is appended as a
+    // further entry: a singular `toolCall`, `tool_input.command`, and
+    // `tool_args`. Returning on the batch alone let a destructive sibling in
+    // those fields ride along unevaluated — e.g. `{"tool_name":"Bash",
+    // "tool_input":{"command":"rm -rf /"},"toolCalls":[{"name":"bash",
+    // "args":"{\"command\":\"ls -la\"}"}]}` was silently allowed because the
+    // benign batch entry answered for the whole payload.
+    if let Some(calls) = input.tool_calls.as_ref() {
+        let mut commands: Vec<(String, ShellDialect)> = Vec::new();
+        for call in calls {
+            if !is_batch_shell_call(call) {
+                continue;
+            }
+            if let Some(command) = call.args.as_ref().and_then(extract_command_from_tool_args) {
+                commands.push((command, shell_dialect_for_tool_name(call.name.as_deref())));
+            }
+        }
+        if let Some(tool_call) = input.tool_call.as_ref() {
+            if let Some(command) = extract_command_from_tool_call(tool_call) {
+                commands.push((command, dialect));
+            }
+        }
+        if let Some(command) = input
+            .tool_input
+            .as_ref()
+            .and_then(extract_command_from_tool_input)
+        {
+            commands.push((command, dialect));
+        }
+        if let Some(command) = input
+            .tool_args
+            .as_ref()
+            .and_then(extract_command_from_tool_args)
+        {
+            commands.push((command, dialect));
+        }
+        let mut entries = commands.into_iter();
+        if let Some((command, primary_dialect)) = entries.next() {
+            return Some(ExtractedHookCommand {
+                command,
+                protocol,
+                dialect: primary_dialect,
+                additional_commands: entries.collect(),
+            });
+        }
+    }
+
     // Antigravity CLI (`agy`) nests the command under `toolCall.args.CommandLine`.
     if let Some(tool_call) = input.tool_call.as_ref() {
         if let Some(command) = extract_command_from_tool_call(tool_call) {
@@ -837,6 +1061,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
                 command,
                 protocol,
                 dialect,
+                additional_commands: Vec::new(),
             });
         }
     }
@@ -847,6 +1072,7 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
                 command,
                 protocol,
                 dialect,
+                additional_commands: Vec::new(),
             });
         }
     }
@@ -857,22 +1083,8 @@ pub fn extract_command_with_context(input: &HookInput) -> Option<ExtractedHookCo
                 command,
                 protocol,
                 dialect,
+                additional_commands: Vec::new(),
             });
-        }
-    }
-
-    // Antigravity CLI (`agy`): command is in `toolCall.args.CommandLine`.
-    if let Some(tool_call) = input.tool_call.as_ref() {
-        if let Some(args) = tool_call.args.as_ref() {
-            if let Some(command) = args.get("CommandLine").and_then(|v| v.as_str()) {
-                if !command.is_empty() {
-                    return Some(ExtractedHookCommand {
-                        command: command.to_string(),
-                        protocol,
-                        dialect: ShellDialect::Unknown,
-                    });
-                }
-            }
         }
     }
 
@@ -971,6 +1183,46 @@ pub fn format_denial_message(
     pack: Option<&str>,
     pattern: Option<&str>,
 ) -> String {
+    format_matched_message(
+        "BLOCKED by dcg",
+        command,
+        reason,
+        explanation,
+        pack,
+        pattern,
+        "If this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+    )
+}
+
+/// Format a native-review request for a matched destructive command.
+#[must_use]
+pub fn format_review_message(
+    command: &str,
+    reason: &str,
+    explanation: Option<&str>,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+) -> String {
+    format_matched_message(
+        "APPROVAL REQUIRED by dcg",
+        command,
+        reason,
+        explanation,
+        pack,
+        pattern,
+        "Approve this command only after reviewing the operation and its target. Denying it keeps the command blocked.",
+    )
+}
+
+fn format_matched_message(
+    heading: &str,
+    command: &str,
+    reason: &str,
+    explanation: Option<&str>,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    instruction: &str,
+) -> String {
     let explain_hint = format_explain_hint(command);
     let rule_id = build_rule_id(pack, pattern);
     let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
@@ -985,14 +1237,13 @@ pub fn format_denial_message(
     );
 
     format!(
-        "BLOCKED by dcg\n\n\
+        "{heading}\n\n\
          {explain_hint}\n\n\
          Reason: {reason}\n\n\
          {explanation_block}\n\n\
          {rule_line}\
          Command: {command}\n\n\
-         If this operation is truly needed, ask the user for explicit \
-         permission and have them run the command manually."
+         {instruction}"
     )
 }
 
@@ -1390,22 +1641,136 @@ pub fn write_denial_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Antigravity => {
-            // `agy` honors `{"decision":"block","reason":...}` with exit code 0.
-            // Verified empirically: both "block" and "deny" keywords abort the
-            // `run_command` tool, whereas a non-zero exit code is only logged and
-            // does NOT reliably abort the tool. We always emit exit 0 + JSON.
-            let output = serde_json::json!({
-                "decision": "block",
-                "reason": message.clone(),
-                "ruleId": rule_id,
-                "packId": pack,
-                "severity": severity.map(|s| format!("{:?}", s)),
-                "confidence": confidence,
-                "remediation": remediation,
-            });
+            // Antigravity CLI (`agy`): stdout `{"decision":"block","reason":...}`
+            // with exit code 0 aborts the `run_command` tool. Verified
+            // empirically that `agy` honors the `"block"` keyword (and `"deny"`
+            // — both block); a non-zero exit code is only logged and does NOT
+            // reliably abort the tool, so we always emit exit 0 + JSON. We
+            // reuse GeminiHookOutput's wire shape (`decision`/`reason` plus
+            // optional `systemMessage` and dcg ergonomics fields); `agy`'s
+            // parser tolerates the extra fields.
+            let output = GeminiHookOutput {
+                decision: "block",
+                reason: Cow::Owned(message),
+                system_message: Some(Cow::Owned(format!("BLOCKED by dcg: {reason}"))),
+                allow_once_code: allow_once.map(|info| info.code.clone()),
+                allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity,
+                confidence,
+                remediation,
+            };
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
+        }
+    }
+}
+
+/// Write an operator-review request for a matched destructive command.
+///
+/// Claude-compatible and Copilot hooks receive their native `ask` decision.
+/// Every other supported protocol receives its ordinary deny/block response;
+/// an opt-in review policy must never become an allow merely because a client
+/// cannot represent review.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn write_review_request_to(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    protocol: HookProtocol,
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once: Option<&AllowOnceInfo>,
+    matched_span: Option<&MatchSpan>,
+    severity: Option<crate::packs::Severity>,
+    confidence: Option<f64>,
+    pattern_suggestions: &[PatternSuggestion],
+    branch_context: Option<&crate::evaluator::BranchContext>,
+) {
+    if !matches!(
+        protocol,
+        HookProtocol::ClaudeCompatible | HookProtocol::Copilot
+    ) {
+        write_denial_to(
+            stdout,
+            stderr,
+            protocol,
+            command,
+            reason,
+            pack,
+            pattern,
+            explanation,
+            allow_once,
+            matched_span,
+            severity,
+            confidence,
+            pattern_suggestions,
+            branch_context,
+        );
+        return;
+    }
+
+    print_colorful_warning_to(
+        stderr,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+        allow_once.map(|info| info.code.as_str()),
+        matched_span,
+        pattern_suggestions,
+        severity,
+        branch_context,
+        WarningAudience::HumanOperator,
+    );
+
+    let message = format_review_message(command, reason, explanation, pack, pattern);
+    match protocol {
+        HookProtocol::ClaudeCompatible => {
+            let rule_id = build_rule_id(pack, pattern);
+            let remediation = allow_once.map(|info| Remediation {
+                safe_alternative: get_contextual_suggestion(command).map(String::from),
+                explanation: format_explanation_text(explanation, rule_id.as_deref(), pack),
+                allow_once_command: format!("dcg allow-once {}", info.code),
+            });
+            let output = HookOutput {
+                hook_specific_output: HookSpecificOutput {
+                    hook_event_name: "PreToolUse",
+                    permission_decision: "ask",
+                    permission_decision_reason: Cow::Owned(message),
+                    allow_once_code: allow_once.map(|info| info.code.clone()),
+                    allow_once_full_hash: allow_once.map(|info| info.full_hash.clone()),
+                    rule_id,
+                    pack_id: pack.map(String::from),
+                    severity,
+                    confidence,
+                    remediation,
+                },
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Copilot => {
+            let output = CopilotHookOutput {
+                permission_decision: "ask",
+                permission_decision_reason: Cow::Owned(message),
+            };
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
+        }
+        HookProtocol::Gemini
+        | HookProtocol::Codex
+        | HookProtocol::Hermes
+        | HookProtocol::Grok
+        | HookProtocol::Antigravity => {
+            unreachable!("non-review protocols returned through write_denial_to")
         }
     }
 }
@@ -1433,6 +1798,46 @@ pub fn output_denial_for_protocol(
     let err = io::stderr();
     let mut err_handle = err.lock();
     write_denial_to(
+        &mut out_handle,
+        &mut err_handle,
+        protocol,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+        allow_once,
+        matched_span,
+        severity,
+        confidence,
+        pattern_suggestions,
+        branch_context,
+    );
+}
+
+/// Output an operator-review request using the active hook protocol.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn output_review_request_for_protocol(
+    protocol: HookProtocol,
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once: Option<&AllowOnceInfo>,
+    matched_span: Option<&MatchSpan>,
+    severity: Option<crate::packs::Severity>,
+    confidence: Option<f64>,
+    pattern_suggestions: &[PatternSuggestion],
+    branch_context: Option<&crate::evaluator::BranchContext>,
+) {
+    let out = io::stdout();
+    let mut out_handle = out.lock();
+    let err = io::stderr();
+    let mut err_handle = err.lock();
+    write_review_request_to(
         &mut out_handle,
         &mut err_handle,
         protocol,
@@ -1671,40 +2076,15 @@ pub(crate) fn write_warning_to(
         let _ = writeln!(stderr, "  {} {}", "Command:".bright_black(), command);
     }
 
-    // -- stdout: hook-protocol JSON with "ask" decision --
+    // -- stdout: protocol-specific non-blocking response --
     let rule_id = build_rule_id(pack, pattern);
     let warn_reason = format!("DCG warn: {reason}");
 
     match protocol {
-        HookProtocol::ClaudeCompatible => {
-            let output = HookOutput {
-                hook_specific_output: HookSpecificOutput {
-                    hook_event_name: "PreToolUse",
-                    permission_decision: "ask",
-                    permission_decision_reason: Cow::Owned(warn_reason),
-                    allow_once_code: None,
-                    allow_once_full_hash: None,
-                    rule_id,
-                    pack_id: pack.map(String::from),
-                    severity: None,
-                    confidence: None,
-                    remediation: None,
-                },
-            };
-
-            let _ = serde_json::to_writer(&mut *stdout, &output);
-            let _ = writeln!(stdout);
-        }
-        HookProtocol::Copilot => {
-            // `ask` is part of Copilot's documented preToolUse contract.
-            let output = CopilotHookOutput {
-                permission_decision: "ask",
-                permission_decision_reason: Cow::Owned(warn_reason),
-            };
-
-            let _ = serde_json::to_writer(&mut *stdout, &output);
-            let _ = writeln!(stdout);
-        }
+        // Silence means "no blocking opinion" for review-capable clients.
+        // Keeping warn distinct from ask preserves the documented policy:
+        // warn proceeds, while ask requires an explicit operator decision.
+        HookProtocol::ClaudeCompatible | HookProtocol::Copilot | HookProtocol::Codex => {}
         HookProtocol::Gemini => {
             // Gemini hooks support allow/deny only. Preserve dcg warn as
             // non-blocking while still surfacing the warning text to Gemini.
@@ -1723,9 +2103,6 @@ pub(crate) fn write_warning_to(
 
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
-        }
-        HookProtocol::Codex => {
-            // Codex: stderr warning already written above; no stdout JSON.
         }
         HookProtocol::Hermes => {
             // Hermes hooks support a "block" decision but no documented
@@ -1770,15 +2147,23 @@ pub(crate) fn write_warning_to(
             let _ = writeln!(stdout);
         }
         HookProtocol::Antigravity => {
-            // `agy` supports `{"decision":"allow","reason":...}` and does not
-            // surface a "warn" concept via its hook API. Emit an explicit
-            // "allow" with the warning text in the `reason` field, which `agy`
-            // logs in the hooks scrollback. Verified empirically that `agy`
-            // preserves `reason` on allow decisions.
-            let output = serde_json::json!({
-                "decision": "allow",
-                "reason": warn_reason,
-            });
+            // Antigravity CLI (`agy`) supports a "block"/"deny" decision but no
+            // documented "ask"/"warn" decision. Preserve dcg warn semantics as
+            // non-blocking by emitting an explicit "allow"; the warning text is
+            // surfaced via `reason`/`systemMessage` for any tooling that shows
+            // hook context.
+            let output = GeminiHookOutput {
+                decision: "allow",
+                reason: Cow::Owned(warn_reason.clone()),
+                system_message: Some(Cow::Owned(warn_reason)),
+                allow_once_code: None,
+                allow_once_full_hash: None,
+                rule_id,
+                pack_id: pack.map(String::from),
+                severity: None,
+                confidence: None,
+                remediation: None,
+            };
             let _ = serde_json::to_writer(&mut *stdout, &output);
             let _ = writeln!(stdout);
         }
@@ -1954,7 +2339,6 @@ mod tests {
             Self { key, previous }
         }
 
-        #[allow(dead_code)]
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             // SAFETY: We hold ENV_LOCK during all tests that use this guard,
@@ -2129,15 +2513,30 @@ mod tests {
     }
 
     #[test]
-    fn test_powershell_tool_without_turn_id_is_codex() {
+    fn test_explicit_windows_shell_without_turn_id_is_codex() {
         // issue #125: on Windows, Codex drives shell commands through
-        // PowerShell but does not always send `turn_id`. Without the
-        // PowerShell-name fallback this payload would be classified as
+        // PowerShell or cmd.exe but does not always send `turn_id`. Without
+        // the explicit-Windows-shell fallback this payload would be classified as
         // ClaudeCompatible (exit 0 + JSON that Codex's strict parser drops),
-        // letting the destructive command through. A PowerShell tool name is
-        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so it
-        // must classify as Codex even with no turn_id.
-        for tool in ["powershell", "pwsh", "PowerShell", "PWSH"] {
+        // letting the destructive command through. These tool names are
+        // Codex-only (Claude Code always uses "Bash"/"launch-process"), so
+        // they must classify as Codex even with no turn_id.
+        //
+        // Ambient `PA_PROJECT_DIR` (the Posit Assistant marker checked ahead
+        // of the Windows-shell rule) would legitimately steer these payloads
+        // to ClaudeCompatible, so pin it removed for a deterministic result.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+        for tool in [
+            "powershell",
+            "pwsh",
+            "PowerShell",
+            "PWSH",
+            "cmd",
+            "CMD",
+            "cmd.exe",
+            "CMD.EXE",
+        ] {
             let json = format!(
                 r#"{{"tool_name":"{tool}","tool_input":{{"command":"git reset --hard HEAD~1"}}}}"#
             );
@@ -2145,7 +2544,7 @@ mod tests {
             assert_eq!(
                 detect_protocol(&input),
                 HookProtocol::Codex,
-                "PowerShell tool_name {tool:?} must be treated as Codex (issue #125)"
+                "explicit Windows shell tool_name {tool:?} must be treated as Codex"
             );
             assert_eq!(
                 extract_command(&input),
@@ -2170,6 +2569,211 @@ mod tests {
                 "{tool:?} without turn_id must stay ClaudeCompatible"
             );
         }
+    }
+
+    // --- Posit Assistant ---------------------------------------------------
+    //
+    // Posit Assistant's `PreToolUse` stdin is the snake_case Claude shape and
+    // its shell tool is lowercase `bash` (or `powershell` on a Windows host).
+    // These tests pin the classification for both tool names: the wire shape
+    // is close enough to Codex's that a regression would silently answer
+    // Posit Assistant with Codex's minimal deny payload.
+
+    /// A `PreToolUse` payload as Posit Assistant sends it for a `bash` shell
+    /// tool.
+    const POSIT_ASSISTANT_BASH_PAYLOAD: &str = r#"{
+        "session_id":"pa-session-42",
+        "transcript_path":null,
+        "cwd":"/home/user/analysis",
+        "hook_event_name":"PreToolUse",
+        "permission_mode":"normal",
+        "tool_name":"bash",
+        "tool_input":{"command":"git reset --hard"},
+        "tool_use_id":"toolu_posit_01"
+    }"#;
+
+    #[test]
+    fn test_posit_assistant_bash_payload_is_claude_compatible_without_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+
+        let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
+        assert_eq!(
+            extract_command(&input),
+            Some("git reset --hard".to_string())
+        );
+        // The lowercase `bash` tool name alone is Claude-shaped; no env marker
+        // is needed on a Unix host.
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_posit_assistant_payload_carries_no_foreign_markers() {
+        // Guards the disambiguators this classification relies on: if Posit
+        // Assistant ever grew a `turn_id`, `event`, or `tool_args` field, an
+        // earlier branch would capture the payload before the Posit checks.
+        let input: HookInput = serde_json::from_str(POSIT_ASSISTANT_BASH_PAYLOAD).unwrap();
+        assert!(input.turn_id.is_none());
+        assert!(input.event.is_none());
+        assert!(input.tool_args.is_none());
+        assert!(input.tool_call.is_none());
+        assert!(input.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_posit_assistant_powershell_payload_is_claude_compatible_via_env() {
+        // On a Windows host Posit Assistant's shell tool is named
+        // `powershell`, which on its own falls into the unconditional
+        // Windows-shell → Codex rule. `PA_PROJECT_DIR` — which the hook
+        // contract sets in the hook subprocess — must steer the payload back
+        // to the Claude-compatible response Posit Assistant actually reads.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let json = r#"{
+            "session_id":"pa-session-42",
+            "cwd":"C:\\Users\\user\\analysis",
+            "hook_event_name":"PreToolUse",
+            "permission_mode":"normal",
+            "tool_name":"powershell",
+            "tool_input":{"command":"Remove-Item -Recurse -Force C:\\data"},
+            "tool_use_id":"toolu_posit_01"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+
+        {
+            let _no_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+            assert_eq!(
+                detect_protocol(&input),
+                HookProtocol::Codex,
+                "without the env marker a bare `powershell` tool stays Codex"
+            );
+        }
+
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "C:\\Users\\user\\analysis");
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_posit_assistant_env_does_not_hijack_other_protocols() {
+        // `PA_PROJECT_DIR` can leak into any process spawned inside a Posit
+        // Assistant workspace, so a payload carrying another agent's own wire
+        // markers must keep that agent's protocol. Every branch below runs
+        // ahead of the Posit Assistant env check.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
+
+        // Gemini: BeforeTool event + run_shell_command tool.
+        let gemini: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&gemini), HookProtocol::Gemini);
+
+        // Copilot: the `event` field.
+        let copilot: HookInput =
+            serde_json::from_str(r#"{"event":"pre-tool-use","toolInput":{"command":"ls"}}"#)
+                .unwrap();
+        assert_eq!(detect_protocol(&copilot), HookProtocol::Copilot);
+
+        // Hermes: pre_tool_call event + terminal tool.
+        let hermes: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"pre_tool_call","tool_name":"terminal","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&hermes), HookProtocol::Hermes);
+
+        // Grok: pre_tool_use event + run_terminal_cmd tool.
+        let grok: HookInput = serde_json::from_str(
+            r#"{"hookEventName":"pre_tool_use","toolName":"run_terminal_cmd","toolInput":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&grok), HookProtocol::Grok);
+
+        // Codex: a non-empty turn_id, even on a PreToolUse/bash payload.
+        let codex: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"PreToolUse","tool_name":"bash","turn_id":"turn-9","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&codex), HookProtocol::Codex);
+
+        // agy: the nested toolCall envelope.
+        let agy: HookInput = serde_json::from_str(
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"ls"}},"conversationId":"c-1"}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&agy), HookProtocol::Antigravity);
+
+        // VS Code Agent Host: the plural toolCalls envelope. The expected
+        // protocol is ClaudeCompatible either way; this pins that the
+        // toolCalls branch (which also drives batched command extraction)
+        // still fires first.
+        let vscode: HookInput = serde_json::from_str(
+            r#"{"sessionId":"s-1","toolCalls":[{"name":"powershell","args":"{\"command\":\"ls\"}"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&vscode), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_posit_env_does_not_capture_gemini_payload_missing_event_name() {
+        // Regression: the Posit Assistant env branch used to fire for ANY
+        // payload whose event name was empty, so with `PA_PROJECT_DIR` set a
+        // Gemini payload that omitted `hook_event_name` was answered in
+        // Claude shape (Gemini's parser reads `decision`/`reason`, not
+        // `hookSpecificOutput`, so the deny was dropped). The gate now also
+        // requires a Posit-Assistant shell tool name.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
+        let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
+        let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
+
+        let gemini: HookInput = serde_json::from_str(
+            r#"{"session_id":"g-1","cwd":"/w","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_protocol(&gemini),
+            HookProtocol::Gemini,
+            "Gemini envelope without hook_event_name must keep the Gemini protocol"
+        );
+    }
+
+    #[test]
+    fn test_posit_env_does_not_capture_non_posit_shell_tools() {
+        // Regression companion: with `PA_PROJECT_DIR` set, payloads whose
+        // shell tool is another agent's must keep that agent's protocol. The
+        // Posit branch only exists to reroute `bash`/Windows-shell names away
+        // from the #125 bare-Windows-shell → Codex rule.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvVarGuard::set("PA_PROJECT_DIR", "/home/user/analysis");
+        let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
+        let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
+
+        // Bare run_shell_command (Copilot fallback shape, no event field).
+        let copilot: HookInput = serde_json::from_str(
+            r#"{"tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&copilot), HookProtocol::Copilot);
+
+        // Hermes' `terminal` tool without an event marker.
+        let hermes: HookInput =
+            serde_json::from_str(r#"{"tool_name":"terminal","tool_input":{"command":"ls"}}"#)
+                .unwrap();
+        assert_eq!(detect_protocol(&hermes), HookProtocol::Hermes);
+
+        // Grok's `run_terminal_cmd` tool without an event marker.
+        let grok: HookInput =
+            serde_json::from_str(r#"{"toolName":"run_terminal_cmd","toolInput":{"command":"ls"}}"#)
+                .unwrap();
+        assert_eq!(detect_protocol(&grok), HookProtocol::Grok);
+
+        // An event-marked payload (Gemini's BeforeTool) with a `bash`-like
+        // tool name must not be captured either: the event gate fails.
+        let event_marked: HookInput = serde_json::from_str(
+            r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command","tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_protocol(&event_marked), HookProtocol::Gemini);
     }
 
     #[test]
@@ -2391,12 +2995,12 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_compatible_warn_ask_json_shape() {
+    fn test_claude_compatible_review_ask_json_shape() {
         let output = HookOutput {
             hook_specific_output: HookSpecificOutput {
                 hook_event_name: "PreToolUse",
                 permission_decision: "ask",
-                permission_decision_reason: Cow::Borrowed("DCG warn: risky pattern"),
+                permission_decision_reason: Cow::Borrowed("APPROVAL REQUIRED by dcg"),
                 allow_once_code: None,
                 allow_once_full_hash: None,
                 rule_id: Some("core.git:checkout-dot".to_string()),
@@ -2414,17 +3018,17 @@ mod tests {
             specific["permissionDecisionReason"]
                 .as_str()
                 .unwrap()
-                .starts_with("DCG warn:")
+                .starts_with("APPROVAL REQUIRED")
         );
         assert_eq!(specific["ruleId"], "core.git:checkout-dot");
         assert_eq!(specific["packId"], "core.git");
     }
 
     #[test]
-    fn test_copilot_warn_ask_json_shape() {
+    fn test_copilot_review_ask_json_shape() {
         let output = CopilotHookOutput {
             permission_decision: "ask",
-            permission_decision_reason: Cow::Borrowed("DCG warn: risky pattern"),
+            permission_decision_reason: Cow::Borrowed("APPROVAL REQUIRED by dcg"),
         };
         let json = serde_json::to_value(&output).unwrap();
         assert_eq!(json["permissionDecision"], "ask");
@@ -2908,6 +3512,226 @@ mod tests {
         assert!(is_shell_hook_candidate(&input));
     }
 
+    // =========================================================================
+    // VS Code Agent Host plural `toolCalls` robustness (issue #252 follow-up).
+    // =========================================================================
+
+    #[test]
+    fn test_tool_calls_non_array_shape_does_not_abort_hook_input_parse() {
+        // A typed Vec field would abort the WHOLE HookInput parse on a shape
+        // mismatch, and an aborted parse fails open — masking the perfectly
+        // good tool_input command in the same payload.
+        let json =
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},"toolCalls":{"0":{}}}"#;
+        let input: HookInput =
+            serde_json::from_str(json).expect("non-array toolCalls must not abort the parse");
+        assert!(
+            input.tool_calls.is_none(),
+            "non-array shape degrades to None"
+        );
+        assert_eq!(extract_command(&input), Some("rm -rf /".to_string()));
+
+        for shape in [r#""text""#, "5", "true"] {
+            let json = format!(
+                r#"{{"tool_name":"Bash","tool_input":{{"command":"git status"}},"toolCalls":{shape}}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("toolCalls={shape} must not abort the parse: {e}"));
+            assert!(input.tool_calls.is_none());
+            assert_eq!(extract_command(&input), Some("git status".to_string()));
+        }
+
+        let null_json =
+            r#"{"tool_name":"Bash","tool_input":{"command":"git status"},"toolCalls":null}"#;
+        let input: HookInput = serde_json::from_str(null_json).unwrap();
+        assert!(input.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_tool_calls_array_skips_unfit_entries_and_keeps_fitting_ones() {
+        let json =
+            r#"{"toolCalls":[42,"junk",{"name":"bash","args":{"command":"echo hi"}},{"name":7}]}"#;
+        let input: HookInput =
+            serde_json::from_str(json).expect("unfit entries must be skipped, not fatal");
+        let calls = input.tool_calls.as_ref().expect("array shape is kept");
+        assert_eq!(calls.len(), 1, "only the fitting entry survives");
+        let extracted = extract_command_with_context(&input).expect("kept entry must extract");
+        assert_eq!(extracted.command, "echo hi");
+        assert!(extracted.additional_commands.is_empty());
+    }
+
+    #[test]
+    fn test_tool_calls_lowercase_alias_is_accepted() {
+        let json = r#"{"toolcalls":[{"name":"bash","args":{"command":"echo hi"}}]}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            input.tool_calls.as_ref().map(Vec::len),
+            Some(1),
+            "the all-lowercase casing must map to the same field"
+        );
+    }
+
+    #[test]
+    fn test_batch_entry_gating_mirrors_singular_tool_call_posture() {
+        // A nameless entry that still carries args (mirrors the singular
+        // `toolCall` posture).
+        let nameless: HookInput =
+            serde_json::from_str(r#"{"toolCalls":[{"args":{"command":"rm -rf /"}}]}"#).unwrap();
+        assert!(is_shell_hook_candidate(&nameless));
+        let extracted = extract_command_with_context(&nameless).expect("nameless entry extracts");
+        assert_eq!(extracted.command, "rm -rf /");
+        assert_eq!(extracted.dialect, ShellDialect::Unknown);
+
+        // agy's shell tool name `run_command` in a batched entry.
+        let run_command: HookInput = serde_json::from_str(
+            r#"{"toolCalls":[{"name":"run_command","args":{"CommandLine":"rm -rf /"}}]}"#,
+        )
+        .unwrap();
+        assert!(is_shell_hook_candidate(&run_command));
+        let extracted =
+            extract_command_with_context(&run_command).expect("run_command entry extracts");
+        assert_eq!(extracted.command, "rm -rf /");
+
+        // CommandLine-style keys on an ordinary shell entry.
+        for key in ["CommandLine", "commandLine", "Command"] {
+            let json = format!(
+                r#"{{"toolCalls":[{{"name":"powershell","args":{{"{key}":"Remove-Item -Recurse -Force C:\\src"}}}}]}}"#
+            );
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            let extracted = extract_command_with_context(&input)
+                .unwrap_or_else(|| panic!("{key} entry must extract"));
+            assert_eq!(extracted.command, r"Remove-Item -Recurse -Force C:\src");
+            assert_eq!(extracted.dialect, ShellDialect::PowerShell);
+        }
+
+        // A non-shell entry alone still extracts nothing.
+        let non_shell: HookInput = serde_json::from_str(
+            r#"{"toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]}"#,
+        )
+        .unwrap();
+        assert!(!is_shell_hook_candidate(&non_shell));
+        assert_eq!(extract_command_with_context(&non_shell), None);
+    }
+
+    #[test]
+    fn test_tool_input_and_tool_args_siblings_ride_along_with_a_batch() {
+        // Regression: extraction returned as soon as the batch yielded one
+        // command, so a destructive `tool_input`/`tool_args` sibling in the
+        // same envelope was never evaluated (silent allow).
+        let with_tool_input: HookInput = serde_json::from_str(
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm -rf /"},
+                "toolCalls":[{"name":"bash","args":"{\"command\":\"ls -la\"}"}]}"#,
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&with_tool_input).expect("must extract");
+        assert_eq!(extracted.command, "ls -la");
+        assert_eq!(
+            extracted.additional_commands,
+            vec![("rm -rf /".to_string(), ShellDialect::Posix)],
+            "the tool_input sibling must ride along as another entry"
+        );
+
+        let with_tool_args: HookInput = serde_json::from_str(
+            r#"{"toolName":"bash","toolArgs":"{\"command\":\"rm -rf /\"}",
+                "toolCalls":[{"name":"bash","args":{"command":"ls -la"}}]}"#,
+        )
+        .unwrap();
+        let extracted = extract_command_with_context(&with_tool_args).expect("must extract");
+        assert_eq!(extracted.command, "ls -la");
+        assert_eq!(
+            extracted.additional_commands,
+            vec![("rm -rf /".to_string(), ShellDialect::Posix)],
+            "the tool_args sibling must ride along as another entry"
+        );
+    }
+
+    #[test]
+    fn test_non_shell_only_batch_leaves_protocol_detection_to_other_markers() {
+        // Regression: the toolCalls branch fired on ANY non-empty array, so a
+        // single non-shell entry rerouted another agent's payload into Claude
+        // wire shape — a deny document those parsers drop (fail-open).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+        let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
+        let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
+
+        let decoy = r#""toolCalls":[{"name":"readFile","args":{"path":"/w/a.txt"}}]"#;
+        let cases = [
+            (
+                format!(
+                    r#"{{"hook_event_name":"BeforeTool","tool_name":"run_shell_command",
+                        "tool_input":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Gemini,
+            ),
+            (
+                format!(
+                    r#"{{"hook_event_name":"pre_tool_call","tool_name":"terminal",
+                        "tool_input":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Hermes,
+            ),
+            (
+                format!(
+                    r#"{{"hookEventName":"pre_tool_use","toolName":"run_terminal_cmd",
+                        "toolInput":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Grok,
+            ),
+            (
+                format!(
+                    r#"{{"hook_event_name":"PreToolUse","tool_name":"bash","turn_id":"turn-1",
+                        "tool_input":{{"command":"rm -rf /"}},{decoy}}}"#
+                ),
+                HookProtocol::Codex,
+            ),
+        ];
+
+        for (json, expected) in cases {
+            let input: HookInput = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                detect_protocol(&input),
+                expected,
+                "a non-shell-only batch must not hijack the protocol: {json}"
+            );
+            // The real command still comes from tool_input.
+            let extracted = extract_command_with_context(&input).expect("must extract");
+            assert_eq!(extracted.command, "rm -rf /");
+        }
+
+        // A genuine shell batch still identifies the Agent Host.
+        let shell_batch: HookInput = serde_json::from_str(
+            r#"{"sessionId":"s","toolCalls":[
+                {"name":"readFile","args":{"path":"/w/a.txt"}},
+                {"name":"bash","args":{"command":"ls"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_protocol(&shell_batch),
+            HookProtocol::ClaudeCompatible
+        );
+    }
+
+    #[test]
+    fn test_singular_tool_call_alongside_batch_is_also_evaluated() {
+        // A payload carrying BOTH the plural batch and a singular `toolCall`
+        // must surface the singular command too — otherwise the batch could
+        // be used as a decoy while the singular envelope carries the payload.
+        let json = r#"{
+            "toolCalls":[{"name":"bash","args":{"command":"git status"}}],
+            "toolCall":{"name":"run_command","args":{"CommandLine":"rm -rf /"}}
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        let extracted = extract_command_with_context(&input).expect("must extract");
+        assert_eq!(extracted.command, "git status");
+        assert_eq!(
+            extracted.additional_commands,
+            vec![("rm -rf /".to_string(), ShellDialect::Unknown)],
+            "the singular toolCall command must ride along as a batch entry"
+        );
+    }
+
     #[test]
     fn test_antigravity_hook_output_block_decision_json_shape() {
         // `agy` aborts run_command on {"decision":"block","reason":...}.
@@ -3119,6 +3943,14 @@ mod tests {
     #[test]
     fn test_bare_run_shell_command_without_context_is_copilot() {
         // run_shell_command without any Gemini context or event field.
+        // Ambient env markers (`PA_PROJECT_DIR` from a Posit Assistant
+        // workspace, `CLAUDE_CODE`/`CLAUDE_SESSION_ID` from a Claude Code
+        // session) would otherwise make this assertion flaky, so pin them
+        // removed under the env lock like the sibling Posit tests do.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _no_posit_env = EnvVarGuard::remove("PA_PROJECT_DIR");
+        let _no_claude_env = EnvVarGuard::remove("CLAUDE_CODE");
+        let _no_claude_session_env = EnvVarGuard::remove("CLAUDE_SESSION_ID");
         let json = r#"{
             "tool_name": "run_shell_command",
             "tool_input": {"command": "git status"}
@@ -3452,7 +4284,82 @@ mod tests {
     }
 
     #[test]
-    fn test_write_warning_claude_produces_ask_json() {
+    fn test_write_review_request_asks_only_when_protocol_supports_review() {
+        let cases = [
+            (HookProtocol::ClaudeCompatible, "ask"),
+            (HookProtocol::Copilot, "ask"),
+            (HookProtocol::Codex, "deny"),
+            (HookProtocol::Gemini, "deny"),
+            (HookProtocol::Hermes, "block"),
+            (HookProtocol::Grok, "deny"),
+            (HookProtocol::Antigravity, "block"),
+        ];
+        let allow = test_allow_once();
+
+        for (protocol, expected_decision) in cases {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            write_review_request_to(
+                &mut stdout,
+                &mut stderr,
+                protocol,
+                "git reset --hard HEAD~1",
+                "destroys uncommitted changes",
+                Some("core.git"),
+                Some("reset-hard"),
+                Some("Rewrites the working tree and index."),
+                Some(&allow),
+                None,
+                Some(crate::packs::Severity::Critical),
+                Some(0.99),
+                &[],
+                None,
+            );
+
+            assert!(!stdout.is_empty(), "{protocol:?} must emit a decision");
+            assert!(!stderr.is_empty(), "{protocol:?} must emit a diagnostic");
+
+            let json: serde_json::Value = serde_json::from_slice(&stdout)
+                .unwrap_or_else(|error| panic!("{protocol:?} output must be JSON: {error}"));
+            let (decision, reason) = match protocol {
+                HookProtocol::ClaudeCompatible | HookProtocol::Codex => {
+                    let specific = &json["hookSpecificOutput"];
+                    (
+                        specific["permissionDecision"].as_str(),
+                        specific["permissionDecisionReason"].as_str(),
+                    )
+                }
+                HookProtocol::Copilot => (
+                    json["permissionDecision"].as_str(),
+                    json["permissionDecisionReason"].as_str(),
+                ),
+                HookProtocol::Gemini
+                | HookProtocol::Hermes
+                | HookProtocol::Grok
+                | HookProtocol::Antigravity => (json["decision"].as_str(), json["reason"].as_str()),
+            };
+
+            assert_eq!(decision, Some(expected_decision), "payload: {json}");
+            assert_ne!(decision, Some("allow"), "payload: {json}");
+            if matches!(
+                protocol,
+                HookProtocol::ClaudeCompatible | HookProtocol::Copilot
+            ) {
+                assert!(
+                    reason.is_some_and(|text| text.starts_with("APPROVAL REQUIRED by dcg")),
+                    "review-capable payload: {json}"
+                );
+            } else {
+                assert!(
+                    reason.is_some_and(|text| text.starts_with("BLOCKED by dcg")),
+                    "fail-closed payload: {json}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_write_warning_claude_is_non_blocking() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -3467,18 +4374,7 @@ mod tests {
             Some("Check git diff first."),
         );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-
-        let specific = &json["hookSpecificOutput"];
-        assert_eq!(specific["permissionDecision"], "ask");
-        assert!(
-            specific["permissionDecisionReason"]
-                .as_str()
-                .unwrap()
-                .starts_with("DCG warn:")
-        );
+        assert!(stdout.is_empty(), "warn must not request operator review");
         assert!(!stderr.is_empty(), "stderr must contain warning text");
     }
 
@@ -3520,7 +4416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_warning_copilot_produces_ask_json() {
+    fn test_write_warning_copilot_is_non_blocking() {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -3535,13 +4431,8 @@ mod tests {
             None,
         );
 
-        let stdout_str = String::from_utf8_lossy(&stdout);
-        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
-            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
-
-        assert_eq!(json["permissionDecision"], "ask");
-        assert!(json.get("continue").is_none());
-        assert!(json.get("stopReason").is_none());
+        assert!(stdout.is_empty(), "warn must not request operator review");
+        assert!(!stderr.is_empty(), "stderr must contain warning text");
     }
 
     #[test]

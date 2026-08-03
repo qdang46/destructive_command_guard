@@ -494,6 +494,9 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         rm_rf_suggestions.clone(),
     );
     m.insert("core.filesystem:rm-rf-general", rm_rf_suggestions.clone());
+    // Globbed rm under a home directory (#247): the glob is the recursion, so
+    // the same preview/trash/scoping alternatives apply.
+    m.insert("core.filesystem:rm-glob-home", rm_rf_suggestions.clone());
     m.insert("core.filesystem:rm-r-f-separate", rm_rf_suggestions.clone());
     m.insert(
         "core.filesystem:rm-recursive-force-long",

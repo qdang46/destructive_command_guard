@@ -157,6 +157,7 @@ impl LogEntry {
             EvaluationDecision::Allow => "allow",
             EvaluationDecision::Deny => match mode {
                 DecisionMode::Deny => "deny",
+                DecisionMode::Ask => "ask",
                 DecisionMode::Warn => "warn",
                 DecisionMode::Log => "log",
             },
@@ -165,6 +166,7 @@ impl LogEntry {
 
         let mode_str = match mode {
             DecisionMode::Deny => "deny",
+            DecisionMode::Ask => "ask",
             DecisionMode::Warn => "warn",
             DecisionMode::Log => "log",
         };
@@ -316,9 +318,11 @@ impl DecisionLogger {
             EvaluationDecision::Allow => self.config.events.allow,
             EvaluationDecision::Deny => match mode {
                 DecisionMode::Warn => self.config.events.warn,
-                // Log mode: pattern matched but we're just observing. Use deny filter
-                // since a destructive pattern did match, even if we're not blocking.
-                DecisionMode::Deny | DecisionMode::Log => self.config.events.deny,
+                // Ask remains security-relevant, and log mode still means a
+                // destructive pattern matched. Use the deny filter for both.
+                DecisionMode::Deny | DecisionMode::Ask | DecisionMode::Log => {
+                    self.config.events.deny
+                }
             },
             // There is no separate legacy event filter for evaluation
             // failures. Treat them as security-relevant deny events instead

@@ -69,8 +69,13 @@ fn mcp_decision_contract(
     mode: Option<crate::packs::DecisionMode>,
 ) -> (bool, &'static str) {
     match decision {
-        EvaluationDecision::Allow => (mode.is_none_or(|value| !value.blocks()), "allow"),
-        EvaluationDecision::Deny => (mode.is_some_and(|value| !value.blocks()), "deny"),
+        EvaluationDecision::Allow => (true, "allow"),
+        EvaluationDecision::Deny => match mode.unwrap_or(crate::packs::DecisionMode::Deny) {
+            crate::packs::DecisionMode::Deny => (false, "deny"),
+            crate::packs::DecisionMode::Ask => (false, "ask"),
+            crate::packs::DecisionMode::Warn => (true, "warn"),
+            crate::packs::DecisionMode::Log => (true, "log"),
+        },
         EvaluationDecision::Indeterminate => (false, "indeterminate"),
     }
 }
@@ -202,8 +207,10 @@ impl DcgMcpServer {
             &self.scan_ctx.allowlists,
         );
 
-        let mode = result.effective_mode.map(|m| m.label().to_string());
-        let (allowed, decision) = mcp_decision_contract(result.decision, result.effective_mode);
+        let effective_mode =
+            crate::evaluator::resolve_effective_mode(&self.config, command, &result);
+        let mode = effective_mode.map(|m| m.label().to_string());
+        let (allowed, decision) = mcp_decision_contract(result.decision, effective_mode);
 
         let mut response = CheckCommandResponse {
             allowed,
@@ -458,6 +465,7 @@ mod tests {
         for mode in [
             None,
             Some(crate::packs::DecisionMode::Deny),
+            Some(crate::packs::DecisionMode::Ask),
             Some(crate::packs::DecisionMode::Warn),
             Some(crate::packs::DecisionMode::Log),
         ] {
@@ -466,6 +474,32 @@ mod tests {
                 (false, "indeterminate")
             );
         }
+    }
+
+    #[test]
+    fn mcp_decision_contract_reports_every_policy_mode_consistently() {
+        use crate::packs::DecisionMode;
+
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Allow, Some(DecisionMode::Deny)),
+            (true, "allow")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Deny)),
+            (false, "deny")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Ask)),
+            (false, "ask")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Warn)),
+            (true, "warn")
+        );
+        assert_eq!(
+            mcp_decision_contract(EvaluationDecision::Deny, Some(DecisionMode::Log)),
+            (true, "log")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -21,7 +21,6 @@ pub fn create_pack() -> Pack {
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
-        default_effects: crate::packs::DEFAULT_PACK_EFFECTS,
     }
 }
 
@@ -35,6 +34,16 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
+        // Evaluated explicitly by the bounded indirect-input data-flow pass.
+        // The regex is intentionally unsatisfiable so ordinary command
+        // matching cannot manufacture this finding.
+        destructive_pattern!(
+            "stdin-unverified",
+            r"(?!)",
+            "nsupdate receives indirect input that dcg cannot statically verify.",
+            High,
+            "Materialize and review the exact nsupdate commands before piping, redirecting, or loading them into the client."
+        ),
         destructive_pattern!(
             "dns-nsupdate-delete",
             r"(?:\bnsupdate\b.*\bdelete\b|\bdelete\b.*\|\s*\bnsupdate\b)",
@@ -115,7 +124,7 @@ mod tests {
         let pack = create_pack();
         assert_blocks_with_pattern(
             &pack,
-            "echo 'delete example.com' | nsupdate",
+            "echo 'update delete example.com A' | nsupdate",
             "dns-nsupdate-delete",
         );
         assert_blocks_with_pattern(&pack, "nsupdate -l", "dns-nsupdate-local");
@@ -128,12 +137,12 @@ mod tests {
         let pack = create_pack();
         assert_blocks(
             &pack,
-            "echo 'delete example.com' | nsupdate",
+            "echo 'update delete example.com A' | nsupdate",
             "nsupdate delete commands remove DNS records",
         );
         assert_blocks(
             &pack,
-            "nsupdate delete example.com A",
+            "echo 'update delete example.com A' | nsupdate",
             "nsupdate delete commands remove DNS records",
         );
         assert_blocks(
@@ -171,7 +180,11 @@ mod tests {
     #[test]
     fn generic_blocks_with_correct_severity() {
         let pack = create_pack();
-        assert_blocks_with_severity(&pack, "nsupdate delete example.com A", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "echo 'update delete example.com A' | nsupdate",
+            Severity::High,
+        );
         assert_blocks_with_severity(&pack, "nsupdate -l", Severity::Medium);
         assert_blocks_with_severity(&pack, "dig axfr example.com", Severity::Medium);
         assert_blocks_with_severity(&pack, "dig AXFR example.com", Severity::Medium);

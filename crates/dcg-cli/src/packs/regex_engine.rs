@@ -174,6 +174,26 @@ impl CompiledRegex {
         }
     }
 
+    /// Find the first match whose search begins at `start`.
+    ///
+    /// Unlike slicing `text`, this preserves anchors and look-behind context.
+    /// Returns `None` when `start` is not a UTF-8 boundary, lies past the end
+    /// of `text`, or regex execution fails.
+    #[must_use]
+    pub fn find_from(&self, text: &str, start: usize) -> Option<(usize, usize)> {
+        if start > text.len() || !text.is_char_boundary(start) {
+            return None;
+        }
+        match self {
+            Self::Linear(re) => re.find_at(text, start).map(|m| (m.start(), m.end())),
+            Self::Backtracking(re) => re
+                .find_from_pos(text, start)
+                .ok()
+                .flatten()
+                .map(|m| (m.start(), m.end())),
+        }
+    }
+
     /// Get the pattern string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -373,6 +393,15 @@ impl LazyCompiledRegex {
             .and_then(|compiled| compiled.find(haystack))
     }
 
+    /// Find the first match whose search begins at `start`.
+    ///
+    /// Returns `None` if no match exists or on execution/compile error.
+    #[must_use]
+    pub fn find_from(&self, haystack: &str, start: usize) -> Option<(usize, usize)> {
+        self.get_compiled()
+            .and_then(|compiled| compiled.find_from(haystack, start))
+    }
+
     /// Get the pattern string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -500,6 +529,27 @@ mod tests {
         assert!(re.uses_backtracking());
         assert_eq!(re.find("run git push"), Some((4, 7)));
         assert_eq!(re.find("git status"), None); // lookahead fails
+    }
+
+    #[test]
+    fn find_from_preserves_context_for_both_engines() {
+        let linear = CompiledRegex::new(r"\brm\b").unwrap();
+        assert_eq!(linear.find_from("rm then rm", 2), Some((8, 10)));
+
+        let backtracking = CompiledRegex::new(r"(?<=run\s)git").unwrap();
+        assert!(backtracking.uses_backtracking());
+        assert_eq!(
+            backtracking.find_from("run git then run git", 8),
+            Some((17, 20))
+        );
+
+        for invalid_start in [1, usize::MAX] {
+            assert_eq!(
+                linear.find_from("é rm", invalid_start),
+                None,
+                "invalid UTF-8 or out-of-range starts are rejected"
+            );
+        }
     }
 
     #[test]

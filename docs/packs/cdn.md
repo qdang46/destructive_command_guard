@@ -29,9 +29,9 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `wrangler-whoami` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?=\s\|$)` |
-| `wrangler-kv-get` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv:key\s+get(?=\s\|$)` |
-| `wrangler-kv-list` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv:key\s+list(?=\s\|$)` |
-| `wrangler-kv-namespace-list` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv:namespace\s+list(?=\s\|$)` |
+| `wrangler-kv-get` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv(?::\|\s+)key\s+get(?=\s\|$)` |
+| `wrangler-kv-list` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv(?::\|\s+)key\s+list(?=\s\|$)` |
+| `wrangler-kv-namespace-list` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+kv(?::\|\s+)namespace\s+list(?=\s\|$)` |
 | `wrangler-r2-object-get` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+r2\s+object\s+get(?=\s\|$)` |
 | `wrangler-r2-bucket-list` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+r2\s+bucket\s+list(?=\s\|$)` |
 | `wrangler-d1-list` | `wrangler(?:\s+--?\S+(?:\s+\S+)?)*\s+d1\s+list(?=\s\|$)` |
@@ -47,11 +47,12 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `wrangler-semantic-unverified` | Wrangler syntax depends on shell expansion or exceeds dcg's bounded semantic analysis. | high |
 | `wrangler-delete` | wrangler delete removes a Worker from Cloudflare. | critical |
 | `wrangler-deployments-rollback` | wrangler deployments rollback reverts to a previous Worker version. | high |
-| `wrangler-kv-key-delete` | wrangler kv:key delete removes a key from KV storage. | medium |
-| `wrangler-kv-namespace-delete` | wrangler kv:namespace delete removes an entire KV namespace. | critical |
-| `wrangler-kv-bulk-delete` | wrangler kv:bulk delete removes multiple keys from KV storage. | high |
+| `wrangler-kv-key-delete` | wrangler kv key delete removes a key from KV storage. | medium |
+| `wrangler-kv-namespace-delete` | wrangler kv namespace delete removes an entire KV namespace. | critical |
+| `wrangler-kv-bulk-delete` | wrangler kv bulk delete removes multiple keys from KV storage. | high |
 | `wrangler-r2-object-delete` | wrangler r2 object delete removes an object from R2 storage. | medium |
 | `wrangler-r2-bucket-delete` | wrangler r2 bucket delete removes an entire R2 bucket. | critical |
 | `wrangler-d1-delete` | wrangler d1 delete removes a D1 database. | critical |

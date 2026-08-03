@@ -354,6 +354,10 @@ fn try_parse_hook_json(line: &str, max_command_bytes: Option<usize>) -> Option<P
             error: command_error_for_hook_input(&hook_input),
         });
     };
+    // Simulation replays one command per log line; a batched `toolCalls`
+    // envelope contributes only its primary command to the statistics. The
+    // live hook path evaluates every batch entry (issue #252) — this is a
+    // deliberate stats-only simplification, not an enforcement gap.
     let command = extracted_command.command;
 
     // Check command length limit
@@ -532,7 +536,8 @@ impl SimulateDecision {
                 match result.effective_mode {
                     Some(crate::packs::DecisionMode::Warn) => Self::Warn,
                     Some(crate::packs::DecisionMode::Log) => Self::Allow,
-                    _ => Self::Deny,
+                    Some(crate::packs::DecisionMode::Deny | crate::packs::DecisionMode::Ask)
+                    | None => Self::Deny,
                 }
             }
             // Simulation has no operator-review state. Conservatively count
@@ -881,7 +886,7 @@ where
     let mut aggregator = SimulationAggregator::new(sim_config);
 
     for cmd in commands {
-        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
             &cmd.command,
             &keywords,
             &ordered_packs,
@@ -894,6 +899,8 @@ where
             None,
             cmd.dialect,
         );
+        result.effective_mode =
+            crate::evaluator::resolve_effective_mode(config, &cmd.command, &result);
         aggregator.record(&cmd.command, cmd.line_number, &result);
     }
 
@@ -1475,6 +1482,32 @@ echo hello
         assert_eq!(result.summary.total_commands, 2);
         assert_eq!(result.summary.deny_count, 1);
         assert_eq!(result.summary.allow_count, 1);
+    }
+
+    #[test]
+    fn simulation_uses_resolved_policy_modes() {
+        use crate::config::PolicyMode;
+
+        for (mode, allow, warn, deny) in [
+            (PolicyMode::Deny, 0, 0, 1),
+            (PolicyMode::Ask, 0, 0, 1),
+            (PolicyMode::Warn, 0, 1, 0),
+            (PolicyMode::Log, 1, 0, 0),
+        ] {
+            let mut config = Config::default();
+            config.policy.default_mode = Some(mode);
+            let result = run_simulation_from_reader(
+                &b"rm -r ./tree\n"[..],
+                SimulateLimits::default(),
+                &config,
+                SimulationConfig::default(),
+                true,
+            )
+            .expect("simulation should evaluate the command");
+            assert_eq!(result.summary.allow_count, allow, "mode {mode:?}");
+            assert_eq!(result.summary.warn_count, warn, "mode {mode:?}");
+            assert_eq!(result.summary.deny_count, deny, "mode {mode:?}");
+        }
     }
 
     #[test]

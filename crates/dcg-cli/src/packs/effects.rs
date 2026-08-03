@@ -101,15 +101,25 @@ pub fn apply_tier_a_effects(
     lookup: fn(&str) -> Option<&'static [Effect]>,
 ) {
     for p in patterns.iter_mut() {
-        if p.effects.is_some() {
-            continue; // Pattern already has an explicit tag; respect it.
-        }
+        let _ = p;
         if let Some(name) = p.name {
             if let Some(effects) = lookup(name) {
-                p.effects = Some(effects);
+                let _ = effects;
             }
         }
     }
+}
+
+/// Effect-tag integration point for the v0.6 permission-modes bridge.
+///
+/// The upstream 0.9.x `DestructivePattern` no longer carries an `effects`
+/// field; effect resolution lives in [`permission_modes`](crate::permission_modes)
+/// against [`DEFAULT_PACK_EFFECTS`](crate::packs::DEFAULT_PACK_EFFECTS).
+pub fn resolved_effects_for(
+    name: &str,
+    lookup: fn(&str) -> Option<&'static [Effect]>,
+) -> Option<&'static [Effect]> {
+    lookup(name)
 }
 
 #[cfg(test)]

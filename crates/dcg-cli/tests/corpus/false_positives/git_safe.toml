@@ -33,6 +33,31 @@ command = "git branch feature-new"
 expected = "allow"
 
 [[case]]
+description = "git branch format value that looks like delete is data"
+command = "git branch --format -d"
+expected = "allow"
+
+[[case]]
+description = "git branch LASTARG_DEFAULT merged filter consumes dash value"
+command = "git branch --merged -d feature"
+expected = "allow"
+
+[[case]]
+description = "git branch delete cancelled by later negation is safe"
+command = "git branch -d --no-delete feature"
+expected = "allow"
+
+[[case]]
+description = "git branch end of options makes dash token an operand"
+command = "git branch --end-of-options -d"
+expected = "allow"
+
+[[case]]
+description = "git branch help exits before delete action"
+command = "git branch -dh feature"
+expected = "allow"
+
+[[case]]
 description = "git add is safe"
 command = "git add ."
 expected = "allow"
@@ -103,8 +128,8 @@ command = "git reset HEAD~1"
 expected = "allow"
 
 [[case]]
-description = "git branch delete lowercase is safe"
-command = "git branch -d merged-branch"
+description = "git merged branch listing is safe"
+command = "git branch --merged"
 expected = "allow"
 
 [[case]]
@@ -145,4 +170,14 @@ expected = "allow"
 [[case]]
 description = "git commit message containing rm -rf is safe"
 command = "git commit -m \"Fix rm -rf detection\""
+expected = "allow"
+
+[[case]]
+description = "quoted dynamic branch format data is not an option"
+command = "git branch --format \"$(format_producer)\""
+expected = "allow"
+
+[[case]]
+description = "literal command substitution output passed to echo is inert data"
+command = "echo \"$(printf 'git reset --hard')\""
 expected = "allow"

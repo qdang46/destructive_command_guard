@@ -17,6 +17,7 @@ enabled = ["kubernetes", "database", "containers"]
 |----------|-------|-------------|
 | [apigateway](apigateway.md) | 3 | AWS API Gateway, Kong API Gateway, Google Apigee |
 | [backup](backup.md) | 4 | BorgBackup, Rclone, Restic, ... |
+| [careful_company_running_windows](careful_company_running_windows.md) | 6 | Careful Company: Chat & Webhook Egress, Careful Company: Outbound Email, Careful Company: Guardrail Tampering, ... |
 | [cdn](cdn.md) | 3 | Cloudflare Workers, Fastly CDN, AWS CloudFront |
 | [cicd](cicd.md) | 4 | GitHub Actions, GitLab CI, Jenkins, ... |
 | [cloud](cloud.md) | 3 | AWS CLI, Google Cloud SDK, Azure CLI |
@@ -106,8 +107,8 @@ enabled = ["kubernetes", "database", "containers"]
 - [`database.mongodb`](database.md#databasemongodb)
 - [`database.redis`](database.md#databaseredis)
 - [`database.sqlite`](database.md#databasesqlite)
-- [`database.supabase`](database.md#databasesupabase)
 - [`database.snowflake`](database.md#databasesnowflake)
+- [`database.supabase`](database.md#databasesupabase)
 - [`containers.docker`](containers.md#containersdocker)
 - [`containers.compose`](containers.md#containerscompose)
 - [`containers.podman`](containers.md#containerspodman)
@@ -136,6 +137,12 @@ enabled = ["kubernetes", "database", "containers"]
 - [`windows.system`](windows.md#windowssystem)
 - [`windows.misc`](windows.md#windowsmisc)
 - [`windows.powershell`](windows.md#windowspowershell)
+- [`careful_company_running_windows.chat`](careful_company_running_windows.md#careful_company_running_windowschat)
+- [`careful_company_running_windows.email`](careful_company_running_windows.md#careful_company_running_windowsemail)
+- [`careful_company_running_windows.guardrails`](careful_company_running_windows.md#careful_company_running_windowsguardrails)
+- [`careful_company_running_windows.transfer`](careful_company_running_windows.md#careful_company_running_windowstransfer)
+- [`careful_company_running_windows.tunnel`](careful_company_running_windows.md#careful_company_running_windowstunnel)
+- [`careful_company_running_windows.upload`](careful_company_running_windows.md#careful_company_running_windowsupload)
 
 ## Notes
 

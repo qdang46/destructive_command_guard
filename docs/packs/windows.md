@@ -15,7 +15,7 @@ This document describes packs in the `windows` category.
 
 **Pack ID:** `windows.filesystem`
 
-Protects against recursive/forced filesystem destruction on Windows: cmd `del /s`, `rd /s`, `format <drive>:`, and PowerShell `Remove-Item -Recurse -Force` (and aliases), `Clear-Content`, and `Clear-RecycleBin`.
+Protects against recursive/forced filesystem destruction on Windows: cmd `del /s`, `rd /s`, `format <drive>:`, PowerShell `Remove-Item -Recurse (with or without `-Force`; aliases included), `Clear-Content`, `Clear-RecycleBin`, and the .NET recursive-delete APIs `[System.IO.Directory]::Delete($path, $true)` and `<DirectoryInfo>.Delete($true)`.
 
 ### Keywords
 
@@ -46,6 +46,13 @@ Commands containing these keywords are checked against this pack:
 - `Clear-RecycleBin`
 - `clear-recyclebin`
 - `CLEAR-RECYCLEBIN`
+- `IO.Directory`
+- `io.directory`
+- `Io.Directory`
+- `IO.DIRECTORY`
+- `.Delete(`
+- `.delete(`
+- `.DELETE(`
 
 ### Safe Patterns (Allowed)
 
@@ -53,8 +60,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `whatif-preview` | `(?i)^\s*(?:(?:remove-item\|ri\|clear-content\|clc\|clear-recyclebin)\b[^\|&;\r\n]*\s-whatif\b\|rm\b(?=[^\|&;\r\n]*\s-recurse\b)(?=[^\|&;\r\n]*\s-force\b)[^\|&;\r\n]*\s-whatif\b)[^\|&;\r\n]*$` |
-| `del-temp` | `(?i)^\s*(?:del\|erase\|rd\|rmdir\|remove-item\|ri\|rm)\b[^\|&;\r\n]*(?:%temp%\|%tmp%\|\$env:te?mp\b\|\$env:localappdata\\+temp\b\|\\appdata\\+local\\+temp\\\|\\windows\\+temp\\\|\[system\.io\.path\]::gettemppath)[^\|&;\r\n]*$` |
+| `whatif-preview` | `(?i)^\s*(?:(?:remove-item\|ri\|clear-content\|clc\|clear-recyclebin)\b(?![^\|&;\r\n]*\s--(?:\s\|$))[^\|&;\r\n]*\s-whatif\b\|rm\b(?=[^\|&;\r\n]*\s-recurse\b)(?![^\|&;\r\n]*\s--(?:\s\|$))[^\|&;\r\n]*\s-whatif\b)[^\|&;\r\n]*$` |
 | `del-help` | `(?i)^\s*(?:del\|rd\|rmdir\|format\|erase)(?:\.exe)?\s+/\?\s*$` |
 
 ### Destructive Patterns (Blocked)
@@ -63,12 +69,17 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `windows-filesystem-semantic-unverified` | The Windows filesystem command contains unresolved shell syntax in an executable or destructive option position. | critical |
 | `del-recursive` | del /s recursively deletes every matching file in a directory tree. | critical |
 | `rd-recursive` | rd /s deletes a directory and its entire contents. | critical |
 | `remove-item-recurse-force` | Remove-Item -Recurse -Force deletes a tree with no Recycle Bin and no prompt. | critical |
+| `remove-item-recurse` | Remove-Item -Recurse permanently deletes a tree with no Recycle Bin. | critical |
 | `format-drive` | format <drive>: erases an entire volume. | critical |
 | `clear-content` | Clear-Content empties a file's contents in place with no undo. | high |
 | `clear-recyclebin` | Clear-RecycleBin permanently purges the Recycle Bin. | medium |
+| `dotnet-directory-delete-recursive` | [System.IO.Directory]::Delete with a true recursive flag deletes an entire directory tree. | critical |
+| `dotnet-directory-delete` | [System.IO.Directory]::Delete removes a directory outside the Recycle Bin. | high |
+| `directoryinfo-delete-recursive` | .Delete($true) on a DirectoryInfo object recursively deletes the directory tree. | critical |
 
 ### Allowlist Guidance
 

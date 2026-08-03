@@ -11,8 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use dcg_cli::history::HistoryDb;
-use fsqlite_types::value::SqliteValue;
+use dcg_cli::history::{HistoryDb, SqliteValue};
 
 fn dcg_binary() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
@@ -65,9 +64,9 @@ fn run_hook_in_with_env(
 
 fn sv_to_string(value: &SqliteValue) -> String {
     match value {
-        SqliteValue::Text(s) => s.to_string(),
+        SqliteValue::Text(s) => s.clone(),
         SqliteValue::Integer(i) => i.to_string(),
-        SqliteValue::Float(f) => f.to_string(),
+        SqliteValue::Real(f) => f.to_string(),
         SqliteValue::Null => String::new(),
         SqliteValue::Blob(_) => String::new(),
     }

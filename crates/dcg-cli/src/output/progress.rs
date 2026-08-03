@@ -70,6 +70,9 @@ impl ScanProgress {
     ///
     /// The progress bar is always created, even if not a TTY. Use `new_if_needed`
     /// for threshold-aware creation.
+    ///
+    /// # Panics
+    /// Panics if the indicatif template cannot be compiled.
     #[must_use]
     pub fn new(total_files: u64) -> Self {
         let bar = ProgressBar::new(total_files);
@@ -302,7 +305,11 @@ impl ScanProgressStyle {
 /// Creates a spinner for indeterminate-duration operations.
 ///
 /// The spinner automatically ticks in the background. Call `finish_and_clear()`
-/// or `finish_with_message()` when done.
+/// or `finish_with_message()` when done. The returned [`ProgressBar`] is
+/// always created even when stdout is not a TTY.
+///
+/// # Panics
+/// Panics if the indicatif spinner template cannot be compiled.
 ///
 /// # Example
 ///

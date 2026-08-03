@@ -68,8 +68,8 @@ id = "rm.safe.tmpdir-brace"
 category = "rm.safe.tmp"
 input_kind = "command"
 command = "rm -rf ${TMPDIR}/build"
-expected_decision = "allow"
-expected_log = { decision = "allow" }
+expected_decision = "deny"
+expected_log = { decision = "deny", mode = "deny", pack_id = "core.filesystem", pattern_name = "rm-rf-general", rule_id = "core.filesystem:rm-rf-general", source = "pack", reason_contains = "requires human approval" }
 
 [[case]]
 id = "rm.safe.var-tmp"
