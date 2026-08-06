@@ -1465,7 +1465,7 @@ jobs:
           if (-not $version) { throw "could not resolve the latest published release" }
           Write-Output "Testing published release $version"
 
-          $owner, $repo = ${{ github.repository }} -split '/'
+          $owner, $repo = '${{ github.repository }}' -split '/'
           $dest = Join-Path $env:RUNNER_TEMP 'dcg-bin'
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $src = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1"

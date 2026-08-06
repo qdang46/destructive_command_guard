@@ -82,7 +82,12 @@ if [[ -n "$HOSTS_OVERRIDE" ]]; then
   [[ ${#UNIX_SSH_HOSTS[@]} -eq 0 ]] && UNIX_SSH_HOSTS=(trj ts1)
 fi
 if $LOCAL_ONLY; then
-  UNIX_SSH_HOSTS=()
+  # Never leave the array EMPTY: bash 3.2 (macOS) treats an empty array as
+  # unbound under `set -u`, so `for host in "${UNIX_SSH_HOSTS[@]}"` crashes
+  # even though the loop body would never run. Keep the default hosts but
+  # skip the loop with a flag instead.
+  UNIX_SSH_HOSTS=(trj ts1)
+  SKIP_UNIX_HOSTS=true
   INCLUDE_WINDOWS=false
 fi
 
@@ -677,6 +682,11 @@ local_out="$(unix_probe | OWNER="$OWNER" REPO="$REPO" bash -s -- "$VERSION" "$RE
 parse_results "local" "$local_out"
 
 # --- Remote Unix hosts ------------------------------------------------------
+if [[ "${SKIP_UNIX_HOSTS:-false}" == "true" ]]; then
+  : # --local-only: skip the SSH loop entirely (array is never expanded)
+elif [[ ${#UNIX_SSH_HOSTS[@]} -eq 0 ]]; then
+  : # no hosts configured — nothing to probe
+else
 for host in "${UNIX_SSH_HOSTS[@]}"; do
   $JSON_OUTPUT || { echo; echo "$host"; }
   if ! ssh -o ConnectTimeout=8 -o BatchMode=yes "$host" 'echo ok' >/dev/null 2>&1; then
@@ -687,6 +697,7 @@ for host in "${UNIX_SSH_HOSTS[@]}"; do
     "OWNER='$OWNER' REPO='$REPO' bash -s -- '$VERSION' '$REPO_RAW'" 2>&1)"
   parse_results "$host" "$remote_out"
 done
+fi
 
 # --- Windows host (native PowerShell installer) -----------------------------
 if $INCLUDE_WINDOWS; then
