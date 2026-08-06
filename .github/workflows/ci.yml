@@ -1411,6 +1411,12 @@ jobs:
   # These runners are stock, unconfigured machines — the closest thing to a
   # real new user that CI can offer. Scheduled + manual only: it exercises the
   # published release, not the commit under test.
+  #
+  # On a fork, this suite validates the FORK's own published release: the
+  # fleet script installs from the checked-out repo's release and installers
+  # (see scripts/e2e_fleet_install.sh --repo), so a fork with its own release
+  # assets gets real coverage instead of silently downloading the upstream
+  # project's artifacts.
   # ---------------------------------------------------------------------------
   published-release-matrix:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -1435,7 +1441,8 @@ jobs:
         if: matrix.shell == 'bash'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash scripts/e2e_fleet_install.sh --local-only
+          DCG_E2E_REPO: ${{ github.repository }}
+        run: bash scripts/e2e_fleet_install.sh --local-only --repo "$DCG_E2E_REPO"
 
       # The Windows path uses the README's scriptblock invocation, which is
       # what users actually run (and what a default Restricted ExecutionPolicy
@@ -1457,10 +1464,11 @@ jobs:
           if (-not $version) { throw "could not resolve the latest published release" }
           Write-Output "Testing published release $version"
 
+          $owner, $repo = ${{ github.repository }} -split '/'
           $dest = Join-Path $env:RUNNER_TEMP 'dcg-bin'
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $src = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1"
-          & ([scriptblock]::Create($src)) -Version $version -Dest $dest -Verify -NoConfigure
+          & ([scriptblock]::Create($src)) -Version $version -Dest $dest -Verify -NoConfigure -Owner $owner -Repo $repo
 
           $bin = Join-Path $dest 'dcg.exe'
           if (-not (Test-Path $bin)) { throw "installer produced no dcg.exe" }

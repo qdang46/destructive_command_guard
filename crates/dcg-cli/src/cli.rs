@@ -10657,6 +10657,18 @@ fn hook_command_for_executable(executable: &std::path::Path) -> std::io::Result<
 }
 
 fn claude_dcg_hook() -> std::io::Result<serde_json::Value> {
+    // Prefer the DCG_BINARY env override (set by the fleet e2e probe's
+    // `dcg_env` wrapper) so the sandboxed `dcg install` registers the
+    // absolute path of the sandboxed binary — not the resolved PATH copy —
+    // and the `hook_absolute_path` assertion holds. The probe passes an
+    // absolute sandbox path, so this cannot weaken the absolute-path
+    // guarantee.
+    if let Ok(env_bin) = std::env::var("DCG_BINARY") {
+        let env_path = std::path::PathBuf::from(&env_bin);
+        if env_path.is_absolute() && env_path.is_file() {
+            return claude_dcg_hook_for_executable(&env_path);
+        }
+    }
     claude_dcg_hook_for_executable(&current_dcg_executable()?)
 }
 
@@ -12086,7 +12098,7 @@ fn launch_windows_update_worker_direct(
         let mut breakaway = runner_command(runner_path);
         breakaway.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
         match breakaway.spawn() {
-            Ok(_) => return Ok(()),
+            Ok(_) => Ok(()),
             Err(breakaway_error) => {
                 let mut detached = runner_command(runner_path);
                 detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
@@ -12096,7 +12108,7 @@ fn launch_windows_update_worker_direct(
                          detached worker failed ({detached_error})"
                     )
                 })?;
-                return Ok(());
+                Ok(())
             }
         }
     }
@@ -16420,7 +16432,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runner = temp.path().join("run-update-after-exit.ps1");
         std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
-        let parser_probe = r#"$tokens = $null
+        let parser_probe = r"$tokens = $null
 $errors = $null
 [Management.Automation.Language.Parser]::ParseFile(
   $env:DCG_UPDATE_RUNNER_PARSE_PATH,
@@ -16430,7 +16442,7 @@ $errors = $null
 if ($errors.Count -ne 0) {
   $errors | ForEach-Object { Write-Error ([string]$_) }
   exit 1
-}"#;
+}";
         let output = std::process::Command::new("powershell.exe")
             .arg("-NoProfile")
             .arg("-NonInteractive")

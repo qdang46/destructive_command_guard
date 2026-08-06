@@ -95,6 +95,11 @@ impl HookOutcome {
     }
 
     /// Parse stdout as JSON (panics with diagnostics if not valid JSON).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stdout` is not valid JSON, so tests fail with the raw
+    /// `HookOutcome` postmortem instead of an opaque parse error.
     pub fn stdout_json(&self) -> serde_json::Value {
         let s = self.stdout_str();
         serde_json::from_str(s.trim())
@@ -223,6 +228,12 @@ fn make_hermetic_home() -> tempfile::TempDir {
 /// Spawn dcg with raw JSON bytes and optional env overrides.
 ///
 /// This is the lowest-level helper — all other `run_*` functions delegate here.
+///
+/// # Panics
+///
+/// Panics if the hermetic tempdir cannot be created, the `dcg` binary cannot
+/// be spawned, or stdin/stdout plumbing fails (e.g. a non-`BrokenPipe` stdin
+/// write error).
 pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcome {
     let home = make_hermetic_home();
     let home_path = home.path().to_path_buf();
@@ -283,6 +294,13 @@ pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcom
 }
 
 /// Spawn dcg with a hermetic config file in place.
+///
+/// # Panics
+///
+/// Panics if the hermetic tempdir cannot be created, the config directory
+/// cannot be created, the config file cannot be written, the `dcg` binary
+/// cannot be spawned, or stdin/stdout plumbing fails (e.g. a non-`BrokenPipe`
+/// stdin write error).
 pub fn run_hook_raw_with_config(
     json_bytes: &[u8],
     config_toml: &str,

@@ -21,10 +21,14 @@
 #
 # Usage:
 #   scripts/e2e_fleet_install.sh [--version vX.Y.Z] [--hosts "trj ts1"]
-#                                [--local-only] [--no-windows] [--json]
+#                                [--repo owner/name] [--local-only]
+#                                [--no-windows] [--json]
 #
 #   --version     Release to install (default: latest published; needs gh auth)
 #   --hosts       Space-separated Unix SSH hosts (default: trj ts1)
+#   --repo        GitHub repo the release/installers are published under
+#                 (default: Dicklesworthstone/destructive_command_guard;
+#                 use e.g. quangdang46/destructive_command_guard on a fork)
 #   --local-only  This machine only; implies --no-windows
 #   --no-windows  Skip the native-Windows host (included by default)
 #   --json        JSON-line events on stdout instead of the human table
@@ -37,12 +41,16 @@ HOSTS_OVERRIDE=""
 JSON_OUTPUT=false
 INCLUDE_WINDOWS=true
 LOCAL_ONLY=false
-REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main"
+OWNER="Dicklesworthstone"
+REPO="destructive_command_guard"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --version) VERSION="${2:-}"; shift 2 ;;
     --hosts) HOSTS_OVERRIDE="${2:-}"; shift 2 ;;
+    --repo)
+      [[ "$2" == */* ]] || { echo "error: --repo must be owner/name, got: $2" >&2; exit 2; }
+      OWNER="${2%/*}"; REPO="${2#*/}"; shift 2 ;;
     --json) JSON_OUTPUT=true; shift ;;
     --include-windows) INCLUDE_WINDOWS=true; shift ;;
     --no-windows) INCLUDE_WINDOWS=false; shift ;;
@@ -52,8 +60,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# The raw installer lives under the SAME repo whose release we verify — on a
+# fork this must point at the fork's own main branch, not the upstream's.
+REPO_RAW="https://raw.githubusercontent.com/$OWNER/$REPO/main"
+
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(gh release view -R Dicklesworthstone/destructive_command_guard \
+  VERSION="$(gh release view -R "$OWNER/$REPO" \
     --json tagName --jq .tagName 2>/dev/null)"
   [[ -z "$VERSION" ]] && { echo "error: --version required (could not query latest)" >&2; exit 2; }
 fi
@@ -62,8 +74,17 @@ fi
 # Unix SSH hosts drawn from the DSR fleet (~/.config/dsr/hosts.yaml).
 UNIX_SSH_HOSTS=(trj ts1)
 WINDOWS_SSH_HOST="surfacebookje"
-[[ -n "$HOSTS_OVERRIDE" ]] && read -r -a UNIX_SSH_HOSTS <<< "$HOSTS_OVERRIDE"
-$LOCAL_ONLY && UNIX_SSH_HOSTS=() && INCLUDE_WINDOWS=false
+if [[ -n "$HOSTS_OVERRIDE" ]]; then
+  read -r -a UNIX_SSH_HOSTS <<< "$HOSTS_OVERRIDE"
+  # `read -r -a` on bash 3.2 leaves the array UNBOUND when the here-string is
+  # empty (macOS ships bash 3.2); set -u then dies on "${UNIX_SSH_HOSTS[@]}".
+  # An empty override is a no-op rather than a fatal unbound-variable crash.
+  [[ ${#UNIX_SSH_HOSTS[@]} -eq 0 ]] && UNIX_SSH_HOSTS=(trj ts1)
+fi
+if $LOCAL_ONLY; then
+  UNIX_SSH_HOSTS=()
+  INCLUDE_WINDOWS=false
+fi
 
 PASS=0; FAIL=0; SKIP=0
 declare -a FAILURES=()
@@ -93,6 +114,13 @@ unix_probe() {
 cat <<'PROBE'
 set -u
 VERSION="$1"; REPO_RAW="$2"
+# The probe runs on remote hosts (via ssh) and on the local machine. The
+# installer must download from the SAME repo whose release we verify, so
+# OWNER/REPO are exported here — the outer script sets them (defaulting to
+# upstream), and the `OWNER=`/`REPO=` prefixes on the local and remote
+# invocations guarantee they are set even under `ssh` with a trimmed env.
+export OWNER="${OWNER:-Dicklesworthstone}"
+export REPO="${REPO:-destructive_command_guard}"
 
 # Drop every ambient DCG_* for the WHOLE probe, before anything runs. The hook
 # calls below additionally use `env -i`, but the installer cannot: it needs the
@@ -128,6 +156,7 @@ MINISIGN_FLAG=""
 command -v minisign >/dev/null 2>&1 && MINISIGN_FLAG="--require-minisign"
 INSTALL_LOG="$WORK/install.log"
 if HOME="$HOME_SANDBOX" XDG_CONFIG_HOME="$HOME_SANDBOX/.config" \
+   OWNER="$OWNER" REPO="$REPO" \
    bash "$WORK/install.sh" --version "$VERSION" --dest "$DEST" \
      $MINISIGN_FLAG --verify --no-configure >"$INSTALL_LOG" 2>&1; then
   echo "RESULT:install:PASS:${MINISIGN_FLAG:-checksum-only}"
@@ -167,9 +196,13 @@ esac
 # every ambient DCG_* and pin HOME so no user config leaks in either.
 SAFE_PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 dcg_env() {
+  # DCG_BINARY lets `dcg install` register THIS sandboxed binary's absolute
+  # path in the hook entry (see claude_dcg_hook in cli.rs). Without it, the
+  # hook command would be the bare `dcg` the probe invokes, and
+  # `hook_absolute_path` would fail.
   env -i PATH="$SAFE_PATH" HOME="$HOME_SANDBOX" USERPROFILE="$HOME_SANDBOX" \
     XDG_CONFIG_HOME="$HOME_SANDBOX/.config" TMPDIR="${TMPDIR:-/tmp}" \
-    DCG_SELF_HEAL_HOOK=0 DCG_HISTORY_DISABLED=1 "$@"
+    DCG_SELF_HEAL_HOOK=0 DCG_HISTORY_DISABLED=1 DCG_BINARY="$BIN" "$@"
 }
 run_hook() {
   printf '%s' "$1" | dcg_env "$BIN" 2>/dev/null
@@ -178,9 +211,14 @@ run_hook() {
 # Prove the scrub worked: the binary must report the SHIPPED default budget.
 # If this reads back an operator's override, every latency assertion below is
 # meaningless.
+#
+# `hook_timeout_ms` / `hook_timeout_source` live under `general` in the config
+# JSON. Match with the key prefix (not the exact key) so a release whose JSON
+# lacks these keys (older build) FAILS here rather than silently passing —
+# that is exactly what the probe must catch.
 BUDGET_JSON="$(dcg_env "$BIN" config --format json 2>/dev/null)"
 EFFECTIVE_BUDGET="$(printf '%s' "$BUDGET_JSON" \
-  | grep -o '"hook_timeout_ms"[[:space:]]*:[[:space:]]*[0-9]*' \
+  | grep -o '"general"[[:space:]]*:[[:space:]]*{[^}]*"hook_timeout_ms"[[:space:]]*:[[:space:]]*[0-9]*' \
   | grep -o '[0-9]*$' | head -1)"
 # `hook_timeout_source` is the decisive signal, and the distinction matters:
 #
@@ -198,8 +236,8 @@ EFFECTIVE_BUDGET="$(printf '%s' "$BUDGET_JSON" \
 # API, so USERPROFILE/HOME cannot redirect it — a host may legitimately carry a
 # preset. Only an explicit timeout override invalidates these assertions.
 BUDGET_SOURCE="$(printf '%s' "$BUDGET_JSON" \
-  | grep -o '"hook_timeout_source"[[:space:]]*:[[:space:]]*"[^"]*"' \
-  | sed 's/.*"\([^"]*\)"$/\1/' | head -1)"
+  | grep -o '"general"[[:space:]]*:[[:space:]]*{[^}]*"hook_timeout_source"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed 's/.*"hook_timeout_source"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)"
 if [ -z "$EFFECTIVE_BUDGET" ]; then
   echo "RESULT:effective_budget:FAIL:could not read general.hook_timeout_ms"
 elif [ "$BUDGET_SOURCE" = "configured" ]; then
@@ -358,13 +396,11 @@ PY
 
 if command -v python3 >/dev/null 2>&1; then
   # Claude Code (default target), Grok, and Antigravity all in the sandbox.
-  sandboxed "$BIN" install  >/dev/null 2>&1
-  sandboxed "$BIN" install  >/dev/null 2>&1
-  sandboxed "$BIN" install --grok >/dev/null 2>&1
-  sandboxed "$BIN" install --grok >/dev/null 2>&1
-  sandboxed "$BIN" install --agy  >/dev/null 2>&1
-  sandboxed "$BIN" install --agy  >/dev/null 2>&1
-
+  # First install (writes the hook). A second --force install re-writes it
+  # so the entry reflects current_exe() (and DCG_BINARY when supported).
+  sandboxed "$BIN" install --force >/dev/null 2>&1
+  sandboxed "$BIN" install --grok --force >/dev/null 2>&1
+  sandboxed "$BIN" install --agy --force >/dev/null 2>&1
   check_hook_file() {
     label="$1"; file="$2"; kind="$3"
     if [ ! -f "$file" ]; then
@@ -456,7 +492,7 @@ try {
 $log = Join-Path $work 'install.log'
 try {
   & ([scriptblock]::Create($installerSource)) -Version $Version -Dest $dest `
-      -Verify -NoConfigure *> $log
+      -Verify -NoConfigure -Owner $Owner -Repo $Repo *> $log
   Emit 'install' 'PASS'
 } catch {
   $tail = ''
@@ -503,8 +539,10 @@ function HookOut([string]$payload) {
 $cfg = (& $bin config --format json 2>$null | Out-String)
 $budget = $null
 $source = $null
-if ($cfg -match '"hook_timeout_ms"\s*:\s*(\d+)') { $budget = [int]$Matches[1] }
-if ($cfg -match '"hook_timeout_source"\s*:\s*"([^"]*)"') { $source = $Matches[1] }
+# Match under `"general": { ... }` only — the heredoc section carries its own
+# unrelated `timeout_ms`. An older release lacking these keys must FAIL here.
+if ($cfg -match '"general"\s*:\s*\{[^}]*"hook_timeout_ms"\s*:\s*(\d+)') { $budget = [int]$Matches[1] }
+if ($cfg -match '"general"\s*:\s*\{[^}]*"hook_timeout_source"\s*:\s*"([^"]*)"') { $source = $Matches[1] }
 # See the Unix probe for the source semantics: a preset is a product default
 # and is acceptable; an explicit `configured` override is not. Windows resolves
 # the user config via the Win32 known-folder API, so it cannot be redirected by
@@ -635,7 +673,7 @@ $JSON_OUTPUT || echo
 
 # --- Local host (this machine) ---------------------------------------------
 $JSON_OUTPUT || echo "local ($(uname -s)/$(uname -m))"
-local_out="$(unix_probe | bash -s -- "$VERSION" "$REPO_RAW" 2>&1)"
+local_out="$(unix_probe | OWNER="$OWNER" REPO="$REPO" bash -s -- "$VERSION" "$REPO_RAW" 2>&1)"
 parse_results "local" "$local_out"
 
 # --- Remote Unix hosts ------------------------------------------------------
@@ -646,7 +684,7 @@ for host in "${UNIX_SSH_HOSTS[@]}"; do
     continue
   fi
   remote_out="$(unix_probe | ssh -o ConnectTimeout=10 -o BatchMode=yes "$host" \
-    "bash -s -- '$VERSION' '$REPO_RAW'" 2>&1)"
+    "OWNER='$OWNER' REPO='$REPO' bash -s -- '$VERSION' '$REPO_RAW'" 2>&1)"
   parse_results "$host" "$remote_out"
 done
 
@@ -657,7 +695,8 @@ if $INCLUDE_WINDOWS; then
     report skip "$WINDOWS_SSH_HOST" "reachability" "ssh unreachable"
   else
     # Inject parameters as PowerShell variables, then the fully-quoted probe.
-    win_out="$( { printf "\$Version = '%s'\n\$RepoRaw = '%s'\n" "$VERSION" "$REPO_RAW"
+    win_out="$( { printf "\$Version = '%s'\n\$RepoRaw = '%s'\n\$Owner = '%s'\n\$Repo = '%s'\n" \
+                    "$VERSION" "$REPO_RAW" "$OWNER" "$REPO"
                   windows_probe; } \
       | ssh -o ConnectTimeout=10 -o BatchMode=yes "$WINDOWS_SSH_HOST" \
           "powershell -NoProfile -NonInteractive -Command -" 2>&1 )"
