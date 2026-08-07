@@ -1371,6 +1371,27 @@ fn mise_exec_wrapper_command_index(command: &str, tokens: &[NormalizeToken]) -> 
     None
 }
 
+/// The executable basenames [`strip_posix_execution_frontend`] models. When a
+/// command starts with one of these but the stripper bails (dynamic option
+/// value, unmodeled flag), the wrapped command still executes at runtime, so
+/// deny-direction analyses must not downgrade its words to argv data (#260).
+pub(crate) fn is_posix_execution_frontend_basename(basename: &str) -> bool {
+    matches!(
+        basename,
+        "exec"
+            | "nohup"
+            | "time"
+            | "nice"
+            | "ionice"
+            | "setsid"
+            | "timeout"
+            | "stdbuf"
+            | "chrt"
+            | "busybox"
+            | "mise"
+    )
+}
+
 pub(crate) fn strip_posix_execution_frontend(command: &str) -> Option<(&str, &'static str)> {
     let trimmed = command.trim_start();
     let tokens = tokenize_for_normalization(trimmed);

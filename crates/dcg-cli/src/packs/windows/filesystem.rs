@@ -1625,6 +1625,24 @@ pub(crate) fn windows_filesystem_semantic_decision_in_dialect(
         .chain(POWERSHELL_PROTECTED_EXECUTABLES)
         .any(|keyword| lowercase_command.contains(keyword));
 
+    // The .NET directory-delete expressions are PowerShell call expressions
+    // whose `(` and `)` the dialect tokenizer emits as statement-internal
+    // separators. The generic segment splitter below therefore severs the
+    // method name from its argument list, so neither `^`-anchored matcher
+    // (both require the opening `(`) can ever fire on a proven-PowerShell
+    // caller — the wiring gap behind issue #222, which left the fix visible
+    // only through the Unknown-dialect raw-regex fallback. Detect them here
+    // over whole-command tokens, before any paren-driven segmentation; the
+    // matchers' own `[^|&\r\n]` guards keep every match inside one statement,
+    // and wholly quoted spellings stay inert because the tokenizer groups a
+    // quoted string into a single (skipped) word.
+    if dialect == ShellDialect::PowerShell {
+        let command_tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+        if let Some(rule) = powershell_dotnet_directory_delete_rule(command, &command_tokens) {
+            return WindowsFilesystemSemanticDecision::Destructive(rule);
+        }
+    }
+
     let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
     if segments.len() > MAX_WINDOWS_FILESYSTEM_SEMANTIC_SEGMENTS {
         return if has_dialect_syntax || has_literal_keyword {

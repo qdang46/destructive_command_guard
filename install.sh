@@ -119,7 +119,7 @@ draw_box() {
   local strip_ansi_sed="s/${esc}\\[[0-9;]*m//g"
 
   # Calculate max width (strip ANSI codes for accurate measurement)
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     local stripped
     stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
     local len=${#stripped}
@@ -139,7 +139,7 @@ draw_box() {
   printf "\033[%sm╔%s╗\033[0m\n" "$color" "$border"
 
   # Draw each line with padding
-  for line in "${lines[@]}"; do
+  for line in ${lines[@]+"${lines[@]}"}; do
     local stripped
     stripped=$(printf '%b' "$line" | LC_ALL=C sed "$strip_ansi_sed")
     local len=${#stripped}
@@ -273,9 +273,10 @@ detect_agents() {
     CURSOR_VERSION=$(try_version cursor)
   fi
 
-  # Hermes Agent (NousResearch) — config dir at ~/.hermes, optional `hermes`
-  # CLI on PATH.
-  if [[ -d "$HOME/.hermes" ]] || command -v hermes &>/dev/null; then
+  # Hermes Agent (NousResearch) — data dir at ${HERMES_HOME:-~/.hermes},
+  # optional `hermes` CLI on PATH.
+  if [[ -d "${HERMES_HOME:-$HOME/.hermes}" ]] || [[ -d "$HOME/.hermes" ]] ||
+    command -v hermes &>/dev/null; then
     DETECTED_AGENTS+=("hermes")
     HERMES_VERSION=$(try_version hermes)
   fi
@@ -294,7 +295,7 @@ print_detected_agents() {
   if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     echo ""
     gum style --foreground 39 --bold "Detected AI Coding Agent${plural}:"
-    for agent in "${DETECTED_AGENTS[@]}"; do
+    for agent in ${DETECTED_AGENTS[@]+"${DETECTED_AGENTS[@]}"}; do
       case "$agent" in
         claude-code)
           local ver_info=""
@@ -342,7 +343,7 @@ print_detected_agents() {
   else
     echo ""
     echo -e "\033[1;39mDetected AI Coding Agent${plural}:\033[0m"
-    for agent in "${DETECTED_AGENTS[@]}"; do
+    for agent in ${DETECTED_AGENTS[@]+"${DETECTED_AGENTS[@]}"}; do
       case "$agent" in
         claude-code)
           local ver_info=""
@@ -393,7 +394,7 @@ print_detected_agents() {
 # Check if a specific agent was detected
 is_agent_detected() {
   local target="$1"
-  for agent in "${DETECTED_AGENTS[@]}"; do
+  for agent in ${DETECTED_AGENTS[@]+"${DETECTED_AGENTS[@]}"}; do
     [[ "$agent" == "$target" ]] && return 0
   done
   return 1
@@ -1299,7 +1300,9 @@ CURSOR_SETTINGS_LINUX="$HOME/.config/Cursor/User/settings.json"
 CURSOR_HOOKS_JSON="$HOME/.cursor/hooks.json"
 CURSOR_HOOK_DIR="$HOME/.cursor/hooks"
 CURSOR_HOOK_SCRIPT="$CURSOR_HOOK_DIR/dcg-pre-shell.py"
-HERMES_CONFIG="$HOME/.hermes/config.yaml"
+# Hermes reads its data root from $HERMES_HOME when set (native-Windows
+# installs set it; Unix users may too), defaulting to ~/.hermes on Unix.
+HERMES_CONFIG="${HERMES_HOME:-$HOME/.hermes}/config.yaml"
 AUTO_CONFIGURED=0
 
 # Detailed tracking for what was configured
@@ -1399,22 +1402,32 @@ if not isinstance(pre_tool_use, list):
     print("invalid")
     raise SystemExit(0)
 
+# Claude Code matchers are regexes over the tool name. Registering only `Bash`
+# leaves the native-Windows `PowerShell` tool unguarded (issue #226), so dcg
+# owns a single `Bash|PowerShell` entry hoisted to the front of PreToolUse.
+# A dcg hook still sitting under the legacy `Bash`-only matcher must be
+# migrated, not left beside the new entry.
+CANONICAL_MATCHER = "Bash|PowerShell"
+LEGACY_MATCHERS = ("Bash",)
 dcg_commands = []
-first_bash_hook_command = None
-first_bash_matcher_seen = False
+first_canonical_hook_command = None
+first_canonical_matcher_seen = False
 predecessor_present = False
 for entry in pre_tool_use:
-    if not isinstance(entry, dict) or entry.get("matcher") != "Bash":
+    if not isinstance(entry, dict):
+        continue
+    matcher = entry.get("matcher")
+    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
         continue
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
         print("invalid")
         raise SystemExit(0)
-    if not first_bash_matcher_seen:
-        first_bash_matcher_seen = True
+    if not first_canonical_matcher_seen:
+        first_canonical_matcher_seen = True
         first_hook = hooks[0] if hooks else None
         if isinstance(first_hook, dict):
-            first_bash_hook_command = first_hook.get("command")
+            first_canonical_hook_command = first_hook.get("command")
     for hook in hooks:
         if not isinstance(hook, dict):
             continue
@@ -1426,7 +1439,7 @@ for entry in pre_tool_use:
 
 if cleanup_predecessor and predecessor_present:
     print("merge")
-elif dcg_commands == [dcg_path] and first_bash_hook_command == dcg_path:
+elif dcg_commands == [dcg_path] and first_canonical_hook_command == dcg_path:
     print("already")
 else:
     print("merge")
@@ -1458,7 +1471,7 @@ PYEOF
       if [ "$after_first_dcg" != "$compact_settings" ] &&
          [ "${after_first_dcg#*"$dcg_command_marker"}" = "$after_first_dcg" ] &&
          printf '%s\n' "$compact_settings" |
-           grep -Eq "\"matcher\":\"Bash\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
+           grep -Eq "\"matcher\":\"Bash\\|PowerShell\",\"hooks\":\\[\\{[^}]*\"command\":\"$dcg_hook_regex\""; then
         CLAUDE_STATUS="already"
         AUTO_CONFIGURED=1
         return 0
@@ -1536,9 +1549,16 @@ elif not isinstance(settings['hooks']['PreToolUse'], list):
     print(f"Claude Code settings.json PreToolUse must contain a list: {settings_file}", file=sys.stderr)
     raise SystemExit(1)
 
-# First pass: process Bash matchers, optionally removing predecessor hooks
-# and consolidate all Bash matchers into one
-bash_hooks = []
+# Claude Code matchers are regexes over the tool name. Registering only `Bash`
+# leaves the native-Windows `PowerShell` tool unguarded (issue #226), so dcg
+# owns a single `Bash|PowerShell` entry hoisted to the front of PreToolUse.
+# A dcg hook still sitting under the legacy `Bash`-only matcher must be
+# migrated, not left beside the new entry.
+CANONICAL_MATCHER = "Bash|PowerShell"
+LEGACY_MATCHERS = ("Bash",)
+# First pass: strip dcg (and, when asked, its predecessor) out of every entry
+# dcg may previously have owned. Other hooks keep their own matcher so their
+# scope is never silently widened; entries emptied by the strip are dropped.
 new_pre_tool_use = []
 predecessor_removed = False
 
@@ -1546,39 +1566,39 @@ for entry in settings['hooks']['PreToolUse']:
     if not isinstance(entry, dict):
         new_pre_tool_use.append(entry)
         continue
-    if entry.get('matcher') == 'Bash':
-        if 'hooks' in entry and not isinstance(entry['hooks'], list):
-            print(f"Claude Code Bash matcher hooks must contain a list: {settings_file}", file=sys.stderr)
-            raise SystemExit(1)
-        # Collect hooks from this Bash matcher
-        if 'hooks' in entry:
-            for hook in entry['hooks']:
-                if isinstance(hook, dict) and 'command' in hook:
-                    cmd = hook.get('command', '')
-                    if 'git_safety_guard' in cmd:
-                        if cleanup_predecessor:
-                            predecessor_removed = True
-                            continue  # Skip predecessor
-                        else:
-                            bash_hooks.append(hook)  # Keep predecessor
-                    elif not is_dcg_command(cmd):  # Don't duplicate dcg
-                        bash_hooks.append(hook)
-                else:
-                    bash_hooks.append(hook)
-    else:
+    matcher = entry.get('matcher')
+    if matcher != CANONICAL_MATCHER and matcher not in LEGACY_MATCHERS:
         new_pre_tool_use.append(entry)
+        continue
+    if 'hooks' not in entry:
+        new_pre_tool_use.append(entry)
+        continue
+    if not isinstance(entry['hooks'], list):
+        print(f"Claude Code {matcher} matcher hooks must contain a list: {settings_file}", file=sys.stderr)
+        raise SystemExit(1)
+    kept_hooks = []
+    for hook in entry['hooks']:
+        if isinstance(hook, dict) and 'command' in hook:
+            cmd = hook.get('command', '')
+            if 'git_safety_guard' in cmd:
+                if cleanup_predecessor:
+                    predecessor_removed = True
+                    continue  # Skip predecessor
+                kept_hooks.append(hook)  # Keep predecessor
+            elif not is_dcg_command(cmd):  # Don't duplicate dcg
+                kept_hooks.append(hook)
+        else:
+            kept_hooks.append(hook)
+    if kept_hooks:
+        entry['hooks'] = kept_hooks
 
-# Add exactly one current dcg hook at the beginning. Existing dcg hooks,
-# including stale paths or duplicates, are intentionally collapsed here.
-dcg_hook = {"type": "command", "command": dcg_path}
-bash_hooks.insert(0, dcg_hook)
-
-# Create consolidated Bash matcher with dcg first
-if bash_hooks:
-    new_pre_tool_use.insert(0, {
-        "matcher": "Bash",
-        "hooks": bash_hooks
-    })
+# Add exactly one current dcg hook, first, so it runs before any other hook.
+# Existing dcg hooks, including stale paths, duplicates, and legacy `Bash`-only
+# registrations, were collapsed above.
+new_pre_tool_use.insert(0, {
+    "matcher": CANONICAL_MATCHER,
+    "hooks": [{"type": "command", "command": dcg_path}]
+})
 
 settings['hooks']['PreToolUse'] = new_pre_tool_use
 
@@ -1612,7 +1632,7 @@ PYEOF
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|PowerShell",
         "hooks": [
           {
             "type": "command",
@@ -2790,9 +2810,11 @@ configure_hermes() {
   local settings_dir
   settings_dir=$(dirname "$settings_file")
 
-  # Detect Hermes installation: config dir or `hermes` on PATH.
+  # Detect Hermes installation: resolved data dir, legacy ~/.hermes, or
+  # `hermes` on PATH. The hook is always WRITTEN to $HERMES_CONFIG.
   local hermes_installed=0
-  if [ -d "$settings_dir" ] || command -v hermes >/dev/null 2>&1; then
+  if [ -d "$settings_dir" ] || [ -d "$HOME/.hermes" ] ||
+    command -v hermes >/dev/null 2>&1; then
     hermes_installed=1
   fi
 
@@ -2810,7 +2832,7 @@ configure_hermes() {
   # Verify PyYAML is available; the YAML merge is too risky to fake.
   if ! python3 -c 'import yaml' >/dev/null 2>&1; then
     HERMES_STATUS="failed"
-    HERMES_FAILURE_REASON="python3 PyYAML required to safely merge ~/.hermes/config.yaml"
+    HERMES_FAILURE_REASON="python3 PyYAML required to safely merge ${HERMES_CONFIG}"
     return 0
   fi
 
@@ -3067,7 +3089,7 @@ if [ "$NO_CONFIGURE" -eq 0 ]; then
     fi
 
     if [ "$REMOVE_PREDECESSOR" -eq 1 ]; then
-      for loc in "${PREDECESSOR_LOCATIONS[@]}"; do
+      for loc in ${PREDECESSOR_LOCATIONS[@]+"${PREDECESSOR_LOCATIONS[@]}"}; do
         remove_predecessor "$loc"
       done
       # Note: settings.json cleanup is handled by configure_claude_code() below
@@ -3334,7 +3356,7 @@ if [ "$QUIET" -eq 0 ]; then
     {
       gum style --foreground 42 --bold "dcg is now active!"
       echo ""
-      for line in "${summary_lines[@]}"; do
+      for line in ${summary_lines[@]+"${summary_lines[@]}"}; do
         gum style --foreground 245 "$line"
       done
       echo ""
@@ -3344,7 +3366,7 @@ if [ "$QUIET" -eq 0 ]; then
   else
     echo -e "\033[1;32mdcg is now active!\033[0m"
     echo ""
-    for line in "${summary_lines[@]}"; do
+    for line in ${summary_lines[@]+"${summary_lines[@]}"}; do
       echo -e "  \033[0;90m$line\033[0m"
     done
     echo ""

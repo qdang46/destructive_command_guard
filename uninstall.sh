@@ -888,7 +888,7 @@ PYEOF
     return 0
 }
 
-# Remove dcg hook from Hermes Agent (~/.hermes/config.yaml)
+# Remove dcg hook from Hermes Agent (${HERMES_HOME:-~/.hermes}/config.yaml)
 unconfigure_hermes() {
     local cfg_file="$HOME/.hermes/config.yaml"
 
@@ -1040,7 +1040,7 @@ main() {
         log "  • Codex CLI hook ($codex_hooks_json)"
         found_anything=1
     fi
-    local hermes_config="$HOME/.hermes/config.yaml"
+    local hermes_config="${HERMES_HOME:-$HOME/.hermes}/config.yaml"
     if yaml_hermes_has_dcg_hook "$hermes_config"; then
         log "  • Hermes Agent hook ($hermes_config)"
         found_anything=1

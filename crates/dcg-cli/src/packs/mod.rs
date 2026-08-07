@@ -23,7 +23,6 @@ pub mod containers;
 pub mod core;
 pub mod database;
 pub mod dns;
-pub mod effects;
 pub mod email;
 pub mod external;
 pub mod featureflags;
@@ -35,6 +34,7 @@ pub mod monitoring;
 pub mod package_managers;
 pub mod payment;
 pub mod platform;
+pub mod effects;
 pub mod regex_engine;
 pub mod remote;
 pub mod safe;
@@ -645,6 +645,10 @@ impl Pack {
             match crate::packs::core::git::branch_command_decision(cmd) {
                 crate::packs::core::git::BranchCommandDecision::Destructive => {
                     return self.destructive_match_by_name("branch-force-delete");
+                }
+                crate::packs::core::git::BranchCommandDecision::DestructiveDynamic => {
+                    return self
+                        .destructive_match_by_name(crate::packs::core::git::BRANCH_DYNAMIC_RULE);
                 }
                 crate::packs::core::git::BranchCommandDecision::NonDestructive => return None,
                 crate::packs::core::git::BranchCommandDecision::NotBranch
@@ -3199,7 +3203,11 @@ fn collect_command_segments<'a>(
                 Some(usize::from(bytes.get(i + 1) == Some(&b'&')) + 1)
             }
         } else if b == b'|' {
-            Some(usize::from(matches!(bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1)
+            if is_force_clobber_pipe(bytes, i) {
+                None
+            } else {
+                Some(usize::from(matches!(bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1)
+            }
         } else {
             None
         };
@@ -3226,6 +3234,33 @@ fn push_trimmed_segment<'a>(cmd: &'a str, start: usize, end: usize, segments: &m
     if !segment.is_empty() {
         segments.push(segment);
     }
+}
+
+/// Returns true when the `|` at `index` is the second byte of bash's
+/// force-clobber redirect operator `>|` rather than a pipeline separator.
+///
+/// `>|` (and its FD-qualified forms `1>|`, `2>|`, `{fd}>|`) truncates the
+/// target even when `noclobber` is set — it is strictly *more* destructive
+/// than a plain `>`. Splitting on that `|` used to cut the redirect away from
+/// its target, so `echo x >| /etc/passwd` became the two segments
+/// `echo x >` and `/etc/passwd` and never reached
+/// `core.filesystem:redirect-truncate-root-home` (#263).
+///
+/// The preceding `>` must itself be unescaped: in `echo a \>| b` the `>` is
+/// literal data and the `|` really is a pipe.
+fn is_force_clobber_pipe(bytes: &[u8], index: usize) -> bool {
+    let Some(previous) = index.checked_sub(1) else {
+        return false;
+    };
+    if bytes.get(previous) != Some(&b'>') {
+        return false;
+    }
+    let escapes = bytes[..previous]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count();
+    escapes % 2 == 0
 }
 
 fn is_redirection_ampersand(bytes: &[u8], index: usize) -> bool {
@@ -3766,6 +3801,56 @@ mod tests {
         assert_eq!(
             split_command_segments("cat <&0; echo done"),
             vec!["cat <&0", "echo done"]
+        );
+    }
+
+    /// #263: `>|` is the force-clobber redirect operator, not a pipe. Splitting
+    /// on its `|` severed the redirect from its target and let every
+    /// force-clobber spelling escape `redirect-truncate-root-home`.
+    #[test]
+    fn split_command_segments_does_not_split_force_clobber_redirects() {
+        assert_eq!(
+            split_command_segments("echo x >| /etc/passwd"),
+            vec!["echo x >| /etc/passwd"]
+        );
+        assert_eq!(
+            split_command_segments("echo x >|/etc/passwd"),
+            vec!["echo x >|/etc/passwd"]
+        );
+        assert_eq!(
+            split_command_segments(">| /etc/passwd"),
+            vec![">| /etc/passwd"]
+        );
+        assert_eq!(
+            split_command_segments("echo x 1>| /etc/passwd"),
+            vec!["echo x 1>| /etc/passwd"]
+        );
+        assert_eq!(
+            split_command_segments("echo x 2>| /etc/passwd"),
+            vec!["echo x 2>| /etc/passwd"]
+        );
+        assert_eq!(
+            split_command_segments("echo x {fd}>| /etc/passwd"),
+            vec!["echo x {fd}>| /etc/passwd"]
+        );
+        // A force-clobber redirect still ends at a genuine separator.
+        assert_eq!(
+            split_command_segments("echo x >| /etc/passwd && echo done"),
+            vec!["echo x >| /etc/passwd", "echo done"]
+        );
+        assert_eq!(
+            split_command_segments("echo x >| /tmp/out | grep x"),
+            vec!["echo x >| /tmp/out", "grep x"]
+        );
+        // An escaped `>` is literal data, so the following `|` is a real pipe.
+        assert_eq!(
+            split_command_segments(r"echo a \>| grep x"),
+            vec![r"echo a \>", "grep x"]
+        );
+        // Quoted `>|` is data and must not suppress a later real pipe.
+        assert_eq!(
+            split_command_segments(r#"echo ">|" | grep x"#),
+            vec![r#"echo ">|""#, "grep x"]
         );
     }
 

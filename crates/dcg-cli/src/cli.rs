@@ -1,6 +1,6 @@
 //! CLI argument parsing and command handling.
 //!
-//! This module provides the command-line interface for dcg (`destructive_command_guard`),
+//! This module provides the command-line interface for dcg (`dcg_cli`),
 //! including subcommands for configuration management and pack information.
 
 use chrono::Utc;
@@ -107,7 +107,7 @@ impl OutputFormat {
 
 /// High-performance Claude Code hook for blocking destructive commands.
 ///
-/// dcg (`destructive_command_guard`) protects against accidental execution of
+/// dcg (`dcg_cli`) protects against accidental execution of
 /// destructive commands by AI coding agents. It blocks dangerous git commands,
 /// filesystem operations, database queries, and more.
 #[derive(Parser, Debug)]
@@ -464,6 +464,14 @@ pub enum Command {
         /// Bypass a soft block from the graduated response system
         #[arg(long)]
         force: bool,
+
+        /// Evaluate a single shell dialect instead of all of them (#269)
+        ///
+        /// `--dialect posix` reproduces the evaluation path the Bash
+        /// PreToolUse hook takes; the default (`unknown`) fans out to every
+        /// dialect because the CLI cannot know the source shell.
+        #[arg(long, value_enum, default_value = "unknown", env = "DCG_DIALECT")]
+        dialect: DialectArg,
     },
 
     /// Generate a sample configuration file
@@ -551,6 +559,14 @@ pub enum Command {
         /// Additional packs to enable for this evaluation
         #[arg(long, value_delimiter = ',')]
         with_packs: Option<Vec<String>>,
+
+        /// Evaluate a single shell dialect instead of all of them (#269)
+        ///
+        /// `--dialect posix` reproduces the evaluation path the Bash
+        /// PreToolUse hook takes; the default (`unknown`) fans out to every
+        /// dialect because the CLI cannot know the source shell.
+        #[arg(long, value_enum, default_value = "unknown", env = "DCG_DIALECT")]
+        dialect: DialectArg,
     },
 
     /// Run regression corpus tests and output detailed JSON logs
@@ -1624,6 +1640,40 @@ pub enum SimulateFormat {
     Json,
 }
 
+/// Shell dialect selector for `dcg explain` / `dcg test` (#269).
+///
+/// The CLI evaluates at [`ShellDialect::Unknown`] by default because it does
+/// not know which shell would run the command, so it fans out to every dialect.
+/// The live PreToolUse hook resolves a concrete dialect (Posix for `Bash`,
+/// PowerShell for `PowerShell`) and evaluates that one path, so diagnostics can
+/// report costs and paths the hook does not have. This opt-in flag lets a user
+/// pin the same dialect the hook resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum DialectArg {
+    /// Evaluate every dialect (CLI default; matches no single hook path)
+    #[default]
+    Unknown,
+    /// POSIX shell — the dialect the `Bash` PreToolUse hook resolves
+    #[value(alias = "bash", alias = "sh")]
+    Posix,
+    /// PowerShell — the dialect the `PowerShell` PreToolUse hook resolves
+    #[value(alias = "pwsh", alias = "powershell")]
+    Ps,
+    /// Windows `cmd.exe`
+    Cmd,
+}
+
+impl From<DialectArg> for crate::normalize::ShellDialect {
+    fn from(value: DialectArg) -> Self {
+        match value {
+            DialectArg::Unknown => Self::Unknown,
+            DialectArg::Posix => Self::Posix,
+            DialectArg::Ps => Self::PowerShell,
+            DialectArg::Cmd => Self::Cmd,
+        }
+    }
+}
+
 /// Output format for explain command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum ExplainFormat {
@@ -2057,7 +2107,9 @@ fn maybe_show_update_notice(cli: &Cli, config: &Config, verbosity: Verbosity) {
 /// subcommand that performs I/O fails.
 ///
 /// # Panics
-/// Panics if a requested config-source trace cannot be constructed.
+///
+/// Panics if a command that requires config-source tracing (`doctor`, `config`)
+/// is dispatched without the source report (an internal invariant violation).
 #[allow(clippy::too_many_lines)]
 pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Source tracing performs path/status bookkeeping for diagnostics. Keep it
@@ -2171,6 +2223,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             heredoc_languages,
             enforce_budget,
             force,
+            dialect,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
@@ -2204,7 +2257,13 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     TestFormat::Pretty => ExplainFormat::Pretty,
                     TestFormat::Json | TestFormat::Toon => ExplainFormat::Json,
                 };
-                handle_explain(&effective_config, &command, explain_format, with_packs);
+                handle_explain(
+                    &effective_config,
+                    &command,
+                    explain_format,
+                    with_packs,
+                    dialect,
+                );
             } else {
                 let was_blocked = test_command(
                     &effective_config,
@@ -2220,6 +2279,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     heredoc_languages,
                     enforce_budget,
                     force,
+                    dialect,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
@@ -2354,6 +2414,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             command,
             format,
             with_packs,
+            dialect,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
@@ -2364,7 +2425,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             if !verbosity.quiet {
-                handle_explain(&config, &command, effective_format, with_packs);
+                handle_explain(&config, &command, effective_format, with_packs, dialect);
             }
         }
         Some(Command::Corpus(corpus)) => {
@@ -4106,6 +4167,7 @@ fn test_command(
     heredoc_languages: Option<Vec<String>>,
     enforce_budget: bool,
     force: bool,
+    dialect: DialectArg,
 ) -> bool {
     use std::time::{Duration, Instant};
 
@@ -4116,7 +4178,7 @@ fn test_command(
     // (issue #149).
 
     if verbosity.is_trace() && format == TestFormat::Pretty {
-        handle_explain(config, command, ExplainFormat::Pretty, extra_packs);
+        handle_explain(config, command, ExplainFormat::Pretty, extra_packs, dialect);
         return false; // Explain mode doesn't track blocked status
     }
 
@@ -4208,7 +4270,7 @@ fn test_command(
     // Use shared evaluator for consistent behavior with hook mode
     let project_path = std::env::current_dir().ok();
     let start = Instant::now();
-    let mut result = evaluate_command_with_pack_order_deadline_at_path(
+    let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -4219,6 +4281,7 @@ fn test_command(
         None,                    // allow_once_audit
         project_path.as_deref(), // project_path scopes path-aware allowlist entries (#186)
         evaluation_deadline.as_ref(),
+        dialect.into(),
     );
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
@@ -4595,6 +4658,7 @@ fn test_command(
                                         command,
                                         ExplainFormat::Pretty,
                                         None,
+                                        DialectArg::Unknown,
                                     );
                                     println!();
                                 } else {
@@ -5524,7 +5588,7 @@ fn generate_config_with_packs(packs: &[String]) -> String {
     // Start with the sample config but replace the packs section
     let mut lines = vec![
         "# dcg configuration".to_string(),
-        "# https://github.com/Dicklesworthstone/destructive_command_guard".to_string(),
+        "# https://github.com/Dicklesworthstone/dcg_cli".to_string(),
         "# Generated by: dcg init --auto".to_string(),
         String::new(),
         "[general]".to_string(),
@@ -6973,6 +7037,7 @@ fn handle_explain(
     command: &str,
     format: ExplainFormat,
     extra_packs: Option<Vec<String>>,
+    dialect: DialectArg,
 ) {
     use crate::trace::{MatchInfo, TraceCollector, TraceDetails};
 
@@ -7022,7 +7087,7 @@ fn handle_explain(
 
     // Evaluate with timing
     collector.begin_step();
-    let result = evaluate_command_with_pack_order(
+    let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -7030,6 +7095,10 @@ fn handle_explain(
         &compiled_overrides,
         &allowlists,
         &heredoc_settings,
+        None, // allow_once_audit
+        None, // project_path
+        None, // deadline
+        dialect.into(),
     );
     collector.end_step(
         "full_evaluation",
@@ -10786,6 +10855,41 @@ fn is_dcg_command(cmd: &str) -> bool {
     dcg_command_program(cmd).is_some()
 }
 
+/// Detect a hook executable path that is well-formed for the *other*
+/// platform (#264): a `C:\…\dcg.exe`-style path on a Unix host, or a
+/// `/home/…/dcg`-style path on native Windows. This happens when an
+/// agent-settings manager (cc-switch and similar) re-materializes a
+/// `settings.json` cached on a different OS; naming the likely cause keeps
+/// users from debugging the wrong layer, and warns that fixing only
+/// `settings.json` gets overwritten on the manager's next sync.
+fn foreign_platform_hook_path(program: &str) -> Option<&'static str> {
+    let bytes = program.as_bytes();
+    let has_drive_prefix = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let looks_windows = has_drive_prefix
+        || program.contains('\\')
+        || std::path::Path::new(program)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    if cfg!(windows) {
+        (program.starts_with('/') && !looks_windows).then_some(
+            "the hook points at a Unix-style dcg path on a Windows host — an \
+             agent-settings manager (e.g. cc-switch) likely restored a settings.json \
+             cached on another OS; fix the manager's stored value first (or it will \
+             reinstate the stale path on its next sync), then run 'dcg install --force'",
+        )
+    } else {
+        looks_windows.then_some(
+            "the hook points at a Windows-style dcg.exe path on a Unix host — an \
+             agent-settings manager (e.g. cc-switch) likely restored a settings.json \
+             cached on another OS; fix the manager's stored value first (or it will \
+             reinstate the stale path on its next sync), then run 'dcg install --force'",
+        )
+    }
+}
+
 #[cfg(test)]
 fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
     is_dcg_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER)
@@ -11857,13 +11961,13 @@ fn self_update_unix(update: UpdateCommand) -> Result<(), Box<dyn std::error::Err
     let requested_version = update.version.clone();
     let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
-        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.sh"
+        "https://raw.githubusercontent.com/Dicklesworthstone/dcg_cli/{normalized_tag}/install.sh"
     );
     // Releases-download URL where install.sh.sha256 is published from
     // dist.yml. Pre-ythp tags will 404 here; the verification step
     // detects that and warns rather than aborting.
     let sha_url = format!(
-        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.sh.sha256"
+        "https://github.com/Dicklesworthstone/dcg_cli/releases/download/{normalized_tag}/install.sh.sha256"
     );
 
     eprintln!("dcg update: downloading and verifying install.sh from {normalized_tag}.");
@@ -12143,10 +12247,10 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
     let requested_version = update.version.clone();
     let normalized_tag = update_installer_tag(requested_version.as_deref())?;
     let script_url = format!(
-        "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/{normalized_tag}/install.ps1"
+        "https://raw.githubusercontent.com/Dicklesworthstone/dcg_cli/{normalized_tag}/install.ps1"
     );
     let sha_url = format!(
-        "https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/{normalized_tag}/install.ps1.sha256"
+        "https://github.com/Dicklesworthstone/dcg_cli/releases/download/{normalized_tag}/install.ps1.sha256"
     );
 
     eprintln!("dcg update: downloading and verifying install.ps1 from {normalized_tag}.");
@@ -12547,7 +12651,13 @@ fn diagnose_hook_wiring() -> HookDiagnostics {
                     // containing spaces.
                     if let Some(program) = dcg_command_program(cmd) {
                         let path = std::path::Path::new(&program);
-                        if !path.is_absolute() {
+                        if let Some(hint) = foreign_platform_hook_path(&program) {
+                            // #264: a well-formed path for the *other*
+                            // platform deserves its own diagnosis — the
+                            // generic messages send users hunting the wrong
+                            // cause.
+                            diag.misconfigured_hooks.push(format!("{cmd} ({hint})"));
+                        } else if !path.is_absolute() {
                             diag.misconfigured_hooks.push(format!(
                                 "{cmd} (the hook executable must be an absolute path; \
                                  agent hook shells do not inherit the interactive PATH)"
@@ -13153,6 +13263,22 @@ fn handle_allow_once_command(
         return Err("JSON output requires --yes or --dry-run to avoid prompts.".into());
     }
 
+    // Confirmation needs a human, so establish that one can answer *before*
+    // printing anything that could be mistaken for a granted allowance. An
+    // agent-invoked `dcg allow-once <CODE>` inherits a closed stdin, so the
+    // prompt read hit EOF and aborted only after the confirmation block had
+    // already been printed — which read as a successful grant while the store
+    // was never written (#262).
+    let needs_prompt = !(cmd.yes || cmd.dry_run);
+    if needs_prompt && !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "Allow-once needs an interactive confirmation, but stdin is not a terminal, so the \
+             answer can never arrive. NOTHING was written and '{code}' is still pending. Re-run \
+             from a terminal, or confirm non-interactively with: dcg allow-once {code} --yes"
+        )
+        .into());
+    }
+
     let selected_cwd = if selected.cwd == "<unknown>" || selected.cwd.is_empty() {
         cwd
     } else {
@@ -13210,7 +13336,6 @@ fn handle_allow_once_command(
             println!("  Mode: reusable until expiry");
         }
 
-        let needs_prompt = !(cmd.yes || cmd.dry_run);
         if needs_prompt {
             if cmd.force && is_config_block {
                 print!("Type 'FORCE' to confirm override: ");
@@ -13218,7 +13343,7 @@ fn handle_allow_once_command(
                 let mut response = String::new();
                 io::stdin().read_line(&mut response)?;
                 if response.trim() != "FORCE" {
-                    return Err("Aborted.".into());
+                    return Err("Aborted: no allow-once entry was written.".into());
                 }
             } else {
                 print!("Proceed? [y/N]: ");
@@ -13227,7 +13352,7 @@ fn handle_allow_once_command(
                 io::stdin().read_line(&mut response)?;
                 let response = response.trim().to_lowercase();
                 if response != "y" && response != "yes" {
-                    return Err("Aborted.".into());
+                    return Err("Aborted: no allow-once entry was written.".into());
                 }
             }
         }
@@ -13683,6 +13808,21 @@ fn pack_id_is_known(pack_id: &str) -> bool {
     // exact full-id lookup, which is precisely what we need (issue #162).
     if REGISTRY.get(pack_id).is_some() {
         return true;
+    }
+
+    // Synthetic `heredoc.<family>` namespaces are not registered packs, but
+    // they are the concrete pack ids the evaluator attaches to embedded-code
+    // AST denials and to the #261 unverifiable-sink rules
+    // (`heredoc.python:shutil_rmtree`, `heredoc.posix:eval-dynamic`, …). The
+    // allowlist engine matches them exactly, and the denials print
+    // `dcg allowlist add '<that rule>'` as the remediation, so they must
+    // validate here. A single `heredoc.<family>` component is required — a
+    // bare `heredoc` group prefix would never match a concrete rule (issue
+    // #162's rationale).
+    if let Some(family) = pack_id.strip_prefix("heredoc.") {
+        if !family.is_empty() && !family.contains('.') {
+            return true;
+        }
     }
 
     // Fall back to external packs declared in config `custom_paths`.
@@ -18077,6 +18217,7 @@ exclude = ["target/**"]
             command,
             format,
             with_packs,
+            ..
         }) = cli.command
         {
             assert_eq!(command, "git reset --hard");
@@ -18101,6 +18242,66 @@ exclude = ["target/**"]
         } else {
             unreachable!("Expected Explain command");
         }
+    }
+
+    /// #269: an opt-in dialect selector on both diagnostic commands, so a user
+    /// can reproduce the single dialect the live hook resolves. The default
+    /// must stay all-dialect.
+    #[test]
+    fn test_cli_parse_dialect_flag() {
+        use crate::normalize::ShellDialect;
+
+        let cli = Cli::try_parse_from(["dcg", "test", "--dialect", "posix", "git status"])
+            .expect("parse test --dialect");
+        let Some(Command::TestCommand { dialect, .. }) = cli.command else {
+            unreachable!("Expected TestCommand");
+        };
+        assert_eq!(dialect, DialectArg::Posix);
+        assert_eq!(ShellDialect::from(dialect), ShellDialect::Posix);
+
+        let cli = Cli::try_parse_from(["dcg", "explain", "--dialect", "bash", "git status"])
+            .expect("parse explain --dialect with alias");
+        let Some(Command::Explain { dialect, .. }) = cli.command else {
+            unreachable!("Expected Explain");
+        };
+        assert_eq!(dialect, DialectArg::Posix);
+
+        // Default stays all-dialect on both commands.
+        let cli = Cli::try_parse_from(["dcg", "test", "git status"]).expect("parse");
+        let Some(Command::TestCommand { dialect, .. }) = cli.command else {
+            unreachable!("Expected TestCommand");
+        };
+        assert_eq!(dialect, DialectArg::Unknown);
+        assert_eq!(ShellDialect::from(dialect), ShellDialect::Unknown);
+
+        let cli = Cli::try_parse_from(["dcg", "explain", "git status"]).expect("parse");
+        let Some(Command::Explain { dialect, .. }) = cli.command else {
+            unreachable!("Expected Explain");
+        };
+        assert_eq!(dialect, DialectArg::Unknown);
+
+        for (argument, expected) in [
+            ("ps", ShellDialect::PowerShell),
+            ("pwsh", ShellDialect::PowerShell),
+            ("cmd", ShellDialect::Cmd),
+            ("sh", ShellDialect::Posix),
+        ] {
+            let cli = Cli::try_parse_from(["dcg", "test", "--dialect", argument, "git status"])
+                .unwrap_or_else(|e| panic!("parse --dialect {argument}: {e}"));
+            let Some(Command::TestCommand { dialect, .. }) = cli.command else {
+                unreachable!("Expected TestCommand");
+            };
+            assert_eq!(
+                ShellDialect::from(dialect),
+                expected,
+                "--dialect {argument}"
+            );
+        }
+
+        assert!(
+            Cli::try_parse_from(["dcg", "test", "--dialect", "klingon", "git status"]).is_err(),
+            "an unknown dialect must be rejected rather than silently ignored"
+        );
     }
 
     #[test]
@@ -18991,6 +19192,50 @@ exclude = ["target/**"]
         let dcg_count = pre_tool_use.iter().filter(|e| is_dcg_hook_entry(e)).count();
 
         assert_eq!(dcg_count, 2, "should detect duplicate dcg hooks");
+    }
+
+    #[test]
+    fn heredoc_synthetic_rule_namespaces_are_allowlistable() {
+        // Fresh-eyes review of #261: the unverifiable-sink denials print
+        // `dcg allowlist add '<heredoc.* rule>'` as remediation, and the
+        // evaluator matches those rule ids exactly, so the CLI must accept
+        // them (it rejected them before, contradicting the printed advice).
+        for pack_id in [
+            "heredoc.posix",
+            "heredoc.powershell",
+            "heredoc.shell",
+            "heredoc.python",
+            "heredoc.bash",
+        ] {
+            assert!(
+                pack_id_is_known(pack_id),
+                "synthetic heredoc namespace must validate for allowlisting: {pack_id}"
+            );
+        }
+        // A bare group prefix still must not validate (issue #162's rule).
+        assert!(!pack_id_is_known("heredoc"));
+        assert!(!pack_id_is_known("heredoc.posix.extra"));
+        assert!(!pack_id_is_known("core"));
+    }
+
+    #[test]
+    fn foreign_platform_hook_paths_are_named_explicitly() {
+        // #264: a stale cross-platform hook path (cc-switch migrating a
+        // cached settings.json between Windows and WSL/Linux) gets a
+        // diagnosis naming the likely cause instead of the generic message.
+        #[cfg(not(windows))]
+        {
+            assert!(foreign_platform_hook_path(r"C:\Users\me\.local\bin\dcg.exe").is_some());
+            assert!(foreign_platform_hook_path(r"D:/tools/dcg.exe").is_some());
+            assert!(foreign_platform_hook_path("dcg.exe").is_some());
+            assert!(foreign_platform_hook_path("/home/user/.local/bin/dcg").is_none());
+            assert!(foreign_platform_hook_path("/usr/local/bin/dcg").is_none());
+        }
+        #[cfg(windows)]
+        {
+            assert!(foreign_platform_hook_path("/home/user/.local/bin/dcg").is_some());
+            assert!(foreign_platform_hook_path(r"C:\Users\me\.local\bin\dcg.exe").is_none());
+        }
     }
 
     #[test]

@@ -773,8 +773,37 @@ function Test-HermesIsDcgCommand {
   $name -ieq "dcg"
 }
 
+function Get-HermesConfigDir {
+  # The directory whose config.yaml Hermes Agent actually reads. Hermes
+  # resolves its data root as (hermes-agent windows-native.md):
+  #   1. HERMES_HOME when set — the native-Windows Hermes installer itself sets
+  #      HERMES_HOME=%LOCALAPPDATA%\hermes, and users may repoint it (e.g. at
+  #      %USERPROFILE%\.hermes to keep a Linux/WSL layout).
+  #   2. %LOCALAPPDATA%\hermes on native Windows.
+  #   3. ~/.hermes on Linux/macOS (the layout install.sh configures).
+  # Writing to ~/.hermes on native Windows produces a config Hermes never
+  # reads, so the hook silently never fires (issue #270).
+  param([string]$HomeDir = $HOME)
+  if (-not [string]::IsNullOrWhiteSpace($env:HERMES_HOME)) { return $env:HERMES_HOME }
+  if ($env:OS -eq 'Windows_NT') {
+    $base = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($base)) {
+      # LOCALAPPDATA is set on any normal Windows session; the known-folder API
+      # is a fallback for stripped environments. ConstrainedLanguage mode can
+      # reject .NET static calls — fall through to ~/.hermes in that case.
+      try {
+        $base = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+      } catch { $base = $null }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($base)) { return (Join-Path $base 'hermes') }
+  }
+  Join-Path $HomeDir '.hermes'
+}
+
 function Configure-HermesHook {
-  # Configure Hermes Agent (~/.hermes/config.yaml, hooks.pre_tool_call[]). Pure
+  # Configure Hermes Agent (config.yaml, hooks.pre_tool_call[]) at the path
+  # Hermes actually reads — Get-HermesConfigDir: HERMES_HOME, else
+  # %LOCALAPPDATA%\hermes on native Windows, else ~/.hermes. Pure
   # PowerShell, no PyYAML. Strategy (never corrupts an existing config):
   #   - no config.yaml yet -> emit a fresh minimal YAML (we own the whole file).
   #   - config exists + powershell-yaml module present -> full-fidelity merge.
@@ -783,8 +812,9 @@ function Configure-HermesHook {
   # Returns skipped | created | already | merged | manual | invalid.
   param([string]$DcgPath, [string]$HomeDir = $HOME, [switch]$Force)
 
-  $hermesDir = Join-Path $HomeDir ".hermes"
+  $hermesDir = Get-HermesConfigDir -HomeDir $HomeDir
   $detected = (Test-Path $hermesDir -PathType Container) -or
+    (Test-Path (Join-Path $HomeDir ".hermes") -PathType Container) -or
     ($null -ne (Get-Command hermes -ErrorAction SilentlyContinue))
   if (-not $detected -and -not $Force) { return "skipped" }
 
@@ -1004,7 +1034,8 @@ function Detect-Agents {
       (_has 'copilot') -or (_has 'gh-copilot'))
     'Grok'    = ((_dir '.grok')    -or (-not [string]::IsNullOrEmpty($env:GROK_SESSION_ID)))
     'Agy'     = (_has 'agy')
-    'Hermes'  = (_dir '.hermes')
+    'Hermes'  = ((_dir '.hermes') -or (_has 'hermes') -or
+      (Test-Path (Get-HermesConfigDir -HomeDir $HOME) -PathType Container))
   }
 }
 
@@ -1039,7 +1070,7 @@ Options:
 Configured agents (when detected, or with -Force/-EasyMode):
   Claude Code  (~/.claude/settings.json)      Codex CLI   (~/.codex/hooks.json)
   Gemini CLI   (~/.gemini/settings.json)      Copilot CLI (~/.copilot/hooks/dcg.json)
-  Cursor IDE   (~/.cursor/hooks.json)         Hermes      (~/.hermes/config.yaml)
+  Cursor IDE   (~/.cursor/hooks.json)         Hermes      (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml)
   Grok / agy   via dcg install --grok / --agy under -EasyMode when detected
 '@
   exit 0
@@ -1396,20 +1427,22 @@ if ($detectedAgents['Cursor'] -or $forceConfig) {
   }
 }
 
-# Configure Hermes Agent (~/.hermes/config.yaml) when detected (or -EasyMode).
+# Configure Hermes Agent (HERMES_HOME, else %LOCALAPPDATA%\hermes\config.yaml on
+# native Windows, else ~/.hermes/config.yaml) when detected (or -EasyMode).
 # Pure-PowerShell; never corrupts an existing config (prints manual steps instead).
 if ($detectedAgents['Hermes'] -or $forceConfig) {
   Write-Host ""
   try {
+    $hermesCfgPath = Join-Path (Get-HermesConfigDir) 'config.yaml'
     switch (Configure-HermesHook -DcgPath $dcgExe -Force:$forceConfig) {
-      "created" { Write-Ok "Created Hermes hook at $HOME\.hermes\config.yaml" }
-      "merged" { Write-Ok "Added Hermes hook to $HOME\.hermes\config.yaml" }
+      "created" { Write-Ok "Created Hermes hook at $hermesCfgPath" }
+      "merged" { Write-Ok "Added Hermes hook to $hermesCfgPath" }
       "already" { Write-Ok "Hermes hook already configured" }
       "invalid" { Write-Warn "Hermes config.yaml is invalid YAML; left unchanged" }
       "skipped" { Write-Info "Hermes not detected; re-run with -EasyMode to configure it anyway" }
       "manual" {
         Write-Warn "Hermes config.yaml exists and the powershell-yaml module is not installed."
-        Write-Info "To avoid corrupting it, add this to $HOME\.hermes\config.yaml manually:"
+        Write-Info "To avoid corrupting it, add this to $hermesCfgPath manually:"
         Write-Host (Get-HermesYamlBlock -DcgPath $dcgExe)
         Write-Info "(Or install the YAML module first:  Install-Module powershell-yaml -Scope CurrentUser  then re-run.)"
       }

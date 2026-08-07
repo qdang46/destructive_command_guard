@@ -372,33 +372,59 @@ function Unconfigure-CopilotHook {
   $true
 }
 
+function Get-HermesConfigDir {
+  # The directory whose config.yaml Hermes Agent actually reads (mirror of the
+  # resolver in install.ps1): HERMES_HOME when set, else %LOCALAPPDATA%\hermes
+  # on native Windows, else ~/.hermes (Linux/macOS pwsh).
+  param([string]$HomeDir = $HOME)
+  if (-not [string]::IsNullOrWhiteSpace($env:HERMES_HOME)) { return $env:HERMES_HOME }
+  if ($env:OS -eq 'Windows_NT') {
+    $base = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($base)) {
+      try {
+        $base = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+      } catch { $base = $null }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($base)) { return (Join-Path $base 'hermes') }
+  }
+  Join-Path $HomeDir '.hermes'
+}
+
 function Unconfigure-HermesHook {
-  # Remove dcg from ~/.hermes/config.yaml. With powershell-yaml: strip the dcg
+  # Remove dcg from Hermes' config.yaml. Native Windows Hermes reads
+  # HERMES_HOME (default %LOCALAPPDATA%\hermes); pre-#270 dcg installers wrote
+  # to ~/.hermes — so clean BOTH locations. With powershell-yaml: strip the dcg
   # pre_tool_call entry (leave hooks_auto_accept, which other hooks may rely on).
   # Without the module: never edit arbitrary YAML — warn the user to remove it.
-  # Returns $true if removed.
+  # Returns $true if any dcg entry was removed.
   param([string]$HomeDir = $HOME)
-  $cfg = Join-Path (Join-Path $HomeDir ".hermes") "config.yaml"
-  if (-not (Test-Path $cfg -PathType Leaf)) { return $false }
-  if ($null -eq (Get-Module -ListAvailable -Name powershell-yaml -ErrorAction SilentlyContinue)) {
-    Write-Warn "powershell-yaml not installed; remove the dcg entry from $cfg manually."
-    return $false
+  $dirs = @((Get-HermesConfigDir -HomeDir $HomeDir), (Join-Path $HomeDir ".hermes")) |
+    Select-Object -Unique
+  $removedAny = $false
+  foreach ($dir in $dirs) {
+    $cfg = Join-Path $dir "config.yaml"
+    if (-not (Test-Path $cfg -PathType Leaf)) { continue }
+    if ($null -eq (Get-Module -ListAvailable -Name powershell-yaml -ErrorAction SilentlyContinue)) {
+      Write-Warn "powershell-yaml not installed; remove the dcg entry from $cfg manually."
+      continue
+    }
+    Import-Module powershell-yaml -ErrorAction SilentlyContinue
+    try { $doc = (Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Yaml) } catch { continue }
+    if ($doc -isnot [System.Collections.IDictionary]) { continue }
+    $hooks = $doc["hooks"]
+    if ($hooks -isnot [System.Collections.IDictionary]) { continue }
+    $list = $hooks["pre_tool_call"]
+    if ($null -eq $list) { continue }
+    $kept = @(@($list) | Where-Object {
+        -not (($_ -is [System.Collections.IDictionary]) -and
+              ((Get-DcgCommandName ([string]$_["command"])) -in @('dcg', 'dcg.exe')))
+      })
+    if ($kept.Count -eq @($list).Count) { continue }
+    if ($kept.Count -gt 0) { $hooks["pre_tool_call"] = $kept } else { $hooks.Remove("pre_tool_call") }
+    [System.IO.File]::WriteAllText($cfg, (ConvertTo-Yaml $doc), (New-Object System.Text.UTF8Encoding $false))
+    $removedAny = $true
   }
-  Import-Module powershell-yaml -ErrorAction SilentlyContinue
-  try { $doc = (Get-Content -Raw -LiteralPath $cfg | ConvertFrom-Yaml) } catch { return $false }
-  if ($doc -isnot [System.Collections.IDictionary]) { return $false }
-  $hooks = $doc["hooks"]
-  if ($hooks -isnot [System.Collections.IDictionary]) { return $false }
-  $list = $hooks["pre_tool_call"]
-  if ($null -eq $list) { return $false }
-  $kept = @(@($list) | Where-Object {
-      -not (($_ -is [System.Collections.IDictionary]) -and
-            ((Get-DcgCommandName ([string]$_["command"])) -in @('dcg', 'dcg.exe')))
-    })
-  if ($kept.Count -eq @($list).Count) { return $false }
-  if ($kept.Count -gt 0) { $hooks["pre_tool_call"] = $kept } else { $hooks.Remove("pre_tool_call") }
-  [System.IO.File]::WriteAllText($cfg, (ConvertTo-Yaml $doc), (New-Object System.Text.UTF8Encoding $false))
-  $true
+  $removedAny
 }
 
 # Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the
@@ -451,7 +477,7 @@ if (Get-Command git -ErrorAction SilentlyContinue) {
   }
 }
 
-# Hermes Agent (~/.hermes/config.yaml).
+# Hermes Agent (HERMES_HOME / %LOCALAPPDATA%\hermes / ~/.hermes config.yaml).
 if (Unconfigure-HermesHook) { Write-Ok "Removed Hermes hook" }
 
 # Grok (xAI): ~/.grok/hooks/dcg.json is a dcg-OWNED file — delete it outright

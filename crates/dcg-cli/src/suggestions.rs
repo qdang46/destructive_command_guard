@@ -354,6 +354,26 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
     );
 
     m.insert(
+        "core.git:branch-dynamic-token",
+        vec![
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Quote the branch name so the expansion stays a single non-flag word",
+            )
+            .with_command("git branch \"backup-$(date +%s)\""),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add `--` to end option parsing so expanded output cannot become a flag",
+            )
+            .with_command("git branch -- <name>"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Resolve the dynamic value first, then pass the literal branch name",
+            ),
+        ],
+    );
+
+    m.insert(
         "core.git:git-alias-semantic-unverified",
         vec![
             Suggestion::new(

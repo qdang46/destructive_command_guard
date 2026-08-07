@@ -2253,8 +2253,9 @@ fn glued_redirect_split_position(token: &str) -> Option<usize> {
 /// - Combined: `&>` (stdout+stderr), `&>>` (stdout+stderr append)
 /// - Read-write: `<>` (open file for both)
 /// - FD-to-FD: `>&`, `<&`
-/// - Numbered FDs (0-9) for output: `N>`, `N>>`, `N>|`, `N>&`
-/// - Numbered FDs (0-9) for read-write / FD duplication: `N<>`, `N<&`
+/// - Numbered FDs for output: `N>`, `N>>`, `N>|`, `N>&`
+/// - Numbered FDs for read-write / FD duplication: `N<>`, `N<&`
+/// - Multi-digit (`10>`) and named (`{fd}>`) FD prefixes on all of the above
 ///
 /// Excludes input-only operators (`<`, `<<`, `<<<`) — those don't
 /// truncate a target and don't affect the destructive-rule blast
@@ -2265,20 +2266,44 @@ fn is_shell_redirect_operator(token: &str) -> bool {
     match bytes {
         // Untyped operators (no leading FD).
         b">" | b">>" | b">|" | b"&>" | b"&>>" | b">&" | b"<>" | b"<&" => true,
-        // Numbered FD: `N>`, `N>>`, `N>|`, `N>&`, `N<>`, `N<&` for any
-        // single ASCII digit (0-9). Bash actually allows multi-digit
-        // FDs (`{var}>`, `10>`) but those are extremely rare and
-        // tokenize differently; the single-digit cases cover the
-        // common idiom (`1>`, `2>`, occasionally `3>`/`9>` for
-        // higher-FD scripting).
-        [d, b'>'] if d.is_ascii_digit() => true,
-        [d, b'>', b'>'] if d.is_ascii_digit() => true,
-        [d, b'>', b'|'] if d.is_ascii_digit() => true,
-        [d, b'>', b'&'] if d.is_ascii_digit() => true,
-        [d, b'<', b'>'] if d.is_ascii_digit() => true,
-        [d, b'<', b'&'] if d.is_ascii_digit() => true,
-        _ => false,
+        // FD-qualified: `N>`, `N>>`, `N>|`, `N>&`, `N<>`, `N<&` where the FD
+        // prefix is one or more ASCII digits (`1>`, `2>`, `10>`) or a Bash
+        // varname allocation (`{fd}>`). Multi-digit and named FDs are rare but
+        // fully functional — `echo x 10> <sensitive>` and
+        // `echo x {v}>| <sensitive>` truncate exactly like `1>` — and the
+        // `redirect-truncate-root-home` regex already models both prefixes, so
+        // stopping the args-data masking here is what lets the rule see the
+        // target at all.
+        _ => match strip_fd_prefix(bytes) {
+            Some(rest) => matches!(rest, b">" | b">>" | b">|" | b">&" | b"<>" | b"<&"),
+            None => false,
+        },
     }
+}
+
+/// Strips a Bash redirection FD prefix — one or more digits (`2`, `10`) or a
+/// varname allocation (`{fd}`) — returning the operator bytes that follow.
+/// Returns `None` when no complete prefix is present.
+#[inline]
+fn strip_fd_prefix(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.first() == Some(&b'{') {
+        let close = bytes.iter().position(|byte| *byte == b'}')?;
+        let name = bytes.get(1..close)?;
+        let valid = !name.is_empty()
+            && matches!(name[0], b'A'..=b'Z' | b'a'..=b'z' | b'_')
+            && name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        return if valid { bytes.get(close + 1..) } else { None };
+    }
+    let digits = bytes
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    bytes.get(digits..)
 }
 
 #[inline]
@@ -4324,6 +4349,16 @@ mod tests {
                 );
             }
         }
+        // Multi-digit and named FDs redirect exactly like single-digit ones,
+        // and `redirect-truncate-root-home` already models both prefixes.
+        for op in [
+            "10>", "10>>", "10>|", "10>&", "255>", "{fd}>", "{fd}>|", "{fd}>>", "{v}>&", "{v}<>",
+        ] {
+            assert!(
+                super::is_shell_redirect_operator(op),
+                "expected `{op}` to be a recognised redirect operator"
+            );
+        }
     }
 
     #[test]
@@ -4343,9 +4378,13 @@ mod tests {
             ">/etc",
             "<", // input-only, intentionally NOT in the list
             "<<",
-            "<<<", // here-doc / here-string
-            ">>>", // not valid bash
-            "10>", // multi-digit FD — out of scope for the single-digit matcher
+            "<<<",    // here-doc / here-string
+            ">>>",    // not valid bash
+            "10file", // digits without an operator
+            "{fd}",   // FD allocation without an operator
+            "{}>",    // empty FD name
+            "{1fd}>", // FD name may not start with a digit
+            "{fd>",   // unterminated FD allocation
             "&",
             "|",
             ";",

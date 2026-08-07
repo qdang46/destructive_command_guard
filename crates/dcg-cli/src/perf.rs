@@ -163,7 +163,13 @@ impl Deadline {
     /// Get the remaining time before the deadline, or None if exceeded.
     #[must_use]
     pub fn remaining(&self) -> Option<Duration> {
-        self.max_duration.checked_sub(self.start.elapsed())
+        let elapsed = self.start.elapsed();
+        // Mirror `is_exceeded`'s `>=` comparison so a zero-duration deadline
+        // reports None even when the monotonic clock has not advanced between
+        // construction and this call (the checked_sub form returned Some(0)
+        // in that window, contradicting both the doc contract and
+        // `is_exceeded`, and made the zero-duration test flaky).
+        (elapsed < self.max_duration).then(|| self.max_duration.saturating_sub(elapsed))
     }
 
     /// Get the elapsed time since the deadline started.

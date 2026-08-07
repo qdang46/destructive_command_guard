@@ -18,6 +18,8 @@ const MAX_GIT_ALIAS_DEPTH: usize = 64;
 
 pub(crate) const GIT_ALIAS_UNVERIFIED_RULE: &str = "git-alias-semantic-unverified";
 pub(crate) const GIT_ALIAS_UNVERIFIED_REASON: &str = "The invoked Git alias depends on shell expansion, contains a cycle, or exceeds dcg's bounded semantic analysis.";
+pub(crate) const BRANCH_DYNAMIC_RULE: &str = "branch-dynamic-token";
+pub(crate) const BRANCH_DYNAMIC_REASON: &str = "A dynamic shell expansion in this git branch command can expand into a deletion or forced ref update. Quote the branch name or add `--` to make it a literal creation.";
 
 /// A visible Git shell alias together with the arguments Git will append when
 /// it invokes that alias. The shell body is deliberately not tokenized here:
@@ -51,7 +53,14 @@ pub(crate) enum InvokedGitAliasDecision {
 pub(crate) enum BranchCommandDecision {
     NotBranch,
     NonDestructive,
+    /// A literal deletion / force flag was proven (`-d`, `-D`, `--delete`,
+    /// `-f`, `-M`, `-C`). Attributed to `branch-force-delete`.
     Destructive,
+    /// The destructive verdict rests on an unresolvable dynamic word that
+    /// *may* expand or field-split into a deletion / force flag (#274).
+    /// Attributed to [`BRANCH_DYNAMIC_RULE`] so the denial explains the actual
+    /// hazard and its safe remediations (quote the name, or add `--`).
+    DestructiveDynamic,
     Unparsed,
 }
 
@@ -1024,12 +1033,15 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
     let Ok(words) = symbolic_posix_words(&view) else {
         return true;
     };
+    let mut scan_all_remaining = false;
     for word in words {
-        if let Some(exact) = word.exact() {
-            if crate::normalize::is_env_assignment(exact)
-                || matches!(exact, "exec" | "time" | "nohup" | "!")
-            {
-                continue;
+        if !scan_all_remaining {
+            if let Some(exact) = word.exact() {
+                if crate::normalize::is_env_assignment(exact)
+                    || matches!(exact, "exec" | "time" | "nohup" | "!")
+                {
+                    continue;
+                }
             }
         }
         let basename = SymbolicPosixWord {
@@ -1041,10 +1053,31 @@ fn symbolic_posix_may_execute_git(command: &str) -> bool {
                 .to_string(),
             unquoted_dynamic: word.unquoted_dynamic,
         };
-        return basename.may_equal("git")
+        if basename.may_equal("git")
             || basename.may_equal("git.exe")
             || basename.may_equal("git-branch")
-            || basename.may_equal("git-branch.exe");
+            || basename.may_equal("git-branch.exe")
+        {
+            return true;
+        }
+        if scan_all_remaining {
+            continue;
+        }
+        // #260: the wrapper strip already ran above, so a first word that is
+        // still a known execution frontend means the strip BAILED (dynamic
+        // option value, unmodeled flag). The wrapped command still executes
+        // at runtime; keep scanning the remaining words for a possible Git
+        // executable so the ordinary regex rules run (deny-direction only —
+        // genuinely unknown programs keep the documented argv-data default).
+        if word
+            .exact()
+            .map(|exact| exact.rsplit(['/', '\\']).next().unwrap_or(exact))
+            .is_some_and(crate::normalize::is_posix_execution_frontend_basename)
+        {
+            scan_all_remaining = true;
+            continue;
+        }
+        return false;
     }
     false
 }
@@ -1496,6 +1529,25 @@ fn powershell_call_expression(command: &str) -> bool {
         .is_some_and(|rest| {
             rest.starts_with('(') || rest.starts_with("$(") || rest.starts_with("@(")
         })
+}
+
+/// Return whether a caller-proven PowerShell statement is an expression
+/// statement that cannot invoke its first token as a command.
+///
+/// PowerShell only invokes a statement whose first token is a bare word or a
+/// path. When the first token is a quoted string, a variable, or an array /
+/// hashtable expression (`"…"`, `'…'`, `$…`, `@…`), the statement parses as an
+/// expression and a trailing bare argument is a parse error — `"$tool" build`
+/// cannot execute `$tool`. Invoking a dynamic name requires the call or
+/// dot-source operator (`& $tool …` / `. $tool …`), which callers detect
+/// before this check. Statements containing a subexpression (`$(…)` / `@(…)`)
+/// are excluded: those evaluate their embedded pipeline even inside an
+/// expression statement, so they must keep the conservative treatment.
+fn powershell_expression_statement_without_subexpression(statement: &str) -> bool {
+    let trimmed = statement.trim_start();
+    matches!(trimmed.as_bytes().first(), Some(b'"' | b'\'' | b'$' | b'@'))
+        && !trimmed.contains("$(")
+        && !trimmed.contains("@(")
 }
 
 fn powershell_dynamic_call_operator(command: &str) -> bool {
@@ -3382,6 +3434,18 @@ fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
             }
         }
     } else {
+        if dialect == ShellDialect::PowerShell {
+            let statement = command.trim();
+            let (statement, _) = command_after_posix_control_prefixes(statement, dialect);
+            let statement =
+                crate::normalize::powershell_assignment_rhs(statement).unwrap_or(statement);
+            if powershell_expression_statement_without_subexpression(statement) {
+                // An expression statement never invokes its first token, so a
+                // dynamic word there cannot become `git branch` (#273). The
+                // call-operator forms keep their existing handling above.
+                return false;
+            }
+        }
         git_semantic_command(command, dialect)
     };
     let Some(decoded) = decode_git_semantic_words(&command, dialect) else {
@@ -3681,14 +3745,14 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
         };
         if basename.may_equal("git") || basename.may_equal("git.exe") {
             if basename.unquoted_dynamic {
-                return Some(BranchCommandDecision::Destructive);
+                return Some(BranchCommandDecision::DestructiveDynamic);
             }
             dashed_branch = false;
             break;
         }
         if basename.may_equal("git-branch") || basename.may_equal("git-branch.exe") {
             if basename.unquoted_dynamic {
-                return Some(BranchCommandDecision::Destructive);
+                return Some(BranchCommandDecision::DestructiveDynamic);
             }
             dashed_branch = true;
             break;
@@ -3707,7 +3771,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
             if word.is_dynamic() {
                 if word.may_equal("branch") {
                     if word.unquoted_dynamic {
-                        return Some(BranchCommandDecision::Destructive);
+                        return Some(BranchCommandDecision::DestructiveDynamic);
                     }
                     index += 1;
                     break;
@@ -3757,7 +3821,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
                     return Some(BranchCommandDecision::Unparsed);
                 };
                 if !symbolic_data_word_is_safe(data) {
-                    return Some(BranchCommandDecision::Destructive);
+                    return Some(BranchCommandDecision::DestructiveDynamic);
                 }
                 if let Some(exact) = data.exact() {
                     if token == "-c" {
@@ -3782,7 +3846,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
                     return Some(BranchCommandDecision::Unparsed);
                 };
                 if !symbolic_data_word_is_safe(data) {
-                    return Some(BranchCommandDecision::Destructive);
+                    return Some(BranchCommandDecision::DestructiveDynamic);
                 }
                 index += 2;
                 continue;
@@ -3837,7 +3901,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
     while let Some(word) = words.get(index) {
         if word.is_dynamic() {
             if word.unquoted_dynamic || symbolic_branch_option_may_mutate(word) {
-                return Some(BranchCommandDecision::Destructive);
+                return Some(BranchCommandDecision::DestructiveDynamic);
             }
             index += 1;
             continue;
@@ -3875,7 +3939,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
                         return Some(BranchCommandDecision::NonDestructive);
                     };
                     if !symbolic_data_word_is_safe(data) {
-                        return Some(BranchCommandDecision::Destructive);
+                        return Some(BranchCommandDecision::DestructiveDynamic);
                     }
                     index += 2;
                 }
@@ -3883,7 +3947,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
                 BranchLongOptionArity::LastArgDefault => {
                     if let Some(data) = words.get(index + 1) {
                         if !symbolic_data_word_is_safe(data) {
-                            return Some(BranchCommandDecision::Destructive);
+                            return Some(BranchCommandDecision::DestructiveDynamic);
                         }
                         index += 2;
                     } else {
@@ -3913,7 +3977,7 @@ fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision
                             return Some(BranchCommandDecision::NonDestructive);
                         };
                         if !symbolic_data_word_is_safe(data) {
-                            return Some(BranchCommandDecision::Destructive);
+                            return Some(BranchCommandDecision::DestructiveDynamic);
                         }
                         index += 1;
                     }
@@ -3962,6 +4026,13 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
     } else {
         command
     };
+    if dialect == ShellDialect::PowerShell
+        && powershell_expression_statement_without_subexpression(command)
+    {
+        // `"$X" …` / `$X …` is an expression statement; PowerShell refuses to
+        // invoke it without the call operator, so it cannot execute Git (#273).
+        return false;
+    }
     let command = command
         .strip_prefix('&')
         .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
@@ -3986,7 +4057,50 @@ pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDiale
         return contains_git_ascii_case_insensitive(command)
             || git_semantic_scan_required(command, dialect);
     }
-    semantic_git_executable_index(&decoded.words, dialect).is_some()
+    if semantic_git_executable_index(&decoded.words, dialect).is_some() {
+        return true;
+    }
+    dialect == ShellDialect::Posix && frontend_bail_may_execute_git(&decoded.words, dialect)
+}
+
+/// #260 deny-direction backstop: a command whose executable is a *known*
+/// execution frontend, but whose wrapper strip bailed (dynamic option value,
+/// unmodeled flag), still executes its wrapped command at runtime. Report
+/// scan-required when any later word may resolve to a Git executable so the
+/// ordinary regex rules evaluate the command text. Genuinely unknown
+/// programs (`foo exec git …`) keep the documented argv-data default.
+fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialect) -> bool {
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if !word.dynamic
+            && (crate::normalize::is_env_assignment(&word.decoded)
+                || matches!(word.decoded.as_str(), "exec" | "time" | "nohup" | "!"))
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(first) = words.get(index) else {
+        return false;
+    };
+    if first.dynamic {
+        return false;
+    }
+    let basename = first
+        .decoded
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&first.decoded);
+    if !crate::normalize::is_posix_execution_frontend_basename(basename) {
+        return false;
+    }
+    words[index + 1..].iter().any(|word| {
+        git_semantic_executable_may_equal(word, dialect, "git")
+            || git_semantic_executable_may_equal(word, dialect, "git.exe")
+            || git_semantic_executable_may_equal(word, dialect, "git-branch")
+            || git_semantic_executable_may_equal(word, dialect, "git-branch.exe")
+    })
 }
 
 /// Build a matching-only view of a Git invocation in a caller-proven shell.
@@ -4225,7 +4339,10 @@ pub(crate) fn branch_command_decision_in_dialect(
         return BranchCommandDecision::Unparsed;
     }
     if dynamic_git_branch_may_mutate(semantic_command, dialect) {
-        return BranchCommandDecision::Destructive;
+        // This path fires only when a dynamic word can occupy a mutating
+        // syntax role (the all-literal case returns false), so attribute it
+        // to the dynamic-token rule rather than a proven deletion (#274).
+        return BranchCommandDecision::DestructiveDynamic;
     }
     let Ok(mut tokens) = branch_tokens(command, dialect) else {
         return BranchCommandDecision::Unparsed;
@@ -4616,6 +4733,38 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 "Review the fully expanded Git executable, alias chain, shell-alias body, and appended arguments before allowing execution. Dynamic shell values, cycles, and commands beyond the semantic parser's bounds can hide destructive operations.",
             ),
             suggestions: &[],
+        },
+        // Evaluated explicitly by the branch semantic parser when a dynamic
+        // word may expand or field-split into a deletion / force flag (#274).
+        // The regex is intentionally unsatisfiable so ordinary text matching
+        // cannot manufacture this finding.
+        DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(r"(?!)"),
+            reason: BRANCH_DYNAMIC_REASON,
+            name: Some(BRANCH_DYNAMIC_RULE),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "An unquoted command substitution or variable in a git branch invocation is \
+                 expanded and field-split by the shell before git parses it, so its output can \
+                 inject `-D`, `-f`, `-M`, or `-C` and turn a branch creation into a deletion or \
+                 forced ref update. dcg cannot statically bound the expansion's output.\n\n\
+                 Safe spellings dcg allows without any exception:\n\
+                 - Quote the name so it stays one word: git branch \"backup-$(date +%s)\"\n\
+                 - End option parsing first: git branch -- backup-$(date +%s)\n\n\
+                 Both guarantee the expansion cannot become a flag.",
+            ),
+            suggestions: &const {
+                [
+                    PatternSuggestion::new(
+                        "git branch \"{name}\"",
+                        "Quote the branch name so the expansion stays a single non-flag word",
+                    ),
+                    PatternSuggestion::new(
+                        "git branch -- {name}",
+                        "`--` ends option parsing, so expanded output cannot become a flag",
+                    ),
+                ]
+            },
         },
         // checkout -- discards uncommitted changes
         destructive_pattern!(
@@ -5079,6 +5228,186 @@ mod tests {
     use std::fmt::Write as _;
 
     // =========================================================================
+    // PowerShell expression statements are not command invocations (#273)
+    // =========================================================================
+
+    /// A PS statement whose first token is a quoted string or variable is an
+    /// expression statement; PowerShell refuses to invoke it without `&`, so
+    /// the git semantic layer must not treat it as a possible Git executable.
+    #[test]
+    fn powershell_expression_statement_is_not_a_git_invocation() {
+        for command in [
+            "\"$X\" \"$Y\"",
+            "\"$BIN\" run \"$ARG\"",
+            "\"$X\" y",
+            "$X $Y",
+            "\"$X\" -D",
+            "\"$env:TOOL\" \"$env:ARG\"",
+            "$x = \"$Y\" \"$Z\"",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::PowerShell),
+                "expression statement must not execute git: {command}"
+            );
+            assert!(
+                !dynamic_git_branch_may_mutate(command, ShellDialect::PowerShell),
+                "expression statement must not reach branch mutation: {command}"
+            );
+            assert_ne!(
+                branch_command_decision_in_dialect(command, ShellDialect::PowerShell),
+                BranchCommandDecision::Destructive,
+                "expression statement must not be a destructive branch command: {command}"
+            );
+        }
+    }
+
+    /// Real invocation shapes must keep their conservative treatment: an
+    /// assignment executes its right-hand side, and `$(…)` / `@(…)`
+    /// subexpressions evaluate their embedded pipeline even inside an
+    /// expression statement.
+    #[test]
+    fn powershell_expression_shortcut_excludes_invoking_shapes() {
+        assert_eq!(
+            branch_command_decision_in_dialect("$x = git branch -D main", ShellDialect::PowerShell),
+            BranchCommandDecision::Destructive,
+            "assignment RHS is a real invocation and must stay destructive"
+        );
+        for command in [
+            "$(git branch -D main)",
+            "\"$(git branch -D main)\"",
+            "@(git branch -D main)",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::PowerShell),
+                "subexpression statements keep the conservative treatment: {command}"
+            );
+        }
+    }
+
+    /// The reported #273 shapes must not be denied on the all-dialect route
+    /// either: the quoted dynamic executable is an unknown program in every
+    /// dialect. The unquoted `$X $Y` form stays fail-closed via the POSIX
+    /// dialect, where field splitting genuinely can synthesize `git branch -D`.
+    #[test]
+    fn quoted_dynamic_executable_with_dynamic_argument_is_unknown_program() {
+        for command in ["\"$X\" \"$Y\"", "\"$BIN\" run \"$ARG\""] {
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                assert_ne!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::Destructive,
+                    "quoted dynamic executable must not be branch-destructive: {command} ({dialect:?})"
+                );
+            }
+        }
+        assert_eq!(
+            branch_command_decision_in_dialect("$X $Y", ShellDialect::Posix),
+            BranchCommandDecision::DestructiveDynamic,
+            "unquoted POSIX expansion may field-split into git branch -D and stays fail-closed"
+        );
+    }
+
+    // =========================================================================
+    // Execution-frontend strip failures stay scan-required (#260)
+    // =========================================================================
+
+    /// When a known execution frontend's wrapper strip bails (dynamic option
+    /// value, unmodeled flag), the wrapped `git` word must stay scan-required
+    /// under the Posix dialect so the regex rules run — the live hook path
+    /// must not be weaker than `dcg test`.
+    #[test]
+    fn frontend_strip_failure_keeps_git_scan_required() {
+        for command in [
+            "nice -n $(x) git reset --hard",
+            "timeout $(x) git reset --hard",
+            "mise exec --cd $(pwd) git reset --hard",
+            "mise exec --no-such-flag git reset --hard",
+            "sudo nice -n $(x) git reset --hard",
+            "nice -n $(x) git branch -D main",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "frontend bail must keep the wrapped git command scan-required: {command}"
+            );
+        }
+        // Genuinely unknown programs keep the documented argv-data default,
+        // and a frontend with no possible git word downstream stays skipped.
+        for command in ["foo exec git reset --hard", "timeout 5 sleep 1"] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "unknown program argv keeps the documented default: {command}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Branch creation with dynamic tokens (#274)
+    // =========================================================================
+
+    /// An unquoted, unresolvable expansion in `git branch` argv stays
+    /// fail-closed — its output can field-split into `-D main` — but the
+    /// verdict is attributed to the dynamic-token rule so the denial explains
+    /// the real hazard and its safe spellings, not a fictional deletion.
+    #[test]
+    fn branch_creation_with_unresolvable_expansion_uses_dynamic_rule() {
+        for command in [
+            "git branch backup-$(date +%s)",
+            "git branch backup/pre-$(git rev-parse --short HEAD)",
+            "git branch $FLAGS",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "unquoted dynamic branch argv fails closed under the dynamic rule: {command} ({dialect:?})"
+                );
+            }
+        }
+    }
+
+    /// The safe spellings need no allowlist entry: quoting pins the expansion
+    /// to a single non-flag word, `--` ends option parsing, and a
+    /// statically-resolvable substitution folds to a literal name.
+    #[test]
+    fn branch_creation_safe_spellings_stay_allowed() {
+        for command in [
+            "git branch mybackup",
+            "git branch foo-$(echo x)",
+            "git branch \"backup-$(date +%s)\"",
+            "git branch \"backup/pre-$(git rev-parse --short HEAD)\"",
+            "git branch -- backup-$(date +%s)",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !matches!(
+                        decision,
+                        BranchCommandDecision::Destructive
+                            | BranchCommandDecision::DestructiveDynamic
+                    ),
+                    "safe branch creation spelling must not fail closed: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+        // Literal deletion / force flags keep the original attribution.
+        for command in [
+            "git branch -D main",
+            "git branch -d merged",
+            "git branch -f main HEAD~1",
+        ] {
+            assert_eq!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                BranchCommandDecision::Destructive,
+                "literal mutation flags stay on branch-force-delete: {command}"
+            );
+        }
+    }
+
+    // =========================================================================
     // Pack Creation Tests
     // =========================================================================
 
@@ -5294,7 +5623,7 @@ mod tests {
             ("g${part}t branch -d victim", ShellDialect::Posix),
             ("git br${part}anch -d victim", ShellDialect::Posix),
             ("git branch -${flag} victim", ShellDialect::Posix),
-            ("$cmd branch -d victim", ShellDialect::PowerShell),
+            ("$cmd branch -d victim", ShellDialect::Posix),
             ("$result = git branch -d victim", ShellDialect::PowerShell),
             ("git br${part}anch -d victim", ShellDialect::PowerShell),
             ("git branch -${flag} victim", ShellDialect::PowerShell),
@@ -5307,10 +5636,13 @@ mod tests {
             ("& ('g'+'it') branch -d victim", ShellDialect::PowerShell),
             ("& $('git') branch -d victim", ShellDialect::PowerShell),
         ] {
-            assert_eq!(
-                branch_command_decision_in_dialect(command, dialect),
-                BranchCommandDecision::Destructive,
-                "active syntax can select destructive Git branch semantics: {command}"
+            let decision = branch_command_decision_in_dialect(command, dialect);
+            assert!(
+                matches!(
+                    decision,
+                    BranchCommandDecision::Destructive | BranchCommandDecision::DestructiveDynamic
+                ),
+                "active syntax can select destructive Git branch semantics: {command} -> {decision:?}"
             );
         }
 
@@ -5324,6 +5656,12 @@ mod tests {
             ("git branch -- \"$value\"", ShellDialect::Posix),
             ("git branch --format \"$value\"", ShellDialect::PowerShell),
             ("git branch -- \"$value\"", ShellDialect::PowerShell),
+            // A variable at PowerShell statement position is an expression
+            // statement; `$cmd branch -d victim` is a parse error in real
+            // PowerShell and cannot invoke `$cmd` (#273). The POSIX dialect
+            // keeps the equivalent unquoted form fail-closed above, so the
+            // all-dialect route still denies it.
+            ("$cmd branch -d victim", ShellDialect::PowerShell),
             ("git branch --format \"%VALUE%\"", ShellDialect::Cmd),
             ("git branch -- \"%VALUE%\"", ShellDialect::Cmd),
             ("call g^it branch --format -^d", ShellDialect::Cmd),
@@ -5803,7 +6141,7 @@ git x",
         assert!(
             matches!(
                 branch_command_decision("gi[t] branch -D feature"),
-                BranchCommandDecision::Destructive
+                BranchCommandDecision::Destructive | BranchCommandDecision::DestructiveDynamic
             ),
             "closed bracket expression in executable position must stay fail-closed"
         );
@@ -6080,7 +6418,7 @@ git x",
         ] {
             assert_eq!(
                 branch_command_decision_in_dialect(command, ShellDialect::Posix),
-                BranchCommandDecision::Destructive,
+                BranchCommandDecision::DestructiveDynamic,
                 "dynamic shell output can occupy a destructive syntax role: {command}"
             );
         }
