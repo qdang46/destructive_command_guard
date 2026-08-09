@@ -2476,7 +2476,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn cmd_style_slash_s_deletes_are_blocked_under_the_powershell_dialect() {
         // Regression for #280: the hook maps the PowerShell tool to the ps
         // dialect, where `rd`/`del` alias Remove-Item and `/s` is a literal

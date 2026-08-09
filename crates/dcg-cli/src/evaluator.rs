@@ -29844,7 +29844,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// Issue #287: `system.permissions` is segment-scoped — a recursive flag
     /// (or 777/u+s/root token) on a *different* command in a chained or
     /// multi-line input must not pair with a chmod/chown elsewhere in the
