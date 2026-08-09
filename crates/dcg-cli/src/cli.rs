@@ -18997,6 +18997,7 @@ exclude = ["target/**"]
     }
 
     #[test]
+    #[cfg(unix)]
     fn get_staged_files_handles_spaces_and_newlines() {
         let repo = init_fixture_repo();
 
