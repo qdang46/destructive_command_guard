@@ -27,7 +27,7 @@ must validate when present:
 - `pack_id`
 - `pattern_name`
 - `rule_id` (pack_id:pattern_name)
-- `mode` (deny/warn/log)
+- `mode` (deny/ask/warn/log)
 - `source` (pack, heredoc_ast, config_override, legacy_pattern)
 - `reason_contains` (substring match)
 
@@ -55,26 +55,58 @@ The corpus MUST include edge cases:
 - backslash-escaped command words (\git)
 - inline -c/-e code with mixed quoting
 
+## Cross-Pack Replay Corpus
+
+Directory: `tests/corpus/cross_pack_fp/`
+Runner: `tests/cross_pack_corpus.rs`
+
+The canonical corpus above and the per-category regression corpus both evaluate
+against the default-enabled pack set, which is platform-dependent and excludes
+opt-in packs. The cross-pack corpus is the complement: every case is replayed
+with **all** registry packs force-enabled (`PackRegistry::all_pack_ids`,
+including `windows.*` on non-Windows hosts) across the `posix`, `ps`, `cmd` and
+`unknown` dialects.
+
+Its schema is the regression schema plus `issue`, `dialects`, `known_failing`,
+`known_failing_reason` and `known_failing_dialects`. It MUST contain, for every
+fixed false-positive issue with an in-tree repro, the exact reported shape — so
+that a fix landed in one pack is re-asked of every other pack.
+
+`known_failing` marks a false positive this suite has found and that the owning
+pack has not yet fixed. It is a bug record, never a licence to soften the case:
+the recorded shape stays verbatim, the tolerance is scoped to the failing
+dialects, and the suite fails if a marked case starts passing.
+
 ## Behavior Invariants (Must Never Change)
 
 1) Pack ordering is deterministic and stable.
    - Packs are ordered by tier, then lexicographically by pack_id.
-   - Tier ordering is fixed (safe, core, system, infrastructure, cloud,
-     kubernetes, containers, database, package_managers, strict_git, cicd).
+   - Tier ordering is fixed. `PackRegistry::pack_tier` in `src/packs/mod.rs` is
+     the source of truth; as of this writing it runs safe, core/storage/remote,
+     system, infrastructure, apigateway/cdn/cloud/dns/loadbalancer/platform,
+     kubernetes, containers, backup/database/messaging/search, package_managers,
+     strict_git, cicd/email/featureflags/secrets/monitoring/payment, windows,
+     careful_company_running_windows, then unknown.
 
 2) Safe-before-destructive evaluation is preserved.
-   - All safe patterns across enabled packs are evaluated first.
-   - Any safe match immediately allows the command.
+   - Each enabled pack evaluates its safe patterns before its destructive
+     patterns.
+   - A safe match suppresses only that owning pack. It never prevents another
+     enabled pack from enforcing a different security boundary.
 
 3) Allowlist scope is precise.
    - A matched allowlist entry bypasses only the specific matched rule.
    - Allowlisting does not suppress evaluation of other packs/patterns.
 
-4) Fail-open behavior is mandatory.
-   - Hook input parse errors, oversized inputs, or exceeded deadlines must
-     allow execution (no deny output).
-   - Heredoc extraction/AST errors fail open by default unless strict
-     settings explicitly override.
+4) Bounded-failure behavior is mandatory.
+   - Malformed or oversized raw hook envelopes allow with an audit warning by
+     default; `general.fail_closed = true` denies attacker-controlled parse
+     failures. Transient stdin I/O errors always fail open.
+   - An oversized extracted command or an exhausted evaluation deadline is
+     indeterminate, never allow: review-capable clients ask and other clients
+     block.
+   - Heredoc extraction/AST errors run the bounded fallback by default unless
+     strict settings explicitly require a block.
 
 5) Word-boundary keyword gating is stable.
    - Quick-reject uses keyword detection over executable spans.

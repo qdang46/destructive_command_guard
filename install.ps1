@@ -512,6 +512,10 @@ function Add-DcgProfileCheck {
       if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     }
 
+    # Detection must accept every command shape the installers write: bare `dcg`,
+    # an absolute Unix or Windows path, and the PowerShell quoted-invocation form
+    # `& 'C:\...\dcg.exe' [args]` (issue #282: naively splitting that on [\\/]
+    # leaves a trailing quote + args, so the hook looked missing every session).
     # Single-quoted here-string: written verbatim into the profile (no expansion now).
     $block = @'
 if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
@@ -520,7 +524,10 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     $dcgHas = $false
     foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
       foreach ($dcgH in @($dcgE.hooks)) {
-        if (((([string]$dcgH.command) -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+        $dcgCmd = ([string]$dcgH.command).Trim()
+        if ($dcgCmd -match '^&\s*[''"](.+?)[''"]') { $dcgExe = $Matches[1] }
+        else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
+        if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
       }
     }
     if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }

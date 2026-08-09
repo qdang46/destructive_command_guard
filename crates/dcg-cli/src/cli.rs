@@ -986,6 +986,20 @@ pub struct TestOutput {
     /// Detected agent information
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentInfo>,
+    /// Dialect-divergence metadata (#289): present only when the command was
+    /// evaluated under the default all-dialect (`unknown`) analysis and that
+    /// analysis denied it. Additive field — absent means "not checked".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect_divergence: Option<DialectDivergence>,
+}
+
+/// Whether the posix dialect alone — the dialect the live Bash hook uses —
+/// would allow a command the all-dialect analysis denied (#289).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct DialectDivergence {
+    /// `true` when posix alone allows: the denial is a diagnostics-only
+    /// verdict that the Bash hook would never produce.
+    pub posix_would_allow: bool,
 }
 
 /// Allowlist override information in test output
@@ -4103,6 +4117,95 @@ fn resolve_mode_for_cli(
     crate::evaluator::resolve_effective_mode(config, command, result)
 }
 
+/// Re-evaluate a blocked command under the posix dialect to detect a
+/// diagnostics-only denial (#289 C1).
+///
+/// `dcg test` / `dcg explain` default to [`ShellDialect::Unknown`], which is a
+/// fail-closed union over every dialect. The live Bash hook resolves a single
+/// dialect — posix — from the tool name, so a denial that only the union
+/// produces is a decision no Bash hook would ever make. Users filed false
+/// positives against that gap (#273) and could not reproduce real hook blocks.
+///
+/// Returns `Some` only when there is something to report — the defaulted
+/// dialect denied and posix alone allows. `None` covers "check did not apply"
+/// (allowed command, caller-chosen dialect) and "checked, no divergence"
+/// alike, which keeps the JSON payload free of a field that says nothing.
+/// Cost: exactly one extra evaluation, and only on the deny path of a
+/// defaulted dialect.
+#[allow(clippy::too_many_arguments)]
+fn cli_dialect_divergence(
+    dialect: DialectArg,
+    decision: EvaluationDecision,
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &crate::allowlist::LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    project_path: Option<&std::path::Path>,
+) -> Option<DialectDivergence> {
+    // `--dialect unknown` is the same analysis as the default, so the note is
+    // equally true there; any other explicit dialect is the user's own choice
+    // and must be reported as-is.
+    if dialect != DialectArg::Unknown {
+        return None;
+    }
+    // Only a blocking decision can diverge in the direction that matters (a
+    // denial the hook would not produce). Indeterminate results are budget
+    // artifacts, not dialect disagreements.
+    if decision != EvaluationDecision::Deny {
+        return None;
+    }
+
+    let posix = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        None, // allow_once_audit
+        project_path,
+        None, // deadline
+        crate::normalize::ShellDialect::Posix,
+    );
+
+    (posix.decision == EvaluationDecision::Allow).then_some(DialectDivergence {
+        posix_would_allow: true,
+    })
+}
+
+/// Build the human-readable dialect-divergence note (#289 C1).
+///
+/// Returns `None` unless the all-dialect analysis denied a command that posix
+/// alone would allow.
+fn dialect_divergence_note(divergence: Option<DialectDivergence>, command: &str) -> Option<String> {
+    if !divergence.is_some_and(|d| d.posix_would_allow) {
+        return None;
+    }
+    Some(format!(
+        "Note: this denial comes from the all-dialect analysis (the CLI default, --dialect unknown).\n\
+         \x20     The Bash hook (posix dialect) would ALLOW this command.\n\
+         \x20     Reproduce the hook's decision with: dcg test --dialect posix {}",
+        single_quote_for_shell(command)
+    ))
+}
+
+/// Print the dialect-divergence note when one applies (#289 C1).
+fn print_dialect_divergence_note(divergence: Option<DialectDivergence>, command: &str) {
+    if let Some(note) = dialect_divergence_note(divergence, command) {
+        println!();
+        println!("{note}");
+    }
+}
+
+/// Wrap `command` in single quotes for a copy-pasteable POSIX shell example.
+fn single_quote_for_shell(command: &str) -> String {
+    format!("'{}'", command.replace('\'', r"'\''"))
+}
+
 fn read_test_command_from_stdin(max_command_bytes: usize) -> std::io::Result<String> {
     use std::io::Read as _;
 
@@ -4229,10 +4332,16 @@ fn test_command(
         },
     };
 
-    // Hook mode starts its deadline after config-derived setup, agent detection,
-    // external-pack loading, and hook-input reading. The CLI already has the
-    // candidate command, so begin at the equivalent boundary: pack expansion,
-    // allowlist loading, and evaluation consume the effective wall-clock budget.
+    // Hook mode starts its deadline right after the stdin read, so its budget
+    // covers self-heal, external-pack loading, and evaluation (issue #293).
+    // The CLI deliberately diverges: it starts the deadline HERE, after
+    // config-derived setup, agent detection, and external-pack loading, so
+    // only pack expansion, allowlist loading, and evaluation consume the
+    // budget. `--enforce-budget` exists to reproduce hook-mode *evaluation*
+    // latency from the command line, and the CLI's own startup is not part of
+    // any agent's hook window — charging it here would make the flag report a
+    // budget the hook never spends. Timing the loading stages is what
+    // `dcg doctor`/`--timing` are for.
     let evaluation_deadline = enforce_budget.then(|| {
         Deadline::new(Duration::from_millis(
             effective_config.effective_hook_timeout_ms(),
@@ -4311,6 +4420,22 @@ fn test_command(
         return policy_blocks_cli_execution(result.decision, resolved_mode);
     }
 
+    // #289 C1: a denial under the defaulted all-dialect analysis may be one the
+    // Bash hook (posix only) would never produce. Computed after the quiet
+    // early-return so the extra evaluation is only paid for when it is reported.
+    let dialect_divergence = cli_dialect_divergence(
+        dialect,
+        result.decision,
+        command,
+        &enabled_keywords,
+        &ordered_packs,
+        keyword_index.as_ref(),
+        &compiled_overrides,
+        &allowlists,
+        &heredoc_settings,
+        None, // project_path: matches the evaluation above
+    );
+
     // Handle structured output (JSON/TOON)
     if format.is_structured() {
         let output = match result.decision {
@@ -4340,6 +4465,7 @@ fn test_command(
                     severity: None,
                     allowlist,
                     agent: Some(agent_info.clone()),
+                    dialect_divergence,
                 }
             }
             EvaluationDecision::Deny => {
@@ -4408,6 +4534,7 @@ fn test_command(
                     severity,
                     allowlist: None,
                     agent: Some(agent_info.clone()),
+                    dialect_divergence,
                 }
             }
             EvaluationDecision::Indeterminate => TestOutput {
@@ -4430,6 +4557,7 @@ fn test_command(
                 severity: None,
                 allowlist: None,
                 agent: Some(agent_info.clone()),
+                dialect_divergence,
             },
         };
         match format {
@@ -4793,6 +4921,12 @@ fn test_command(
         if normalized.as_ref() != command {
             println!("Normalized: {normalized}");
         }
+    }
+
+    // #289 C1: point the user at the dialect the live Bash hook actually uses
+    // when the all-dialect union is the only thing producing this denial.
+    if !interactive_allowed {
+        print_dialect_divergence_note(dialect_divergence, command);
     }
 
     // Return true unless execution was affirmatively allowed. An incomplete
@@ -7131,6 +7265,26 @@ fn handle_explain(
         });
     }
 
+    // #289 C1: same divergence check as `dcg test` — an explain trace that
+    // blames the all-dialect union must say so, or the reader will chase a
+    // denial the Bash hook never makes.
+    let dialect_divergence = cli_dialect_divergence(
+        dialect,
+        result.decision,
+        command,
+        &enabled_keywords,
+        &ordered_packs,
+        keyword_index.as_ref(),
+        &compiled_overrides,
+        &allowlists,
+        &heredoc_settings,
+        None, // project_path: matches the evaluation above
+    );
+
+    // A rule that matched but was stood down by a configured target exemption
+    // is an allow that came from configuration, so explain must say so (#284).
+    let target_suppressions = crate::config::take_rule_target_suppressions();
+
     // Finish and get trace
     let trace = collector.finish(result.decision);
 
@@ -7149,16 +7303,32 @@ fn handle_explain(
             {
                 print_explain_pretty_plain(&trace);
             }
+            print_dialect_divergence_note(dialect_divergence, command);
+            print_rule_target_suppression_notes(&target_suppressions);
         }
         ExplainFormat::Compact => {
             println!("{}", trace.format_compact(None));
+            print_dialect_divergence_note(dialect_divergence, command);
+            print_rule_target_suppression_notes(&target_suppressions);
         }
         ExplainFormat::Json => {
-            let json_output = trace.to_json_output();
+            let mut json_output = trace.to_json_output();
+            json_output.dialect_divergence = dialect_divergence;
             let json = serde_json::to_string_pretty(&json_output)
                 .unwrap_or_else(|e| format!("{{\"error\": \"JSON serialization failed: {e}\"}}"));
             println!("{json}");
         }
+    }
+}
+
+/// Report rules that matched but were stood down by a configured target
+/// exemption (#284).
+fn print_rule_target_suppression_notes(suppressions: &[crate::config::RuleTargetSuppression]) {
+    for suppression in suppressions {
+        println!(
+            "Note: rule {} matched but target \"{}\" was exempted by [rules.\"{}\"] exempt_target_globs entry \"{}\"",
+            suppression.rule_id, suppression.target, suppression.rule_id, suppression.glob
+        );
     }
 }
 
@@ -9919,6 +10089,16 @@ fn doctor_pretty(fix: bool, config: &Config, config_sources: &[ConfigSourceOutco
             }
             println!("  → Fix the regex patterns in the trusted config source");
         }
+        if !config_diag.rule_target_exemption_warnings.is_empty() {
+            println!("  Inert rule target exemptions:");
+            for warning in &config_diag.rule_target_exemption_warnings {
+                println!("    - {warning}");
+            }
+            println!(
+                "  → See the \"Per-rule target-path exemptions\" section of the README \
+                 for the supported rules"
+            );
+        }
     } else {
         println!(
             "{} ({} file source{})",
@@ -12190,7 +12370,7 @@ fn launch_windows_update_worker_direct(
         let mut breakaway = runner_command(runner_path);
         breakaway.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB);
         match breakaway.spawn() {
-            Ok(_) => return Ok(()),
+            Ok(_) => Ok(()),
             Err(breakaway_error) => {
                 let mut detached = runner_command(runner_path);
                 detached.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
@@ -12200,7 +12380,7 @@ fn launch_windows_update_worker_direct(
                          detached worker failed ({detached_error})"
                     )
                 })?;
-                return Ok(());
+                Ok(())
             }
         }
     }
@@ -12455,28 +12635,211 @@ pub fn ensure_hook_registered() {
 /// so the outer function can swallow them for fail-open behavior.
 fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
     let settings_path = claude_settings_path();
+    let lock_path = self_heal_lock_path(&settings_path);
+    ensure_hook_registered_at(&settings_path, &lock_path)
+}
+
+/// Path to the advisory lock file that serializes concurrent self-heal
+/// writers of `settings_path`.
+///
+/// Lives in dcg's own config directory rather than `~/.claude` so dcg does
+/// not litter Claude Code's directory with extra files — but the *name* is
+/// derived from the protected file, not from the config directory. The config
+/// directory moves with `XDG_CONFIG_HOME`/`DCG_CONFIG_DIR`, so a fixed
+/// `selfheal.lock` let two processes with different environments heal the
+/// same `settings.json` under two different locks and interleave their
+/// read-modify-write. Keying the name to a stable hash of the canonicalized
+/// settings path makes the lock follow the file it protects.
+fn self_heal_lock_path(settings_path: &std::path::Path) -> std::path::PathBuf {
+    use sha2::{Digest, Sha256};
+
+    // Canonicalize so `~/.claude/settings.json` and a symlink/`..`-laden
+    // spelling of the same file hash identically. A not-yet-existing path
+    // falls back to its literal form (self-heal no-ops on it anyway).
+    let canonical = std::fs::canonicalize(settings_path)
+        .unwrap_or_else(|_| settings_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let digest = Sha256::digest(canonical.as_bytes());
+    let mut hex8 = String::with_capacity(8);
+    for byte in digest.iter().take(4) {
+        use std::fmt::Write as _;
+        let _ = write!(hex8, "{byte:02x}");
+    }
+    config_dir().join(format!("selfheal-{hex8}.lock"))
+}
+
+/// True if `settings` already contains the exact desired dcg hook entry for
+/// the Claude shell matcher.
+fn settings_has_exact_dcg_hook(
+    settings: &serde_json::Value,
+    desired_hook: &serde_json::Value,
+) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|arr| arr.as_array())
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, desired_hook)
+            })
+        })
+}
+
+/// Try to take an exclusive advisory lock on `lock_path` with a small bounded
+/// wait (same `fs2::FileExt` mechanism as the pending-exceptions store).
+///
+/// Returns `Ok(Some(file))` while holding the lock (released when the file is
+/// dropped), or `Ok(None)` if the lock stayed contended past the bounded wait
+/// — the caller should skip self-heal for this invocation rather than block
+/// the hook pipeline; it reruns on the next invocation.
+fn try_acquire_self_heal_lock(
+    lock_path: &std::path::Path,
+) -> Result<Option<std::fs::File>, Box<dyn std::error::Error>> {
+    use fs2::FileExt;
+
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+
+    const ATTEMPTS: u32 = 5;
+    for attempt in 0..ATTEMPTS {
+        // Treat any lock failure (WouldBlock or otherwise) as contention:
+        // self-heal is best-effort and must never block command evaluation.
+        if file.try_lock_exclusive().is_ok() {
+            return Ok(Some(file));
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    Ok(None)
+}
+
+/// Atomically replace `path` with `content` using the same temp-file, fsync,
+/// then rename idiom as `write_allowlist`: the temp file lives in the
+/// target's own directory so the rename never crosses filesystems, and a
+/// crash mid-write leaves the original file intact instead of
+/// truncated/invalid JSON (which would make Claude Code silently drop ALL
+/// hooks).
+///
+/// Two properties the naive temp+rename does NOT have, and that self-heal
+/// must not silently take away from a user:
+/// - **Symlinks are followed, not replaced.** `~/.claude/settings.json` is
+///   very often a symlink into a dotfile manager (chezmoi, GNU stow, Nix home
+///   manager). Renaming over the link would orphan the managed target and
+///   silently detach the file from the user's source of truth, so the write
+///   resolves the link first and replaces the real file.
+/// - **Permissions are preserved.** settings.json can hold API keys in `env`
+///   blocks; a `chmod 600` file must not come back world-readable 0644 just
+///   because dcg repaired a hook entry.
+fn write_settings_atomic(
+    path: &std::path::Path,
+    content: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    // Resolve symlinks so the rename lands on the real file, and so the temp
+    // file shares its filesystem. A path that cannot be canonicalized (does
+    // not exist yet) keeps its literal form.
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+
+    let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let temp_name = format!(".dcg-settings-{}.tmp", std::process::id());
+    let temp_path = parent.join(&temp_name);
+
+    // Every failure after this point must remove the temp file: a failed
+    // write/sync used to leave `.dcg-settings-<pid>.tmp` behind forever.
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let mut temp_file = std::fs::File::create(&temp_path)?;
+            temp_file.write_all(content.as_bytes())?;
+            temp_file.sync_all()?; // Ensure data is flushed to disk
+        }
+
+        copy_file_permissions(&target, &temp_path)?;
+
+        // Atomic rename (on Unix this is atomic; on Windows `std::fs::rename`
+        // replaces the existing file via MOVEFILE_REPLACE_EXISTING).
+        std::fs::rename(&temp_path, &target)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        // Clean up our own temp file so failed attempts don't accumulate.
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    write_result
+}
+
+/// Copy `from`'s permission bits onto `to` so an atomic temp+rename replace
+/// does not silently widen a restrictive mode (e.g. a `chmod 600`
+/// settings.json or allowlist).
+///
+/// A missing/unreadable source is not an error: there is nothing to preserve,
+/// and the temp file's default mode is the correct outcome. On non-Unix this
+/// is a no-op — Windows permissions live in ACLs that `std::fs` cannot carry
+/// across, and `rename` does not reset them the way a fresh file would.
+#[allow(clippy::unnecessary_wraps)] // the non-unix arm still needs the Result shape
+fn copy_file_permissions(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        if let Ok(metadata) = std::fs::metadata(from) {
+            std::fs::set_permissions(to, metadata.permissions())?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (from, to);
+    }
+    Ok(())
+}
+
+/// Path-parameterized core of `ensure_hook_registered_inner` (separated for
+/// testability against an isolated settings/lock location).
+fn ensure_hook_registered_at(
+    settings_path: &std::path::Path,
+    lock_path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !settings_path.exists() {
         // No settings.json at all — nothing to heal. The user hasn't run
         // `dcg install` yet, or Claude Code hasn't been configured.
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
     let desired_hook = claude_dcg_hook()?;
 
-    let is_registered = settings
-        .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
-        .and_then(|arr| arr.as_array())
-        .is_some_and(|entries| {
-            entries.iter().any(|entry| {
-                is_exact_hook_entry_for_matcher(entry, CLAUDE_SHELL_MATCHER, &desired_hook)
-            })
-        });
+    // Fast path (lock-free): if the hook is present, nothing to do. This is
+    // the common case on every hook invocation, so it stays a read + parse.
+    let content = std::fs::read_to_string(settings_path)?;
+    let settings: serde_json::Value = serde_json::from_str(&content)?;
+    if settings_has_exact_dcg_hook(&settings, &desired_hook) {
+        return Ok(());
+    }
 
-    if is_registered {
-        // Fast path: hook is present, nothing to do.
+    // Repair needed — serialize concurrent self-healers so two dcg hook
+    // processes cannot interleave read-modify-write and lose each other's
+    // changes. If the lock stays contended, skip: another process is healing
+    // right now, and this check reruns on the next hook invocation.
+    let Some(_lock) = try_acquire_self_heal_lock(lock_path)? else {
+        return Ok(());
+    };
+
+    // Re-read under the lock so the modification applies to the freshest
+    // snapshot (a concurrent healer may have already repaired the file).
+    let content = std::fs::read_to_string(settings_path)?;
+    let mut settings: serde_json::Value = serde_json::from_str(&content)?;
+    if settings_has_exact_dcg_hook(&settings, &desired_hook) {
         return Ok(());
     }
 
@@ -12484,7 +12847,7 @@ fn ensure_hook_registered_inner() -> Result<(), Box<dyn std::error::Error>> {
     let changed = install_dcg_hook_into_settings(&mut settings, false)?;
     if changed {
         let new_content = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&settings_path, new_content)?;
+        write_settings_atomic(settings_path, &new_content)?;
         eprintln!(
             "[dcg] \x1b[1;33mWarning: DCG hook was missing or stale in {} — repaired automatically.\x1b[0m",
             settings_path.display()
@@ -12686,6 +13049,8 @@ struct ConfigDiagnostics {
     unknown_packs: Vec<String>,
     /// Override patterns that failed to compile
     invalid_override_patterns: Vec<(String, String)>, // (pattern, error)
+    /// `[rules]` target exemptions that will not take effect (#284)
+    rule_target_exemption_warnings: Vec<String>,
 }
 
 impl ConfigDiagnostics {
@@ -12697,6 +13062,7 @@ impl ConfigDiagnostics {
         !self.source_warnings.is_empty()
             || !self.unknown_packs.is_empty()
             || !self.invalid_override_patterns.is_empty()
+            || !self.rule_target_exemption_warnings.is_empty()
     }
 }
 
@@ -12765,6 +13131,11 @@ fn validate_config_diagnostics(
         diag.invalid_override_patterns
             .push((ip.pattern.clone(), ip.error.clone()));
     }
+
+    // A `[rules]` target exemption on an unsupported rule, or with an unusable
+    // glob, is silently inert: the user keeps getting the denial they tried to
+    // carve out. Surface it rather than leaving them unserved (#284).
+    diag.rule_target_exemption_warnings = config.rule_target_exemption_warnings();
 
     diag
 }
@@ -14559,6 +14930,11 @@ fn write_allowlist(
             format!("Generated TOML failed validation (this is a bug): {parse_err}").into(),
         );
     }
+
+    // Preserve the existing file's permissions: a temp+rename replace
+    // otherwise resets a deliberately restrictive mode (e.g. `chmod 600`) to
+    // the process umask default.
+    copy_file_permissions(path, &temp_path)?;
 
     // Create a backup before replacing the file so we can recover from write failures.
     let backup_path = backup_allowlist_file(path)?;
@@ -16560,7 +16936,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runner = temp.path().join("run-update-after-exit.ps1");
         std::fs::write(&runner, WINDOWS_UPDATE_RUNNER).unwrap();
-        let parser_probe = r#"$tokens = $null
+        let parser_probe = r"$tokens = $null
 $errors = $null
 [Management.Automation.Language.Parser]::ParseFile(
   $env:DCG_UPDATE_RUNNER_PARSE_PATH,
@@ -16570,7 +16946,7 @@ $errors = $null
 if ($errors.Count -ne 0) {
   $errors | ForEach-Object { Write-Error ([string]$_) }
   exit 1
-}"#;
+}";
         let output = std::process::Command::new("powershell.exe")
             .arg("-NoProfile")
             .arg("-NonInteractive")
@@ -16848,9 +17224,14 @@ if ($errors.Count -ne 0) {
         let results = process_batch_lines(&lines);
 
         let decisions: Vec<&str> = results.iter().map(|result| result.decision).collect();
+        // The last line has no proven dialect (`runTerminalCommand`), so it is
+        // evaluated under `Unknown` and the #294 fan-out replays the cmd view
+        // that de-escapes `g^it branch ^-d` into a real `git branch -d`. The
+        // Bash line before it stays allowed: POSIX has no backtick escape, so
+        // that command really is not git.
         assert_eq!(
             decisions,
-            ["deny", "allow", "deny", "allow", "allow", "allow"]
+            ["deny", "allow", "deny", "allow", "allow", "deny"]
         );
     }
 
@@ -18450,6 +18831,7 @@ exclude = ["target/**"]
                 trust_level: "medium".to_string(),
                 detection_method: "none".to_string(),
             }),
+            dialect_divergence: None,
         };
 
         let json = serde_json::to_value(&payload).expect("serialize payload to json");
@@ -19616,6 +19998,182 @@ exclude = ["target/**"]
         assert!(
             settings.get("permissions").is_some(),
             "existing keys should be preserved"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_settings_atomic_preserves_a_symlinked_settings_file() {
+        // ~/.claude/settings.json is very often a symlink into a dotfile
+        // manager (chezmoi / stow / home-manager). A temp+rename replace that
+        // does not resolve the link would silently orphan the managed target.
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_path = real_dir.join("claude-settings.json");
+        std::fs::write(&real_path, "{\"old\": true}").unwrap();
+
+        let link_path = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+
+        write_settings_atomic(&link_path, "{\"new\": true}").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "settings.json must still be a symlink after self-heal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_path).unwrap(),
+            "{\"new\": true}",
+            "the write must land on the symlink's target"
+        );
+        // No temp file left in either directory.
+        for probe in [dir.path(), real_dir.as_path()] {
+            let leftover_tmp = std::fs::read_dir(probe)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| e.file_name().to_string_lossy().ends_with(".tmp"));
+            assert!(!leftover_tmp, "no temp file should be left in {probe:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_settings_atomic_preserves_restrictive_mode() {
+        // settings.json can hold API keys in `env` blocks: a `chmod 600` file
+        // must not come back 0644 because dcg repaired a hook entry.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{\"old\": true}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_settings_atomic(&path, "{\"new\": true}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restrictive mode must survive the atomic write"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"new\": true}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_allowlist_preserves_restrictive_mode() {
+        // Same defect, same fix, in the pre-existing allowlist atomic write.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowlist.toml");
+        std::fs::write(&path, "[commands]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let doc: toml_edit::DocumentMut = "[commands]\nfoo = \"bar\"\n".parse().unwrap();
+        write_allowlist(&path, &doc).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "restrictive mode must survive the atomic write"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("foo"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_heal_at_repairs_through_a_symlink() {
+        // End-to-end: the whole repair path must keep the symlink intact.
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_path = real_dir.join("claude-settings.json");
+        std::fs::write(
+            &real_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": { "PreToolUse": [] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let link_path = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let lock_path = dir.path().join("selfheal.lock");
+
+        ensure_hook_registered_at(&link_path, &lock_path).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "self-heal must not replace the symlink with a regular file"
+        );
+        let healed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real_path).unwrap()).unwrap();
+        let is_registered = healed
+            .get("hooks")
+            .and_then(|h| h.get("PreToolUse"))
+            .and_then(|arr| arr.as_array())
+            .is_some_and(|a| a.iter().any(is_dcg_hook_entry));
+        assert!(is_registered, "hook must be repaired in the link target");
+    }
+
+    #[test]
+    fn self_heal_lock_path_is_keyed_to_the_protected_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("settings.json");
+        let b = dir.path().join("other-settings.json");
+        std::fs::write(&a, "{}").unwrap();
+        std::fs::write(&b, "{}").unwrap();
+
+        // Stable for the same file...
+        assert_eq!(self_heal_lock_path(&a), self_heal_lock_path(&a));
+        // ...and distinct for a different one.
+        assert_ne!(self_heal_lock_path(&a), self_heal_lock_path(&b));
+
+        // Shape: <config dir>/selfheal-<8 hex>.lock
+        let name = self_heal_lock_path(&a)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let hex = name
+            .strip_prefix("selfheal-")
+            .and_then(|rest| rest.strip_suffix(".lock"))
+            .expect("lock file name must be selfheal-<hex>.lock");
+        assert_eq!(hex.len(), 8, "expected an 8-char hex key, got {name:?}");
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn self_heal_lock_path_is_identical_for_aliases_of_one_file() {
+        // Two processes reaching the same settings.json by different
+        // spellings (symlink, `..` hop) must contend on ONE lock.
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let real_path = real_dir.join("claude-settings.json");
+        std::fs::write(&real_path, "{}").unwrap();
+        let link_path = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&real_path, &link_path).unwrap();
+        let dotted = real_dir
+            .join("..")
+            .join("dotfiles")
+            .join(real_path.file_name().map(std::path::PathBuf::from).unwrap());
+
+        assert_eq!(
+            self_heal_lock_path(&real_path),
+            self_heal_lock_path(&link_path)
+        );
+        assert_eq!(
+            self_heal_lock_path(&real_path),
+            self_heal_lock_path(&dotted)
         );
     }
 }

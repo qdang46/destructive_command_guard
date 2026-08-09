@@ -41,6 +41,7 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `git-alias-semantic-unverified` | The invoked Git alias depends on shell expansion, contains a cycle, or exceeds dcg's bounded semantic analysis. | high |
+| `branch-dynamic-token` | A dynamic shell expansion in this git branch command can expand into a deletion or forced ref update. Quote the branch name or add `--` to make it a literal creation. | high |
 | `checkout-discard` | git checkout -- discards uncommitted changes permanently. Use 'git stash' first. | high |
 | `checkout-ref-discard` | git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first. | high |
 | `restore-worktree` | git restore discards uncommitted changes. Use 'git stash' or 'git diff' first. | high |

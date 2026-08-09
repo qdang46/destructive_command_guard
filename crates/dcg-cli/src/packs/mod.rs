@@ -23,6 +23,7 @@ pub mod containers;
 pub mod core;
 pub mod database;
 pub mod dns;
+pub mod effects;
 pub mod email;
 pub mod external;
 pub mod featureflags;
@@ -34,7 +35,6 @@ pub mod monitoring;
 pub mod package_managers;
 pub mod payment;
 pub mod platform;
-pub mod effects;
 pub mod regex_engine;
 pub mod remote;
 pub mod safe;
@@ -298,6 +298,19 @@ pub struct DestructivePattern {
     /// Safer command alternatives to suggest when this pattern matches.
     /// Each suggestion includes the command, why it's safer, and which platforms it applies to.
     pub suggestions: &'static [PatternSuggestion],
+    /// Executables this rule is about (issue #289).
+    ///
+    /// `None` means the rule is unscoped: it matches any text the engine hands
+    /// it, exactly as before this field existed. `Some(list)` restricts the
+    /// rule to text governed by one of the listed executables — the evaluator
+    /// resolves the argv0 of the command segment the match starts in (wrappers
+    /// such as `sudo`/`env` and leading assignments stripped, path basename,
+    /// `.exe`/`.cmd`/`.bat`/`.com` removed, ASCII case-insensitive) and skips
+    /// the rule unless it is in this list. A dynamic argv0 (one containing a
+    /// shell expansion) never matches.
+    ///
+    /// Names must be written lowercase without a path or extension.
+    pub executables: Option<&'static [&'static str]>,
 }
 
 impl std::fmt::Debug for DestructivePattern {
@@ -309,6 +322,7 @@ impl std::fmt::Debug for DestructivePattern {
             .field("severity", &self.severity)
             .field("explanation", &self.explanation)
             .field("suggestions", &self.suggestions)
+            .field("executables", &self.executables)
             .finish()
     }
 }
@@ -339,6 +353,73 @@ macro_rules! safe_pattern {
 /// - `destructive_pattern!("name", "regex", "reason", Critical, "explanation", &[...])` - with suggestions
 #[macro_export]
 macro_rules! destructive_pattern {
+    // ---- `executables = [...]` variants ----------------------------------
+    // These must precede the plain arms: the trailing `$suggestions:expr` arm
+    // would otherwise parse `executables = [...]` as an assignment expression.
+
+    // Unnamed pattern, default severity (High), executable-scoped
+    ($re:literal, $reason:literal, executables = [$($exe:literal),+ $(,)?]) => {
+        $crate::packs::DestructivePattern {
+            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            reason: $reason,
+            name: None,
+            severity: $crate::packs::Severity::High,
+            explanation: None,
+            suggestions: &[],
+            executables: Some(&[$($exe),+]),
+        }
+    };
+    // Named pattern, default severity (High), executable-scoped
+    ($name:literal, $re:literal, $reason:literal, executables = [$($exe:literal),+ $(,)?]) => {
+        $crate::packs::DestructivePattern {
+            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            reason: $reason,
+            name: Some($name),
+            severity: $crate::packs::Severity::High,
+            explanation: None,
+            suggestions: &[],
+            executables: Some(&[$($exe),+]),
+        }
+    };
+    // Named pattern with explicit severity, executable-scoped
+    ($name:literal, $re:literal, $reason:literal, $severity:ident, executables = [$($exe:literal),+ $(,)?]) => {
+        $crate::packs::DestructivePattern {
+            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            reason: $reason,
+            name: Some($name),
+            severity: $crate::packs::Severity::$severity,
+            explanation: None,
+            suggestions: &[],
+            executables: Some(&[$($exe),+]),
+        }
+    };
+    // Named pattern with explicit severity and explanation, executable-scoped
+    ($name:literal, $re:literal, $reason:literal, $severity:ident, $explanation:literal, executables = [$($exe:literal),+ $(,)?]) => {
+        $crate::packs::DestructivePattern {
+            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            reason: $reason,
+            name: Some($name),
+            severity: $crate::packs::Severity::$severity,
+            explanation: Some($explanation),
+            suggestions: &[],
+            executables: Some(&[$($exe),+]),
+        }
+    };
+    // Named pattern with severity, explanation, and suggestions, executable-scoped
+    ($name:literal, $re:literal, $reason:literal, $severity:ident, $explanation:literal, $suggestions:expr, executables = [$($exe:literal),+ $(,)?]) => {
+        $crate::packs::DestructivePattern {
+            regex: $crate::packs::regex_engine::LazyCompiledRegex::new($re),
+            reason: $reason,
+            name: Some($name),
+            severity: $crate::packs::Severity::$severity,
+            explanation: Some($explanation),
+            suggestions: $suggestions,
+            executables: Some(&[$($exe),+]),
+        }
+    };
+
+    // ---- unscoped variants (executables: None) ---------------------------
+
     // Unnamed pattern, default severity (High)
     ($re:literal, $reason:literal) => {
         $crate::packs::DestructivePattern {
@@ -348,6 +429,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::High,
             explanation: None,
             suggestions: &[],
+            executables: None,
         }
     };
     // Named pattern, default severity (High)
@@ -359,6 +441,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::High,
             explanation: None,
             suggestions: &[],
+            executables: None,
         }
     };
     // Named pattern with explicit severity
@@ -370,6 +453,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: None,
             suggestions: &[],
+            executables: None,
         }
     };
     // Named pattern with explicit severity and explanation
@@ -381,6 +465,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: Some($explanation),
             suggestions: &[],
+            executables: None,
         }
     };
     // Named pattern with explicit severity, explanation, and suggestions
@@ -392,6 +477,7 @@ macro_rules! destructive_pattern {
             severity: $crate::packs::Severity::$severity,
             explanation: Some($explanation),
             suggestions: $suggestions,
+            executables: None,
         }
     };
 }

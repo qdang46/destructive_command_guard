@@ -117,7 +117,10 @@ rule_id = "core.git:branch-force-delete"
 description = "unresolved POSIX output cannot occupy a branch option role"
 command = "git branch $(branch_option_producer)"
 expected = "deny"
-rule_id = "core.git:branch-force-delete"
+# Re-attributed in #274: the proof is the unresolvable dynamic token, not a
+# literal deletion flag, so the denial explains the field-splitting hazard
+# and its safe spellings (quote the name, or add `--`).
+rule_id = "core.git:branch-dynamic-token"
 
 [[case]]
 description = "literal POSIX substitutions cannot splice reset hard"

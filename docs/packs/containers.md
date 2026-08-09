@@ -105,7 +105,7 @@ These patterns match safe commands that are always allowed:
 | `compose-up` | `(?:docker-compose\|docker\s+compose)\s+up` |
 | `compose-build` | `(?:docker-compose\|docker\s+compose)\s+build` |
 | `compose-pull` | `(?:docker-compose\|docker\s+compose)\s+pull` |
-| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose)\s+down(?!\s+.*(?:-v\b\|--volumes\|--rmi))` |
+| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose)\s+(?:-[^\s;\|&`()<>]*\s+(?:[^\s;\|&`()<>-][^\s;\|&`()<>]*\s+)?)*down(?!\s+.*(?:-[vt]*v[vt]*\b\|--volumes\|--rmi))(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

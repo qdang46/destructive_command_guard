@@ -43,7 +43,9 @@ use dcg_cli::packs::load_external_packs;
 #[cfg(test)]
 use dcg_cli::packs::pack_aware_quick_reject;
 use dcg_cli::packs::{DecisionMode, EnabledKeywordIndex, REGISTRY};
-use dcg_cli::pending_exceptions::{PendingExceptionStore, log_maintenance};
+use dcg_cli::pending_exceptions::{
+    MaintenanceRecheck, PendingExceptionStore, PersistBudget, log_maintenance,
+};
 use dcg_cli::perf::{Deadline, HOOK_EVALUATION_BUDGET};
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
@@ -160,6 +162,29 @@ fn effective_agent_for_hook_protocol(
     }
 }
 
+/// Maximum time the deny path may wait for the pending-exceptions store lock
+/// before emitting its denial without an allow-once code (issue #291).
+///
+/// Wide enough that a short burst of concurrent hook denials (each holding
+/// the lock for a scan + append + fsync) still gets codes, while a wedged or
+/// long-held lock degrades to a code-less denial well inside the 1000ms
+/// evaluation budget instead of stalling the protocol response indefinitely.
+const ALLOW_ONCE_LOCK_WAIT: Duration = Duration::from_millis(150);
+
+/// Minimum remaining deadline budget required before the deny path lets the
+/// pending-exceptions store run maintenance (full scan + prune/archive
+/// rewrite) while recording a block (issue #291).
+const ALLOW_ONCE_MAINTENANCE_MIN_BUDGET: Duration = Duration::from_millis(250);
+
+/// Minimum remaining deadline budget required before hook mode runs the
+/// settings.json self-heal check (issue #293).
+///
+/// Sized just above the self-heal advisory lock's own bounded wait (5 attempts
+/// × 10ms) plus the read/parse/rename it guards, so a deliberately tight
+/// `general.hook_timeout_ms` spends its budget on evaluation rather than on
+/// housekeeping. Self-heal is idempotent and reruns on the next invocation.
+const SELF_HEAL_MIN_BUDGET: Duration = Duration::from_millis(60);
+
 const INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
 const INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
 
@@ -252,6 +277,204 @@ fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
     }
 }
 
+/// Overlap between consecutive scan windows of an over-limit command, so a
+/// destructive command that straddles a window boundary is still wholly
+/// contained in the next window. 4 KiB comfortably exceeds any realistic
+/// single shell command.
+const OVERSIZED_SCAN_WINDOW_OVERLAP: usize = 4 * 1024;
+
+/// Hard cap on the number of scan windows produced from one extracted
+/// command. With the 4 MiB scan buffer and the 64 KiB default command limit
+/// this is never reached; it exists so an exotic configuration cannot turn
+/// the fail-open path into an unbounded loop.
+const OVERSIZED_SCAN_MAX_WINDOWS: usize = 128;
+
+/// Slice `command` into evaluable, overlapping windows and append them to
+/// `out`.
+///
+/// A command within the limit contributes itself unchanged. Empty windows are
+/// dropped. Windows always start and end on char boundaries.
+fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command_bytes: usize) {
+    if command.is_empty() || max_command_bytes == 0 {
+        return;
+    }
+    if command.len() <= max_command_bytes {
+        out.push(command.to_string());
+        return;
+    }
+
+    let stride = max_command_bytes
+        .saturating_sub(OVERSIZED_SCAN_WINDOW_OVERLAP)
+        .max(1);
+    let mut start = 0usize;
+    for _ in 0..OVERSIZED_SCAN_MAX_WINDOWS {
+        if start >= command.len() {
+            break;
+        }
+        let mut begin = start;
+        while begin < command.len() && !command.is_char_boundary(begin) {
+            begin += 1;
+        }
+        let mut end = (begin + max_command_bytes).min(command.len());
+        while end > begin && !command.is_char_boundary(end) {
+            end -= 1;
+        }
+        if begin < end {
+            out.push(command[begin..end].to_string());
+        }
+        if end >= command.len() {
+            break;
+        }
+        start += stride;
+    }
+}
+
+/// Best-effort evaluation of an oversized hook payload's truncated prefix
+/// (issue #290).
+///
+/// Padding a destructive command past `max_hook_input_bytes` used to skip
+/// every pack: the oversized input failed open (by default) without any
+/// evaluation. The JSON prefix that WAS read usually still contains
+/// `tool_input.command`, so extract it leniently and run it through the
+/// normal evaluation pipeline. A proven Deny/Ask publishes the ordinary
+/// protocol response and returns `true`; every other outcome — nothing
+/// extractable, benign command, warn/log match, deadline exhausted — returns
+/// `false` so the caller keeps the historic fail-open warning path.
+///
+/// Two attribution rules keep this from over-denying and from under-scanning:
+/// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName`).
+///   An oversized `Write`/`Read` envelope that happens to carry a
+///   command-shaped field is not a shell request and must fail open; so does
+///   a prefix with no tool name at all — dcg never denies what it cannot
+///   attribute to a shell.
+/// - EVERY `"command"` occurrence in the prefix is evaluated, not just the
+///   first: `serde_json` is last-wins on duplicate keys and an earlier
+///   unrelated object can carry a decoy, so judging one occurrence would let
+///   a benign decoy suppress the real command.
+///
+/// Only called under fail-open; fail-closed oversized input still denies
+/// unconditionally in `handle_unparseable_hook_input` (issue #160).
+#[allow(clippy::too_many_arguments)]
+fn try_deny_oversized_input(
+    config: &Config,
+    detected_agent: &Agent,
+    prefix: &str,
+    deadline: &Deadline,
+    compiled_overrides: &CompiledOverrides,
+    heredoc_settings: &HeredocSettings,
+    external_store: &dcg_cli::packs::ExternalPackStore,
+) -> bool {
+    // Attribute the payload to a shell tool before evaluating anything. The
+    // dialect comes from the same mapping the normal parsed path uses.
+    let Some((_tool_name, shell_dialect)) = hook::shell_tool_from_truncated_json(prefix) else {
+        return false;
+    };
+
+    // The padding may live INSIDE the command string (the issue's repro
+    // shape), either before or after the destructive part. Evaluating an
+    // over-limit command outright would be refused as oversized, so slice it
+    // into overlapping evaluable windows instead of keeping only the leading
+    // prefix: padding-then-destructive is exactly as easy to write as
+    // destructive-then-padding.
+    let max_command_bytes = config.general.max_command_bytes();
+    let mut commands: Vec<String> = Vec::new();
+    for command in hook::extract_commands_from_truncated_json(prefix) {
+        push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
+    }
+    if commands.is_empty() {
+        return false;
+    }
+
+    // No parsed payload exists, so protocol detection falls back to the
+    // env/process-detected agent (same rule as the fail-closed deny path).
+    let hook_protocol = hook_protocol_for_agent(detected_agent);
+    let effective_agent = effective_agent_for_hook_protocol(hook_protocol, detected_agent);
+    let history_agent_type = history_agent_type_for_protocol(hook_protocol, detected_agent);
+
+    let allowlists = load_effective_allowlists_for_agent(config, &effective_agent);
+    let mut enabled_packs: HashSet<String> = config.enabled_pack_ids_for_agent(&effective_agent);
+    for id in external_store.pack_ids() {
+        enabled_packs.insert(id.clone());
+    }
+    remove_disabled_packs_for_agent(&mut enabled_packs, config, &effective_agent);
+
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    enabled_keywords.extend(external_store.keywords().iter().copied());
+    let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    for id in external_store.pack_ids() {
+        if !ordered_packs.contains(id) {
+            ordered_packs.push(id.clone());
+        }
+    }
+    let keyword_index = if external_store.pack_ids().next().is_some() {
+        None
+    } else {
+        REGISTRY.build_enabled_keyword_index(&ordered_packs)
+    };
+
+    let cwd_path = std::env::current_dir().ok();
+    let working_dir = cwd_path.as_ref().map_or_else(
+        || "<unknown>".to_string(),
+        |path| path.to_string_lossy().to_string(),
+    );
+
+    let eval_context = HookEvalContext {
+        config,
+        enabled_keywords: &enabled_keywords,
+        ordered_packs: &ordered_packs,
+        keyword_index: keyword_index.as_ref(),
+        compiled_overrides,
+        allowlists: &allowlists,
+        heredoc_settings,
+        cwd_path: cwd_path.as_deref(),
+        working_dir: &working_dir,
+        deadline,
+        hook_protocol,
+        history_agent_type,
+        max_command_bytes,
+    };
+
+    // History is deliberately not passed to resolve: the fail-open fallback
+    // records its own audit row in `handle_unparseable_hook_input`, and a
+    // refused payload must not provoke history-writer construction (worker
+    // thread + database) unless a denial is actually published.
+    // Deny if ANY extracted occurrence (or scan window) resolves decisively;
+    // a benign decoy ahead of the real command must not be able to end the
+    // scan. Bail out as soon as the deadline is gone — an exhausted budget
+    // means fail-open, exactly as before.
+    for command in &commands {
+        if deadline.is_exceeded() {
+            break;
+        }
+        // Windows made of pure padding carry no enabled keyword; skipping
+        // them keeps the multi-window scan a substring search per megabyte
+        // rather than a full evaluation per window.
+        if dcg_cli::packs::pack_aware_quick_reject(command, &enabled_keywords) {
+            continue;
+        }
+        let outcome = resolve_hook_command(&eval_context, command, shell_dialect, None);
+        if let ResolvedCommandOutcome::DenyFamily(resolved) = outcome {
+            if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) {
+                let mut history_writer = if config.history.enabled {
+                    let mut writer =
+                        HistoryWriter::new(history_db_path(&config.history), &config.history);
+                    writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                    Some(writer)
+                } else {
+                    None
+                };
+                publish_decisive_response(
+                    &eval_context,
+                    ResolvedCommandOutcome::DenyFamily(resolved),
+                    &mut history_writer,
+                );
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn handle_unparseable_hook_input(
     config: &Config,
     detected_agent: &Agent,
@@ -265,7 +488,7 @@ fn handle_unparseable_hook_input(
     // malformed payloads.
     let blockable = matches!(
         read_err,
-        hook::HookReadError::Json(_) | hook::HookReadError::InputTooLarge(_)
+        hook::HookReadError::Json(_) | hook::HookReadError::InputTooLarge { .. }
     );
     let block = blockable && config.is_fail_closed();
 
@@ -303,7 +526,7 @@ fn handle_unparseable_hook_input(
         // operator can see why a large command was allowed; other errors warn
         // only under verbose.
         match read_err {
-            hook::HookReadError::InputTooLarge(len) => {
+            hook::HookReadError::InputTooLarge { len, .. } => {
                 eprintln!(
                     "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
                 );
@@ -322,7 +545,7 @@ fn handle_unparseable_hook_input(
     // cannot run protocol detection, so derive the protocol from the
     // env/process-detected agent.
     let protocol = hook_protocol_for_agent(detected_agent);
-    let reason = if matches!(read_err, hook::HookReadError::InputTooLarge(_)) {
+    let reason = if matches!(read_err, hook::HookReadError::InputTooLarge { .. }) {
         "BLOCKED by dcg: the hook input exceeds the size limit and cannot be evaluated; \
          DCG_FAIL_CLOSED is set (fail-closed mode)."
     } else {
@@ -857,22 +1080,55 @@ fn publish_decisive_response(
                 _ => info.reason.clone(),
             };
 
+            // Allow-once code issuance is best-effort and must never delay the
+            // protocol denial (issue #291): the store lock is acquired with a
+            // small bounded wait, maintenance rewrites are skipped when the
+            // deadline budget is low, and persistence is skipped entirely once
+            // the deadline is exhausted. On contention/failure the denial is
+            // emitted WITHOUT a code — the block always stands.
             let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
-            if let Ok((record, maintenance)) = store.record_block(
-                &command,
-                ctx.working_dir,
-                &reason,
-                &ctx.config.logging.redaction,
-                false,
-                Some(format!("{:?}", info.source)),
-                None,
-            ) {
-                allow_once_info = Some(hook::AllowOnceInfo {
-                    code: record.short_code,
-                    full_hash: record.full_hash,
-                });
-                if let Some(log_file) = ctx.config.general.log_file.as_deref() {
-                    let _ = log_maintenance(log_file, maintenance, "record_block");
+            let remaining = ctx.deadline.remaining().unwrap_or(Duration::ZERO);
+            if !remaining.is_zero() {
+                let budget = PersistBudget {
+                    lock_wait: remaining.min(ALLOW_ONCE_LOCK_WAIT),
+                    allow_maintenance: remaining > ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
+                    // `remaining` was measured BEFORE a lock wait of up to
+                    // ALLOW_ONCE_LOCK_WAIT; re-derive the decision from the
+                    // live deadline once the lock is actually held.
+                    maintenance_recheck: Some(MaintenanceRecheck {
+                        deadline: *ctx.deadline,
+                        min_budget: ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
+                    }),
+                };
+                match store.record_block_bounded(
+                    &command,
+                    ctx.working_dir,
+                    &reason,
+                    &ctx.config.logging.redaction,
+                    false,
+                    Some(format!("{:?}", info.source)),
+                    None,
+                    budget,
+                ) {
+                    Ok(Some((record, maintenance))) => {
+                        allow_once_info = Some(hook::AllowOnceInfo {
+                            code: record.short_code,
+                            full_hash: record.full_hash,
+                        });
+                        if let Some(log_file) = ctx.config.general.log_file.as_deref() {
+                            let _ = log_maintenance(log_file, maintenance, "record_block");
+                        }
+                    }
+                    // Lock stayed contended: denial is emitted without a code.
+                    Ok(None) => {}
+                    // A store error (notably the MAX_PENDING_BYTES hard cap)
+                    // used to be swallowed, so allow-once issuance could stop
+                    // silently and permanently. The block still stands; say so.
+                    Err(e) => {
+                        eprintln!(
+                            "[dcg] Warning: could not record an allow-once code for this block ({e}); the block still stands."
+                        );
+                    }
                 }
             }
 
@@ -1080,10 +1336,37 @@ fn main() {
         return;
     }
 
+    // Read hook input FIRST, before the deadline starts: how long the client
+    // takes to write stdin is outside dcg's control and must not eat the
+    // evaluation budget (a client that spawns the hook and writes the payload
+    // late would otherwise start every evaluation near-exhausted).
+    let max_input_bytes = config.general.max_hook_input_bytes();
+    let hook_read = hook::read_hook_input(max_input_bytes);
+
+    // Start the evaluation deadline immediately after the input read so that
+    // EVERYTHING dcg does on its own clock — self-heal, external pack
+    // loading, and evaluation — is bounded by `hook_timeout_ms` (issue #293;
+    // both stages previously ran before `Deadline::new` and were unbounded).
+    // Enforce a minimum timeout so a zero-valued override cannot force every
+    // hook request immediately into the conservative indeterminate path.
+    let deadline = Deadline::new(Duration::from_millis(config.effective_hook_timeout_ms()));
+
     // Self-heal: verify the DCG hook is still registered in settings.json.
     // Claude Code can silently overwrite settings.json mid-session, removing the hook.
     // This re-registers it automatically (fail-open: errors are logged, never fatal).
-    if config.general.self_heal_hook {
+    //
+    // Skipped when the whole budget is smaller than self-heal's own worst case
+    // (SELF_HEAL_MIN_BUDGET): a repair can spend up to the advisory lock's
+    // bounded wait before it even writes, so running it under a tighter
+    // deadline would spend the entire evaluation window on housekeeping. The
+    // deadline is never already *exhausted* here — it starts a few statements
+    // above and MIN_HOOK_TIMEOUT_MS clamps it above zero — so the guard is a
+    // budget floor, not an exhaustion check. Skipping is safe: the check
+    // reruns on the next invocation.
+    let self_heal_budget_ok = deadline
+        .remaining()
+        .is_none_or(|remaining| remaining >= SELF_HEAL_MIN_BUDGET);
+    if config.general.self_heal_hook && self_heal_budget_ok {
         cli::ensure_hook_registered();
     }
 
@@ -1098,16 +1381,15 @@ fn main() {
     let external_paths = config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
 
-    // Log warnings from external pack loading (fail-open: don't block on warnings).
-    if config.general.verbose {
-        for warning in external_store.warnings() {
-            eprintln!("[dcg] Warning: {warning}");
-        }
+    // Surface external pack load FAILURES unconditionally (issue #293): a
+    // broken custom pack file silently dropped its coverage when this was
+    // verbose-only. The store only records warnings on failures, so success
+    // stays silent — one stderr line per broken file.
+    for warning in external_store.warnings() {
+        eprintln!("[dcg] Warning: {warning}");
     }
 
-    // Read and parse input
-    let max_input_bytes = config.general.max_hook_input_bytes();
-    let hook_input = match hook::read_hook_input(max_input_bytes) {
+    let hook_input = match hook_read {
         Ok(input) => input,
         Err(read_err) => {
             // Malformed, oversized, or unreadable hook input. The default is
@@ -1116,15 +1398,31 @@ fn main() {
             // when fail-closed mode is enabled — including oversized input,
             // which is attacker-controllable (issue #160). Routing oversized
             // input through the same handler is what closes the size-bypass.
+            //
+            // Oversized input under fail-open first gets a best-effort
+            // evaluation of the truncated prefix that WAS read (issue #290):
+            // padding a destructive command past the size limit must not skip
+            // every pack. A proven deny/ask on the embedded command emits the
+            // normal protocol response; anything else keeps fail-open.
+            if !config.is_fail_closed() {
+                if let hook::HookReadError::InputTooLarge { prefix, .. } = &read_err {
+                    if try_deny_oversized_input(
+                        &config,
+                        &detected_agent,
+                        prefix,
+                        &deadline,
+                        &compiled_overrides,
+                        &heredoc_settings,
+                        external_store,
+                    ) {
+                        return;
+                    }
+                }
+            }
             handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
             return;
         }
     };
-
-    // Start evaluation deadline after input size checks (includes evaluation).
-    // Enforce a minimum timeout so a zero-valued override cannot force every
-    // hook request immediately into the conservative indeterminate path.
-    let deadline = Deadline::new(Duration::from_millis(config.effective_hook_timeout_ms()));
 
     let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
         return;

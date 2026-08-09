@@ -73,6 +73,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         // chmod 777 (world writable)
+        // These patterns use unbounded .* gap-matchers, so on a full command
+        // line they could pair a flag or path from a *different* command in a
+        // chain (`chmod 600 f && grep -rn …`, issue #287). The evaluator
+        // therefore scopes this pack to per-segment evaluation: full-command
+        // matches whose span crosses a segment boundary are discarded (see
+        // SEGMENT_SCOPED_PACKS in evaluator.rs). A character-class bound like
+        // [^;&|]* is NOT equivalent — it matches newlines (still cross-command)
+        // and breaks on separators inside quotes or $() (false negatives).
         destructive_pattern!(
             "chmod-777",
             r#"chmod\s+(?:.*\s+)?["'=]?0*777(?:[\s"']|$)"#,
@@ -81,7 +89,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "chmod 777 grants read/write/execute to everyone. This can expose sensitive \
              files and allow unauthorized modification. Prefer least-privilege permissions \
              that only grant the specific access needed.",
-            CHMOD_777_SUGGESTIONS
+            CHMOD_777_SUGGESTIONS,
+            executables = ["chmod"]
         ),
         // chmod -R on root or system directories
         // `['"]?` before the leading `/` so quoted variants like
@@ -96,7 +105,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              system files require specific permission bits to function correctly.\n\n\
              Check current permissions first:\n  \
              ls -la /path/to/directory\n\n\
-             Apply changes to a specific subdirectory instead of the whole tree."
+             Apply changes to a specific subdirectory instead of the whole tree.",
+            executables = ["chmod"]
         ),
         // chown -R on root or system directories
         destructive_pattern!(
@@ -107,7 +117,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             "Recursive ownership changes on system directories can disrupt services, \
              break package-managed files, and be difficult to undo. Start with a single \
              path or a shallow find before applying broader changes.",
-            CHOWN_RECURSIVE_SUGGESTIONS
+            CHOWN_RECURSIVE_SUGGESTIONS,
+            executables = ["chown"]
         ),
         // chmod u+s (setuid)
         destructive_pattern!(
@@ -121,7 +132,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Verify the file and owner first:\n  \
              ls -la <file>\n\n\
              Find existing setuid files:\n  \
-             find / -perm -4000 -type f 2>/dev/null"
+             find / -perm -4000 -type f 2>/dev/null",
+            executables = ["chmod"]
         ),
         // chmod g+s (setgid)
         destructive_pattern!(
@@ -135,7 +147,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check current group ownership:\n  \
              ls -la <file>\n\n\
              Find existing setgid files:\n  \
-             find / -perm -2000 -type f 2>/dev/null"
+             find / -perm -2000 -type f 2>/dev/null",
+            executables = ["chmod"]
         ),
         // chown to root
         destructive_pattern!(
@@ -149,7 +162,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check who currently owns the file:\n  \
              ls -la <path>\n\n\
              Consider using group ownership instead:\n  \
-             chgrp <group> <path>"
+             chgrp <group> <path>",
+            executables = ["chown"]
         ),
         // setfacl with dangerous patterns
         destructive_pattern!(
@@ -164,7 +178,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Review current ACLs first:\n  \
              getfacl <path>\n\n\
              Apply to a specific file instead of recursively:\n  \
-             setfacl -m u:<user>:rwx <specific-file>"
+             setfacl -m u:<user>:rwx <specific-file>",
+            executables = ["setfacl"]
         ),
     ]
 }
@@ -236,5 +251,35 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo hello");
+    }
+
+    /// Issue #287: separators inside quotes or command substitutions are not
+    /// segment boundaries, and the pack regexes must keep matching across
+    /// them. Cross-segment suppression happens in the evaluator
+    /// (`SEGMENT_SCOPED_PACKS`), not in these regexes — a character-class
+    /// bound here would match newlines and break on quoted separators.
+    #[test]
+    fn quoted_and_substituted_separators_do_not_break_matches_issue_287() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "chmod -R $(cat modes.txt | head -1) /etc",
+            "chmod-recursive-root",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "chmod -R --reference=\"/opt/a&b\" /etc",
+            "chmod-recursive-root",
+        );
+        assert_blocks_with_pattern(&pack, "chown -R \"u;g\" /etc", "chown-recursive-root");
+        assert_blocks_with_pattern(
+            &pack,
+            "setfacl -R -m \"u:$(id -un | tr -d ' '):rwx\" /etc",
+            "setfacl-all",
+        );
+        // Single-segment matches unchanged.
+        assert_blocks_with_pattern(&pack, "chmod -R 755 /etc", "chmod-recursive-root");
+        assert_blocks_with_pattern(&pack, "chown -R user:group /var", "chown-recursive-root");
+        assert_blocks_with_pattern(&pack, "setfacl -R -m u:app:rwx /etc", "setfacl-all");
     }
 }

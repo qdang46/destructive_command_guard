@@ -11365,7 +11365,458 @@ pub fn evaluate_command_with_pack_order_deadline_at_path_in_dialect(
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
+/// Shell reserved words that may precede the command word inside a compound
+/// construct's segment (dcg#289 C2).
+///
+/// `split_command_segments` splits on operators only, so the body of a loop or
+/// conditional arrives as `do dcg test …` / `then dcg explain …`. These words
+/// are reserved in the grammar — bash cannot execute a program named `do` in
+/// that position — so skipping them cannot let a real executable be mistaken
+/// for dcg. The keyword itself is left unmasked so constructs that reason
+/// about loop/branch shape still see it.
+const SEGMENT_LEADING_SHELL_KEYWORDS: &[&str] =
+    &["do", "then", "else", "elif", "if", "while", "until", "{"];
+
+/// Upper bound on stacked reserved words before a command word (`then { dcg …`).
+const MAX_SEGMENT_LEADING_KEYWORDS: usize = 4;
+
+/// Blank out the text of every top-level segment that is itself a dcg
+/// self-inspection call (dcg#289 C2).
+///
+/// Masking is length-preserving (spaces, matching
+/// [`crate::context::sanitize_for_pattern_matching`]) so every match span,
+/// highlight offset, and per-segment range computed downstream stays valid.
+///
+/// Three restrictions keep this an exemption and not a bypass:
+///
+/// 1. **Whole-segment match only.** The segment (after any leading reserved
+///    word) must satisfy [`crate::allowlist::is_dcg_self_inspection_segment`],
+///    which requires a dcg executable, a diagnostic subcommand, and no
+///    redirect, substitution, backtick, or subshell anywhere inside it.
+/// 2. **Top-level only.** Segments that `split_command_segments` emitted from
+///    inside a command/process substitution are contained in an enclosing
+///    segment's range and skipped by the containment check.
+/// 3. **Never a pipeline member.** A `dcg test` on either side of a real `|`
+///    pipe feeds or receives live data from another executing command, so its
+///    candidate text is not inert.
+fn mask_dcg_self_inspection_segments(command: &str) -> Cow<'_, str> {
+    // Cheap gate: skip the split work unless the binary name appears.
+    if !command.contains("dcg") && !command.contains("destructive_command_guard") {
+        return Cow::Borrowed(command);
+    }
+
+    let ranges = command_segment_ranges(command);
+    if ranges.len() < 2 {
+        // A single segment is either the whole-command exemption (already
+        // handled) or not a diagnostic at all.
+        return Cow::Borrowed(command);
+    }
+
+    let mut masked: Option<String> = None;
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        // Restriction 2: skip segments nested inside another segment's range.
+        if ranges
+            .iter()
+            .enumerate()
+            .any(|(other, &(other_start, other_end))| {
+                other != index && other_start <= start && end <= other_end
+            })
+        {
+            continue;
+        }
+        // Restriction 3: never mask a member of a pipeline.
+        if segment_is_pipeline_member(command, start, end) {
+            continue;
+        }
+        // Restriction 1: whole-segment dcg diagnostic.
+        let Some(offset) = dcg_inspection_offset_in_segment(&command[start..end]) else {
+            continue;
+        };
+        let mask_start = start + offset;
+        let buffer = masked.get_or_insert_with(|| command.to_string());
+        buffer.replace_range(mask_start..end, &" ".repeat(end - mask_start));
+    }
+
+    masked.map_or(Cow::Borrowed(command), Cow::Owned)
+}
+
+/// Returns the byte offset within `segment` at which a dcg self-inspection call
+/// starts, skipping any leading shell reserved words, or `None` when the
+/// segment is not one.
+fn dcg_inspection_offset_in_segment(segment: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for _ in 0..=MAX_SEGMENT_LEADING_KEYWORDS {
+        let rest = &segment[offset..];
+        if crate::allowlist::is_dcg_self_inspection_segment(rest) {
+            return Some(offset);
+        }
+        let leading_space = rest.len() - rest.trim_start().len();
+        let trimmed = &rest[leading_space..];
+        let word_end = trimmed.find(char::is_whitespace)?;
+        if !SEGMENT_LEADING_SHELL_KEYWORDS.contains(&&trimmed[..word_end]) {
+            return None;
+        }
+        offset += leading_space + word_end;
+    }
+    None
+}
+
+/// Returns `true` when the segment at `start..end` is on either side of a `|`
+/// pipe (as opposed to a `||` logical-or), i.e. its output feeds — or its input
+/// comes from — another executing command.
+fn segment_is_pipeline_member(command: &str, start: usize, end: usize) -> bool {
+    let bytes = command.as_bytes();
+
+    let mut after = end;
+    while bytes.get(after).is_some_and(u8::is_ascii_whitespace) {
+        after += 1;
+    }
+    if bytes.get(after) == Some(&b'|') && bytes.get(after + 1) != Some(&b'|') {
+        return true;
+    }
+
+    let mut before = start;
+    while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+        before -= 1;
+    }
+    before > 0 && bytes[before - 1] == b'|' && (before < 2 || bytes[before - 2] != b'|')
+}
+
+/// Evaluate a command, fanning out across dialects when the caller could not
+/// prove one (dcg#294).
+///
+/// Under [`ShellDialect::Unknown`] — what every generic terminal adapter and the
+/// CLI default supply — the regex packs used to see a single POSIX-normalized
+/// view, so a payload that is inert under POSIX quoting but destructive under
+/// cmd.exe or PowerShell quoting passed every pack. The per-dialect union with
+/// deny-wins combination existed only inside the hand-written semantic decoders.
+///
+/// The fan-out here restores fail-closed behavior for the generic path: when the
+/// POSIX-shaped view of an unknown-dialect command allows, the same evaluation is
+/// replayed under the concrete Cmd and PowerShell dialects and a deny or warn
+/// from either is adopted. Polarity is deny-wins only — the extra views can add
+/// a finding but can never clear one, and a POSIX deny short-circuits before
+/// they run. Each replay is a full evaluation at the replayed dialect, so a
+/// finding carries exactly the rule id `--dialect cmd` / `--dialect ps` would
+/// report for the same command.
+///
+/// Two guards keep the cost bounded and the polarity honest:
+/// [`unknown_dialect_fanout_candidate`] requires a dialect-divergent byte plus a
+/// live enabled-pack keyword before any replay runs at all, and each replay
+/// additionally requires [`dialect_view_may_expose_hidden_execution`] so that a
+/// dialect's quote-blindness can only add a deny when its parse exposes an
+/// execution POSIX could not see, never when it merely reveals quoted argument
+/// text as command-shaped bytes.
+///
+/// Recursion is impossible: the replays pass a concrete dialect, and the
+/// fan-out is confined to top-level evaluation (`nested_command_depth == 0`).
+/// Nested envelopes — launcher payloads, heredoc bodies, command
+/// substitutions — keep their existing single-view behavior under whichever
+/// dialect the enclosing view established.
+/// Bytes whose shell meaning differs between the dialects dcg models, and which
+/// can therefore make one dialect's parse of a command structurally different
+/// from another's (dcg#294).
+///
+/// * `'` / `"` — POSIX and PowerShell quoting vs. cmd.exe, where `'` is an
+///   ordinary argv byte and an unbalanced quote does not swallow the rest of
+///   the line.
+/// * `^` — cmd.exe's escape character; inert elsewhere.
+/// * `` ` `` — PowerShell's escape character and POSIX command substitution.
+/// * `%` — cmd.exe variable expansion.
+/// * `&` / `|` — command separators whose reach depends on which quoting rules
+///   delimit them, and which a POSIX backslash escape neutralizes while cmd.exe
+///   and PowerShell keep them live.
+///
+/// `;` is deliberately absent. POSIX and PowerShell both split on it and
+/// cmd.exe does not, so relative to the POSIX view the only structural effect a
+/// bare `;` can have is to *merge* segments under Cmd — which can manufacture
+/// cross-segment false positives but can never expose a command the POSIX view
+/// masked. A `;` that is dialect-relevant because it sits next to quoting is
+/// already covered by the quote bytes.
+const DIALECT_DIVERGENT_BYTES: [u8; 7] = *b"'\"^`%&|";
+
+/// Cheap pre-signal for the unknown-dialect fan-out (dcg#294).
+///
+/// Returns `true` only when a second dialect's parse could plausibly differ
+/// from the POSIX one *and* the raw command still mentions an enabled-pack
+/// keyword. Both halves are byte scans over the raw string: the fast path
+/// (a benign command with no quoting or separators, or one that names nothing
+/// any enabled pack protects) never pays for the extra views.
+///
+/// The keyword half is deliberately evaluated against the *raw* command rather
+/// than any normalized view: masking and normalization are exactly the
+/// dialect-dependent steps the fan-out exists to re-run, so gating on their
+/// output would re-introduce the bug. When no keyword index is available the
+/// keyword half is skipped (fail-closed: the fan-out still runs).
+fn unknown_dialect_fanout_candidate(
+    command: &str,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+) -> bool {
+    if !command
+        .as_bytes()
+        .iter()
+        .any(|byte| DIALECT_DIVERGENT_BYTES.contains(byte))
+    {
+        return false;
+    }
+    keyword_index.is_none_or(|index| {
+        index.has_any_keyword(command)
+            // A dialect-only escape can hide the keyword itself, not just a
+            // separator: `doc^ker system prune -af` names no enabled-pack
+            // keyword until cmd.exe removes the caret (dcg#294). Ask each
+            // replay view's own decode before concluding the command is inert.
+            || [ShellDialect::Cmd, ShellDialect::PowerShell]
+                .into_iter()
+                .any(|view| view_decode_exposes_pack_keyword(command, view, Some(index)))
+    })
+}
+
+/// Whether `view`'s own decode of `command` reveals an enabled-pack keyword
+/// that the raw text does not (dcg#294).
+///
+/// This is the intra-segment counterpart to
+/// [`view_exposes_extra_command_segments`]. A cmd.exe caret or a PowerShell
+/// backtick can split an executable word without adding any separator, so the
+/// raw text names nothing a pack protects while the dialect's own view runs
+/// `docker system prune -af`. The normalized view a replay would actually match
+/// on is the authority on that, so ask it directly.
+///
+/// Cost is bounded to commands that already carry the view's escape byte: the
+/// caller has proven a dialect-divergent byte is present, and the extra
+/// normalize runs only when that byte is this view's own escape character *and*
+/// the raw text names no keyword. A benign `echo he^llo` decodes to `echo
+/// hello`, which still names nothing, so it never reaches a replay.
+fn view_decode_exposes_pack_keyword(
+    command: &str,
+    view: ShellDialect,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+) -> bool {
+    let escapes: &[char] = match view {
+        ShellDialect::Cmd => &['^', '%'],
+        ShellDialect::PowerShell => &['`'],
+        ShellDialect::Posix | ShellDialect::Unknown => return false,
+    };
+    // The escape must sit in an *executable* position. A caret or backtick
+    // inside quoted argument data is an inert byte that no shell removes from
+    // the executable word — `printf '%s\n' 'doc^ker system prune -af'` prints a
+    // string in every dialect. Treating one there as evidence would import the
+    // decoded view's own false positives into the default unknown-dialect path,
+    // so reuse the same quoted-data classification the rest of the evaluator
+    // uses. Real obfuscation (`doc^ker system prune -af`) keeps the escape
+    // unquoted and still triggers the replay.
+    let view_escape_present = command.char_indices().any(|(offset, ch)| {
+        escapes.contains(&ch) && !crate::context::offset_is_quoted_data(command, offset)
+    });
+    if !view_escape_present {
+        return false;
+    }
+    let view_normalized = crate::normalize::normalize_command_in_dialect(command, view);
+    let Some(index) = keyword_index else {
+        // No index to ask, so fail closed exactly like the candidate gate's
+        // keyword half does: replay whenever this view's normalized text
+        // differs from the POSIX one, because that difference is the only
+        // thing that could have reconstructed an executable.
+        return view_normalized
+            != crate::normalize::normalize_command_in_dialect(command, ShellDialect::Posix);
+    };
+    if index.has_any_keyword(command) {
+        return false;
+    }
+    index.has_any_keyword(view_normalized.as_ref())
+}
+
+/// Whether `view`'s parse of `command` exposes command segments the POSIX parse
+/// does not (dcg#294).
+///
+/// This is the divergence that can actually hide an execution: POSIX quoting or
+/// escaping swallowing a separator the other dialect honors, so
+/// `echo 'ok & docker system prune -af` is one `echo` under POSIX but two
+/// commands under cmd.exe.
+///
+/// The complementary direction is deliberately *not* a trigger. A dialect
+/// reading quoted bytes as ordinary argv text inside a single segment cannot
+/// execute anything the POSIX view failed to see as a command; it only makes
+/// argument data look like command text, which is the false-positive direction
+/// (`git commit -m 'fix: do not rm -rf root'` is one `git commit` in every
+/// dialect). Likewise `;`, which cmd.exe merges rather than splits.
+///
+/// The new segment must additionally start right after a `&` or `|` separator.
+/// cmd.exe also splits on `(`/`)` grouping, and a quoted `$(...)` or `(...)`
+/// that POSIX keeps inside one word would otherwise look like an exposed
+/// command when it is still argument text.
+fn view_exposes_extra_command_segments(command: &str, view: ShellDialect) -> bool {
+    let segment_starts = |dialect: ShellDialect| -> Vec<usize> {
+        crate::packs::split_command_segments_in_dialect(command, dialect)
+            .iter()
+            .map(|segment| (segment.as_ptr() as usize).saturating_sub(command.as_ptr() as usize))
+            .collect()
+    };
+    let posix_starts = segment_starts(ShellDialect::Posix);
+    segment_starts(view).into_iter().any(|start| {
+        !posix_starts.contains(&start) && command[..start].trim_end().ends_with(['&', '|'])
+    })
+}
+
+/// PowerShell cmdlets (and their default aliases) that execute a string value
+/// as code. They have no POSIX or cmd.exe analogue, so a command naming one is
+/// worth replaying under PowerShell even when its segmentation matches POSIX's:
+/// `'git reset --hard' | iex` is inert data piped to an unknown program
+/// everywhere else and a real `git reset --hard` under PowerShell.
+const POWERSHELL_STRING_EXECUTION_SINKS: [&str; 4] =
+    ["iex", "invoke-expression", "icm", "invoke-command"];
+
+/// Whether `command` names a PowerShell string-execution sink as a whole word.
+fn names_powershell_string_execution_sink(command: &str) -> bool {
+    let lowered = command.to_ascii_lowercase();
+    lowered
+        .split(|byte: char| !(byte.is_ascii_alphanumeric() || byte == '-' || byte == '_'))
+        .any(|word| POWERSHELL_STRING_EXECUTION_SINKS.contains(&word))
+}
+
+/// Whether replaying `command` under `view` can expose an execution the POSIX
+/// view structurally could not see (dcg#294).
+///
+/// An intra-segment dialect-only rewrite — cmd.exe caret de-escaping
+/// (`doc^ker …`), `%VAR%` expansion, or a PowerShell backtick escape
+/// reconstructing an executable word without adding a separator — counts too,
+/// via [`view_decode_exposes_pack_keyword`]: the view's own decode is asked
+/// whether it names something a pack protects that the raw text does not.
+///
+/// Residual gap, stated plainly: a PowerShell execution sink outside the small
+/// list above is still not covered. Closing that needs the per-dialect
+/// `CommandModel` of #289 §A rather than a fan-out: replaying every command
+/// unconditionally under every dialect imports each dialect view's own false
+/// positives (quoted commit prose read as command text, `rm` resolved as the
+/// `Remove-Item` alias) into the view that generic adapters actually get.
+fn dialect_view_may_expose_hidden_execution(
+    command: &str,
+    view: ShellDialect,
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+) -> bool {
+    if view_exposes_extra_command_segments(command, view) {
+        return true;
+    }
+    if view_decode_exposes_pack_keyword(command, view, keyword_index) {
+        return true;
+    }
+    view == ShellDialect::PowerShell && names_powershell_string_execution_sink(command)
+}
+
+/// Evaluate a command, fanning out across dialects when the caller could not
+/// prove one (dcg#294).
+///
+/// Under [`ShellDialect::Unknown`] — what every generic terminal adapter and the
+/// CLI default supply — the regex packs used to see a single POSIX-normalized
+/// view, so a payload that is inert under POSIX quoting but destructive under
+/// cmd.exe or PowerShell quoting passed every pack. The per-dialect union with
+/// deny-wins combination existed only inside the hand-written semantic decoders.
+///
+/// The fan-out here restores fail-closed behavior for the generic path: when the
+/// POSIX-shaped view of an unknown-dialect command allows, the same evaluation is
+/// replayed under the concrete Cmd and PowerShell dialects and a deny or warn
+/// from either is adopted. Polarity is deny-wins only — the extra views can add
+/// a finding but can never clear one, and a POSIX deny short-circuits before
+/// they run. Each replay is a full evaluation at the replayed dialect, so a
+/// finding carries exactly the rule id `--dialect cmd` / `--dialect ps` would
+/// report for the same command.
+///
+/// Two guards keep the cost bounded and the polarity honest:
+/// [`unknown_dialect_fanout_candidate`] requires a dialect-divergent byte plus a
+/// live enabled-pack keyword before any replay runs at all, and each replay
+/// additionally requires [`dialect_view_may_expose_hidden_execution`] so that a
+/// dialect's quote-blindness can only add a deny when its parse exposes an
+/// execution POSIX could not see, never when it merely reveals quoted argument
+/// text as command-shaped bytes.
+///
+/// Recursion is impossible: the replays pass a concrete dialect, and the
+/// fan-out is confined to top-level evaluation (`nested_command_depth == 0`).
+/// Nested envelopes — launcher payloads, heredoc bodies, command
+/// substitutions — keep their existing single-view behavior under whichever
+/// dialect the enclosing view established.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn evaluate_command_with_pack_order_deadline_at_path_inner(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+) -> EvaluationResult {
+    let primary = evaluate_command_in_single_dialect_view(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        shell_dialect,
+        nested_command_depth,
+        inherited_automated_stdin,
+    );
+
+    if shell_dialect != ShellDialect::Unknown
+        || nested_command_depth != 0
+        || primary.decision != EvaluationDecision::Allow
+        || !unknown_dialect_fanout_candidate(command, keyword_index)
+    {
+        return primary;
+    }
+
+    for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
+        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index) {
+            continue;
+        }
+        // An exhausted budget is never proof that the un-run views are clean.
+        if deadline_exceeded(deadline) {
+            return EvaluationResult::indeterminate_due_to_budget();
+        }
+        let alternate = evaluate_command_in_single_dialect_view(
+            command,
+            enabled_keywords,
+            ordered_packs,
+            keyword_index,
+            compiled_overrides,
+            allowlists,
+            heredoc_settings,
+            allow_once_audit,
+            project_path,
+            deadline,
+            view,
+            nested_command_depth,
+            inherited_automated_stdin,
+        );
+        // Deny-wins union. An incomplete alternate view is fail-closed for the
+        // same reason an incomplete primary view is. A warn is adopted only
+        // when the primary view found nothing at all, so an alternate view can
+        // never overwrite the primary's own attribution with a weaker one.
+        match alternate.decision {
+            EvaluationDecision::Deny | EvaluationDecision::Indeterminate => return alternate,
+            EvaluationDecision::Allow => {
+                if primary.effective_mode.is_none() && alternate.effective_mode.is_some() {
+                    return alternate;
+                }
+            }
+        }
+    }
+
+    primary
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn evaluate_command_in_single_dialect_view(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],
@@ -11432,6 +11883,35 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     if crate::allowlist::is_dcg_self_inspection_call(command) {
         return EvaluationResult::allowed();
     }
+
+    // Step 2b: Segment-level self-inspection masking (dcg#289 C2).
+    //
+    // Step 2 exempts a command that is *entirely* a dcg diagnostic. A compound
+    // command that merely *contains* one (`for c in a b; do dcg test rm -rf /;
+    // done`, `dcg explain <cmd> && echo ok`) fell through to ordinary
+    // evaluation, and the inert candidate text inside the diagnostic tripped
+    // packs — the report the user was trying to read became the block (#287,
+    // #288). Here the diagnostic segment's text is blanked (length-preserving,
+    // same masking style as `sanitize_for_pattern_matching`) so the remaining
+    // segments still evaluate against real text at unchanged offsets.
+    //
+    // Placement: this runs *before* heredoc scanning, semantic-pack force
+    // flags, sanitizing, and both pack passes, so every downstream layer —
+    // including the bounded fallback paths that forget the other maskers
+    // (#289 §4) — inherits the mask for free instead of each call site having
+    // to remember it. Step 1's config block overrides deliberately stay ahead
+    // of it: an explicit user block still wins on the raw text.
+    //
+    // Depth cap: top-level segmentation only. Recursive evaluation of heredoc
+    // bodies, launcher payloads, and substitutions passes a deeper depth and
+    // does not get this exemption; a dcg diagnostic that really is the whole
+    // body still hits the Step 2 whole-command exemption on its own.
+    let dcg_masked = if nested_command_depth == 0 {
+        mask_dcg_self_inspection_segments(command)
+    } else {
+        Cow::Borrowed(command)
+    };
+    let command: &str = dcg_masked.as_ref();
 
     // A standalone PowerShell string or script-block literal is an expression
     // value, not an invocation. This distinction is especially important for
@@ -18215,6 +18695,28 @@ fn evaluate_packs_with_allowlists_at_depth(
             .iter()
             .any(|token| token.kind == NormalizeTokenKind::Separator);
     let has_compound_segments = segment_ranges.len() > 1 || has_cmd_grouping_or_separator;
+    // `SEGMENT_SCOPED_PACKS` (chmod/chown/setfacl are POSIX utilities) pair a
+    // POSIX utility with its own flags and its own target. cmd.exe and
+    // PowerShell never run those utilities; the evaluator only sees them
+    // under those dialects because of the unknown-dialect fan-out (#294)
+    // and the unknown default. So the ambient dialect's segmentation is the
+    // wrong coordinate space for these rules, and using it produced two
+    // false negatives: cmd.exe keeps a whole `;`-joined line as one
+    // segment, which (a) lets a greedy full-command match straddle a POSIX
+    // `;` and be discarded by the cross-boundary guard below with no
+    // per-segment pass to fall back on, and (b) resolves argv0 from the
+    // line's leading token (`;`, `a`, `VAR=1`) rather than the token that
+    // actually runs chmod.
+    //
+    // Compute the POSIX segment view as a second boundary source for those
+    // packs only; every other pack keeps the evaluated dialect's segmentation
+    // exactly as before.
+    let posix_segment_ranges_for_scoped_packs =
+        (matches!(shell_dialect, ShellDialect::Cmd | ShellDialect::PowerShell)
+            && ordered_packs
+                .iter()
+                .any(|pack_id| SEGMENT_SCOPED_PACKS.contains(&pack_id.as_str())))
+        .then(|| command_segment_ranges_in_dialect(command_for_packs, ShellDialect::Posix));
     // Semantic decoders for a caller-proven dialect need the original quoting
     // and escape syntax, but they must not reinterpret literal stdin data as
     // executable source. Keep the dialect-preserving view and mask only
@@ -18505,6 +19007,58 @@ fn evaluate_packs_with_allowlists_at_depth(
                 }
                 crate::packs::windows::filesystem::WindowsFilesystemSemanticDecision::NoMatch => {}
             }
+        }
+
+        // Segment-scoped packs under a Windows dialect (issue #287 + #289).
+        //
+        // Evaluate these packs against POSIX segments instead of the ambient
+        // dialect's. Each segment gets its own pattern pass, so a match can
+        // neither pair two commands (preserving the #287 fix) nor borrow
+        // another command's argv0. This is sound as a replacement for the
+        // ambient-dialect passes because POSIX segmentation is strictly finer
+        // here: it splits on everything Cmd and PowerShell split on plus `;`,
+        // so every match kept by the old passes and confined to one command is
+        // still visible inside exactly one POSIX segment. POSIX and Unknown
+        // dialects are untouched — `posix_segment_ranges_for_scoped_packs` is
+        // only computed for Cmd/PowerShell.
+        if SEGMENT_SCOPED_PACKS.contains(&pack_id.as_str())
+            && let Some(posix_ranges) = posix_segment_ranges_for_scoped_packs.as_ref()
+            && !posix_ranges.is_empty()
+        {
+            for &(segment_start, segment_end) in posix_ranges {
+                if deadline_exceeded(deadline)
+                    || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
+                {
+                    return EvaluationResult::indeterminate_due_to_budget();
+                }
+                let Some(segment) = command_for_packs.get(segment_start..segment_end) else {
+                    continue;
+                };
+                let sanitized_segment = sanitize_for_pattern_matching(segment);
+                let segment_for_match = sanitized_segment.as_ref();
+                if pack.matches_safe_with_deadline(segment_for_match, deadline) {
+                    continue;
+                }
+                if let Some(result) = evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    segment_for_match,
+                    shell_dialect,
+                    segment_start,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                    &[],
+                    None,
+                ) {
+                    return result;
+                }
+            }
+            continue;
         }
 
         // Check safe patterns for this pack first.
@@ -18896,6 +19450,21 @@ fn evaluate_packs_with_allowlists_at_depth(
                 continue;
             }
 
+            // Executable scoping (issue #289). Same rule as the per-segment
+            // pass: a rule declaring `executables` fires only when its match
+            // span starts inside a segment whose resolved argv0 is one of the
+            // declared executables.
+            if let Some(executables) = pattern.executables
+                && !span_starts_in_executable_segment(
+                    span,
+                    command_for_packs,
+                    &segment_ranges,
+                    executables,
+                )
+            {
+                continue;
+            }
+
             // Non-filesystem packs already checked each segment above, so skip
             // duplicate full-command matches that sit wholly inside one segment.
             // core.filesystem uses its specialized rm parser instead of that
@@ -18903,6 +19472,41 @@ fn evaluate_packs_with_allowlists_at_depth(
             if has_compound_segments
                 && pack_id != "core.filesystem"
                 && span_is_inside_any_segment(span, &segment_ranges)
+            {
+                continue;
+            }
+
+            // Segment-scoped packs pair an executable with its flags and
+            // target; those tokens never legitimately span a segment boundary,
+            // so a full-command match that crosses segments is a cross-command
+            // pairing (`chmod 600 f && grep -rn … /etc`, issue #287). The
+            // quote/substitution-aware per-segment pass above is authoritative
+            // for these packs; drop the cross-segment full-command match. A
+            // character-class bound in the patterns themselves is not a
+            // substitute: it would match newlines and break on separators
+            // inside quotes or $().
+            if has_compound_segments
+                && SEGMENT_SCOPED_PACKS.contains(&pack_id.as_str())
+                && !span_is_inside_any_segment(span, &segment_ranges)
+            {
+                continue;
+            }
+
+            // Same rule, second boundary source: under a dialect that does not
+            // split on `;` (Cmd), a POSIX command boundary inside the matched
+            // span is still a cross-command pairing for these POSIX utilities.
+            //
+            // The test here is "the span reaches into two POSIX segments",
+            // not "the span sits inside one". There is no per-segment pass
+            // over the POSIX view to fall back on in this dialect, so a match
+            // must only be dropped when it really pairs two commands: a
+            // pattern whose match starts on the separator byte before its own
+            // command (`echo ok; chmod -R 755 /etc`) stays a single-command
+            // match and still denies.
+            if SEGMENT_SCOPED_PACKS.contains(&pack_id.as_str())
+                && posix_segment_ranges_for_scoped_packs
+                    .as_ref()
+                    .is_some_and(|ranges| span_overlaps_multiple_segments(span, ranges))
             {
                 continue;
             }
@@ -19095,6 +19699,12 @@ fn command_segment_ranges(cmd: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Packs whose destructive rules pair an executable with flags/targets that
+/// must all come from the same command segment. Full-command matches spanning
+/// a segment boundary are discarded for these packs (issue #287); the
+/// per-segment pass is authoritative.
+const SEGMENT_SCOPED_PACKS: &[&str] = &["system.permissions"];
+
 fn command_segment_ranges_in_dialect(
     cmd: &str,
     dialect: crate::normalize::ShellDialect,
@@ -19112,6 +19722,23 @@ fn span_is_inside_any_segment(span: MatchSpan, segment_ranges: &[(usize, usize)]
     segment_ranges
         .iter()
         .any(|&(start, end)| span.start >= start && span.end <= end)
+}
+
+/// Whether `span` reaches into two or more of `segment_ranges`.
+///
+/// Stricter evidence of a cross-command pairing than
+/// [`span_is_inside_any_segment`]'s complement: the ranges are the *trimmed*
+/// segment texts, so a match that merely starts on the separator or the
+/// whitespace between two segments is outside every range while still naming
+/// exactly one command. Only a span with bytes in two segments pairs two
+/// commands.
+fn span_overlaps_multiple_segments(span: MatchSpan, segment_ranges: &[(usize, usize)]) -> bool {
+    segment_ranges
+        .iter()
+        .filter(|&&(start, end)| span.start < end && span.end > start)
+        .take(2)
+        .count()
+        == 2
 }
 
 fn should_check_original_control_plane_payload(
@@ -20345,6 +20972,85 @@ fn filesystem_redirection_matching_view(command: &str, dialect: ShellDialect) ->
     Cow::Owned(String::from_utf8(view).expect("ASCII mask plus UTF-8 suffix remains valid UTF-8"))
 }
 
+/// Collect every unquoted output-redirect target in `command` as written.
+///
+/// Returns `None` unless the command's redirect targets can all be read as
+/// plain path tokens. File-descriptor duplications (`2>&1`, `>&2`) are skipped:
+/// they name a descriptor, not a file. Anything else that is not a bare token —
+/// a quoted target, an empty target, `>&file` — disqualifies the whole command.
+///
+/// The all-or-nothing shape is deliberate. A target exemption must never let a
+/// second redirect in the same command ride along, so `> ~/scratch/log >
+/// /etc/passwd` yields both targets and the caller requires both to be exempt.
+fn unquoted_output_redirect_targets(command: &str, dialect: ShellDialect) -> Option<Vec<String>> {
+    let mut targets: Vec<String> = Vec::new();
+    let mut rest = command;
+    while let Some(index) = first_unquoted_output_redirect(rest, dialect) {
+        let after = rest.get(index + 1..)?;
+        // `>>` (append) and `>|` (force clobber) extend the operator itself.
+        let after = after.strip_prefix('>').unwrap_or(after);
+        let after = after.strip_prefix('|').unwrap_or(after);
+        let trimmed = after.trim_start_matches([' ', '\t']);
+        if let Some(dup) = trimmed.strip_prefix('&') {
+            let digits = dup.chars().take_while(char::is_ascii_digit).count();
+            if digits == 0 {
+                return None;
+            }
+            rest = &dup[digits..];
+            continue;
+        }
+        let end = trimmed
+            .find(|c: char| c.is_ascii_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>'))
+            .unwrap_or(trimmed.len());
+        let token = &trimmed[..end];
+        if token.is_empty() {
+            return None;
+        }
+        targets.push(token.to_string());
+        rest = &trimmed[end..];
+    }
+    (!targets.is_empty()).then_some(targets)
+}
+
+/// Whether a matched `core.filesystem` redirect rule is suppressed by a
+/// configured `[rules."core.filesystem:<name>"] exempt_target_globs` (#284).
+///
+/// `redirect-truncate-dynamic-path` never participates: that rule exists
+/// precisely because the runtime target cannot be proven, and a glob over an
+/// unprovable path would be a bypass rather than an exemption.
+fn redirect_rule_target_exempted(
+    pattern_name: Option<&str>,
+    command: &str,
+    dialect: ShellDialect,
+) -> bool {
+    let Some(name) = pattern_name else {
+        return false;
+    };
+    if name == "redirect-truncate-dynamic-path" {
+        return false;
+    }
+    let rule_id = format!("core.filesystem:{name}");
+    if !crate::config::rule_has_target_exemptions(&rule_id) {
+        return false;
+    }
+    let Some(targets) = unquoted_output_redirect_targets(command, dialect) else {
+        return false;
+    };
+    let matched: Option<Vec<(String, String)>> = targets
+        .into_iter()
+        .map(|target| {
+            crate::config::rule_target_exemption(&rule_id, &target).map(|glob| (target, glob))
+        })
+        .collect();
+    let Some(matched) = matched else {
+        return false;
+    };
+    for (target, glob) in &matched {
+        crate::config::note_rule_target_suppression(&rule_id, glob, target);
+    }
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn evaluate_core_filesystem_pack(
     pack_id: &str,
@@ -20805,6 +21511,187 @@ fn find_actionable_command_pattern_span(
     }
 }
 
+/// Shell reserved words that can occupy the front of a segment without being
+/// the command that segment runs (issue #289 follow-up).
+///
+/// The list is POSIX's reserved-word set plus `time` and `coproc`, which are
+/// Bash keywords in the same position. Terminators (`fi`, `done`, `esac`, `}`)
+/// are included because a segment can consist of, or begin with, one; skipping
+/// them only advances to the next word and never invents a command.
+fn is_command_prefix_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then"
+            | "elif"
+            | "else"
+            | "fi"
+            | "for"
+            | "in"
+            | "do"
+            | "done"
+            | "while"
+            | "until"
+            | "select"
+            | "case"
+            | "esac"
+            | "function"
+            | "time"
+            | "coproc"
+            | "!"
+            | "{"
+            | "}"
+    )
+}
+
+/// Whether `word` is compound-command syntax rather than a command name.
+///
+/// Grouping punctuation is tested on the first character because the shell does
+/// not require whitespace after it (`(chmod …`), while reserved words are
+/// matched whole (`then`, never `thenceforth`).
+fn word_is_command_prefix_syntax(word: &str) -> bool {
+    word.starts_with(['(', ')', '{', '}', '!', ';', '&', '|'])
+        || is_command_prefix_reserved_word(word)
+}
+
+/// Skip compound-command syntax at the front of `segment` and return the first
+/// real command word (issue #289 follow-up).
+///
+/// The walk runs over the shared tokenizer rather than `split_whitespace` so
+/// quoting and escaping are handled the same way the rest of the evaluator
+/// handles them, and so grouping punctuation that the shell does not require
+/// whitespace around (`(`, `)`, `;`, `&&`, `|`) is skipped as the separator
+/// token it is. Wrapper prefixes are re-stripped after each skipped reserved
+/// word, so `then sudo chmod …` still resolves `chmod`.
+///
+/// `case` needs one extra rule: its pattern list is ordinary words that the
+/// shell never executes (`case x in *) chmod …`). After a literal `case`, words
+/// are skipped until the `)` that closes the pattern list.
+fn command_word_after_prefix_syntax(segment: &str) -> Option<String> {
+    // Each iteration consumes at least one token, so the bound is a token
+    // count, not a recursion depth.
+    const MAX_PREFIX_TOKENS: usize = 64;
+    let mut current = segment.to_string();
+    let mut in_case_pattern = false;
+
+    for _ in 0..MAX_PREFIX_TOKENS {
+        let stripped = crate::normalize::strip_wrapper_prefixes(&current);
+        let text = stripped.normalized.as_ref();
+        let token = crate::normalize::tokenize_for_normalization(text)
+            .into_iter()
+            .next()?;
+        let raw = token.text(text)?;
+        let consumed = token.byte_range.end;
+
+        match token.kind {
+            NormalizeTokenKind::Separator => {
+                if raw == ")" {
+                    in_case_pattern = false;
+                }
+            }
+            NormalizeTokenKind::Word if in_case_pattern || is_command_prefix_reserved_word(raw) => {
+                in_case_pattern |= raw == "case";
+            }
+            NormalizeTokenKind::Word => return Some(raw.to_string()),
+        }
+        let remainder = text.get(consumed..)?.to_string();
+        current = remainder;
+    }
+    None
+}
+
+/// Resolve the executable name a command segment invokes, for `executables=`
+/// rule scoping (issue #289).
+///
+/// Wrapper prefixes (`sudo`, `env`, `command`, leading `VAR=value`
+/// assignments, …) are stripped with the shared normalizer, then the leading
+/// word is reduced to a path basename with any `.exe`/`.cmd`/`.bat`/`.com`
+/// extension removed and lowercased.
+///
+/// Compound-command syntax that may sit between the start of a segment and the
+/// simple command it introduces — shell grouping punctuation (`(`, `((`, `{`,
+/// `!`) and the reserved words — is skipped first, so
+/// `if true; then chmod -R 755 /etc; fi` resolves `chmod` rather than `then`.
+///
+/// Returns `None` when the segment has no leading word, or when that word is
+/// *dynamic* — it contains a shell expansion (`$…`, backtick, `%VAR%`), so the
+/// executable is not statically known. A dynamic argv0 never satisfies an
+/// `executables=` rule; this tranche deliberately adds no new fail-closed
+/// finding for that case.
+fn segment_executable_name(segment: &str) -> Option<String> {
+    let stripped = crate::normalize::strip_wrapper_prefixes(segment);
+    let normalized = stripped.normalized.as_ref();
+    let leading = normalized.split_whitespace().next()?;
+    // Fast path: the overwhelmingly common segment already starts with its own
+    // command word, so no prefix walk (and no extra allocation) is needed. Only
+    // a leading grouping character or reserved word pays for the tokenizing
+    // walk.
+    let walked;
+    let word = if word_is_command_prefix_syntax(leading) {
+        walked = command_word_after_prefix_syntax(normalized)?;
+        walked.as_str()
+    } else {
+        leading
+    };
+    if word.contains(['$', '`', '%']) {
+        return None;
+    }
+    // Quotes around (or inside) argv0 are removed by the shell before exec:
+    // `"chmod"` and `ch"mod"` both run chmod.
+    let unquoted: String = word
+        .chars()
+        .filter(|ch| !matches!(ch, '\'' | '"'))
+        .collect();
+    let basename = unquoted
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(unquoted.as_str());
+    if basename.is_empty() {
+        return None;
+    }
+    let lowered = basename.to_ascii_lowercase();
+    for extension in [".exe", ".cmd", ".bat", ".com"] {
+        if let Some(base) = lowered.strip_suffix(extension)
+            && !base.is_empty()
+        {
+            return Some(base.to_string());
+        }
+    }
+    Some(lowered)
+}
+
+/// Whether a segment's resolved argv0 is one of the rule's declared executables.
+fn segment_invokes_executable(segment: &str, executables: &[&str]) -> bool {
+    segment_executable_name(segment).is_some_and(|argv0| {
+        executables
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&argv0))
+    })
+}
+
+/// Whole-command gate for `executables=` rules (issue #289).
+///
+/// Exact rule: the match fires only when its span **starts** inside a segment
+/// whose resolved argv0 is one of the declared executables. A span that starts
+/// outside every known segment (or inside a segment run by some other program)
+/// is not governed by this rule.
+fn span_starts_in_executable_segment(
+    span: MatchSpan,
+    command: &str,
+    segment_ranges: &[(usize, usize)],
+    executables: &[&str],
+) -> bool {
+    if segment_ranges.is_empty() {
+        return segment_invokes_executable(command, executables);
+    }
+    segment_ranges.iter().any(|&(start, end)| {
+        span.start >= start
+            && (span.start < end || start == end)
+            && command
+                .get(start..end)
+                .is_some_and(|segment| segment_invokes_executable(segment, executables))
+    })
+}
+
 fn evaluate_pack_destructive_patterns(
     pack_id: &str,
     pack: &crate::packs::Pack,
@@ -20881,6 +21768,24 @@ fn evaluate_pack_destructive_patterns(
     let decoded_without_source_map = shell_dialect != crate::normalize::ShellDialect::Unknown
         && pattern_command != command_slice;
 
+    // Executable-scoped rules (issue #289). Resolve each top-level segment of
+    // this slice once, in the same coordinate space as `matched_span`
+    // (slice-local + `slice_offset`). Per-segment callers hand us a single
+    // segment, so this collapses to that segment's argv0; whole-command
+    // callers get one entry per segment. Only computed when some rule in the
+    // pack actually declares `executables`, so unscoped packs pay nothing.
+    let executable_segments: Option<Vec<(usize, usize)>> = pack
+        .destructive_patterns
+        .iter()
+        .any(|pattern| pattern.executables.is_some())
+        .then(|| {
+            let mut ranges = command_segment_ranges_in_dialect(command_slice, shell_dialect);
+            if ranges.is_empty() {
+                ranges.push((0, command_slice.len()));
+            }
+            ranges
+        });
+
     for pattern in &pack.destructive_patterns {
         if pattern_filter.is_some_and(|include| !include(pattern.name)) {
             continue;
@@ -20935,6 +21840,36 @@ fn evaluate_pack_destructive_patterns(
             continue;
         }
 
+        // Executable scoping (issue #289). Exact rule: a rule declaring
+        // `executables` fires only when the match span **starts** inside a
+        // segment of this slice whose resolved argv0 is one of those
+        // executables. A match carrying no span (semantic or decoded-view
+        // rules) instead requires *some* segment of this slice to be run by a
+        // declared executable — the coarsest sound reading, since there is no
+        // position to attribute. A dynamic argv0 never satisfies the rule.
+        if let Some(executables) = pattern.executables {
+            let segments = executable_segments.as_deref().unwrap_or(&[]);
+            let governed = match matched_span.as_ref() {
+                Some(span) => span_starts_in_executable_segment(
+                    MatchSpan {
+                        start: span.start.saturating_sub(slice_offset),
+                        end: span.end.saturating_sub(slice_offset),
+                    },
+                    command_slice,
+                    segments,
+                    executables,
+                ),
+                None => segments.iter().any(|&(start, end)| {
+                    command_slice
+                        .get(start..end)
+                        .is_some_and(|segment| segment_invokes_executable(segment, executables))
+                }),
+            };
+            if !governed {
+                continue;
+            }
+        }
+
         if matched_span
             .as_ref()
             .is_some_and(|span| span_is_inside_any_segment(*span, ignored_ranges))
@@ -20959,6 +21894,12 @@ fn evaluate_pack_destructive_patterns(
                 if crate::context::offset_is_quoted_data(pattern_command, raw_start) {
                     continue;
                 }
+            }
+            // Rule-scoped target exemption (#284): the redirect target is
+            // resolvable here, so a configured glob stands this rule down
+            // without touching any other rule's view of the command.
+            if redirect_rule_target_exempted(pattern.name, redirect_syntax_command, shell_dialect) {
+                continue;
             }
         }
 
@@ -21416,14 +22357,29 @@ fn evaluate_heredoc(
         // Commands like `cat`, `tee`, `grep`, etc. just output the heredoc content
         // as data - they don't execute it as code. This prevents false positives
         // where documentation text containing dangerous command examples is blocked.
-        if content.target_command.as_ref().is_some_and(|cmd| {
-            crate::heredoc::is_non_executing_heredoc_command(cmd)
-                && !crate::heredoc::stdin_data_sink_may_be_overridden(
-                    command,
-                    content.byte_range.start,
-                    cmd,
-                )
-        }) {
+        let target_not_overridden = |cmd: &str| {
+            !crate::heredoc::stdin_data_sink_may_be_overridden(
+                command,
+                content.byte_range.start,
+                cmd,
+            )
+        };
+        let non_executing_target = content.target_command.as_deref().is_some_and(|cmd| {
+            crate::heredoc::is_non_executing_heredoc_command(cmd) && target_not_overridden(cmd)
+        });
+        // Structured stdin data sinks (`git commit -F - <<'EOF'`, `spx session
+        // handoff <<EOF`) likewise consume the body as DATA — a commit message
+        // is read by git, never executed (#277). Mirror the masking path's
+        // gate: only heredoc/here-string bodies are stdin-bound (inline `-c`
+        // scripts are not), and any PATH/alias override of the target keeps
+        // the body scannable (fail-closed).
+        let structured_stdin_sink = content.heredoc_type.is_some()
+            && crate::heredoc::is_structured_stdin_data_sink(command, content.byte_range.start)
+            && content
+                .target_command
+                .as_deref()
+                .is_none_or(target_not_overridden);
+        if non_executing_target || structured_stdin_sink {
             tracing::trace!(
                 target_command = ?content.target_command,
                 "Skipping heredoc content analysis for non-executing target"
@@ -21800,10 +22756,18 @@ fn check_fallback_patterns(command: &str) -> Option<EvaluationResult> {
         .expect("fallback patterns must compile")
     });
 
+    // Heredoc bodies bound to a non-executing or structured stdin data sink
+    // (`cat <<EOF`, `git commit -F - <<'EOF'`, …) are DATA the target never
+    // executes; mask them exactly like the main raw-shell rescan does (#277).
+    // Executing sinks (`bash <<EOF`, `python3 - <<'PY'`) are never masked, so
+    // the fallback stays fail-closed for real embedded shell/interpreter code.
+    // Bare body content (no `<<` operator) passes through unchanged.
+    let masked = crate::heredoc::mask_non_executing_heredocs(command);
+
     // Sanitize the command first to mask comments and safe arguments (e.g. commit messages).
     // This prevents false positives where a destructive command is mentioned in a comment
     // inside a large heredoc.
-    let sanitized = sanitize_for_pattern_matching(command);
+    let sanitized = sanitize_for_pattern_matching(masked.as_ref());
     let check_target = sanitized.as_ref();
 
     if FALLBACK_PATTERNS.is_match(check_target) {
@@ -28881,6 +29845,61 @@ mod tests {
     }
 
     #[test]
+    /// Issue #287: `system.permissions` is segment-scoped — a recursive flag
+    /// (or 777/u+s/root token) on a *different* command in a chained or
+    /// multi-line input must not pair with a chmod/chown elsewhere in the
+    /// string. Separators inside quotes or `$()` are not boundaries.
+    #[test]
+    fn segment_scoped_pack_matches_do_not_cross_segments_issue_287() {
+        for command in [
+            // The -r/-R belongs to grep/cp/ls, not chmod/chown/setfacl.
+            "chmod 600 /root/.ssh/x && grep -rn foo /etc/ssh/",
+            "sudo chmod 600 /root/.ssh/authorized_keys && sudo grep -rn PermitRootLogin /etc/ssh/sshd_config",
+            // Newlines separate commands exactly like `&&` (review finding on
+            // the first #287 fix: a char-class bound matched right across them).
+            "chmod 600 /root/.ssh/authorized_keys\ngrep -rn PermitRootLogin /etc/ssh/sshd_config",
+            "chown app /var/log/x\ngrep -R foo /etc/passwd",
+            "chown user /var/log/app.log; cp -R src /opt/app",
+            "setfacl -m u:app:r /srv/f | ls -R /etc",
+            "chmod u+x build.sh && echo 777",
+            "chown alice /tmp/f && sudo -u root: true",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                !result.is_denied(),
+                "cross-segment tokens must not combine: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+
+        for command in [
+            // Genuine matches within one segment still deny, including when a
+            // separator byte hides inside quotes or a command substitution.
+            "chmod -R 755 /etc",
+            "true && chmod -R 755 /etc",
+            "chmod -R $(cat modes.txt | head -1) /etc",
+            "chown -R \"u;g\" /etc",
+            "setfacl -R -m u:app:rwx /etc",
+            "echo done && chmod 777 /tmp/f",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["system.permissions"],
+                ShellDialect::Posix,
+            );
+            assert!(
+                result.is_denied(),
+                "single-segment match must still deny: {command:?}: {:?}",
+                result.pattern_info
+            );
+        }
+    }
+
+    #[test]
     fn filesystem_rule_allowlists_do_not_hide_other_segment_destruction() {
         let enabled_keywords = ["rm", "unlink"];
         let ordered_packs = ["core.filesystem".to_string()];
@@ -29236,6 +30255,23 @@ mod tests {
                 "Write-Output @'\nit's inert data\n'@; git branch -d feature",
                 "branch-force-delete",
             ),
+            // Both escape shapes below used to be pinned as allowed under the
+            // unknown dialect — the #294 residual gap: the escape hides the
+            // executable *inside* one segment, so the fan-out's segmentation
+            // evidence saw nothing and never replayed the view that actually
+            // runs git. The decoded-view keyword gate closes that, and the
+            // deny they now carry is the one `--dialect ps` / `--dialect cmd`
+            // report for the same bytes.
+            (
+                ShellDialect::Unknown,
+                "g`it branch -`d feature",
+                "branch-force-delete",
+            ),
+            (
+                ShellDialect::Unknown,
+                "g^it branch -^d feature",
+                "branch-force-delete",
+            ),
         ];
         let safe = [
             (ShellDialect::PowerShell, "g`it branch --format -`d"),
@@ -29270,8 +30306,6 @@ mod tests {
             ),
             (ShellDialect::PowerShell, "'g`it' branch -d feature"),
             (ShellDialect::Cmd, "\"g^it\" branch -d feature"),
-            (ShellDialect::Unknown, "g`it branch -`d feature"),
-            (ShellDialect::Unknown, "g^it branch -^d feature"),
             (ShellDialect::PowerShell, "& ('g'+'it') status"),
             (ShellDialect::PowerShell, "& $G status"),
             (ShellDialect::PowerShell, "& ('rm') reset --hard"),

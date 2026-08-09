@@ -5,19 +5,21 @@ mod tests {
     #[test]
     fn test_extract_clean_command() {
         // Case 1: unquoted redirection
-        // tree-sitter-bash splits this at the redirection, so the
-        // "command" node may only cover the portion before the redirect.
+        // tree-sitter-bash wraps the redirect in a `redirected_statement`
+        // node; since #271 the complete statement is emitted first (so the
+        // redirect target stays visible to the recursive evaluation) and the
+        // bare command node follows.
         let cmds = extract_shell_commands("git >/dev/null reset --hard");
         assert!(!cmds.is_empty(), "should extract at least one command");
         println!("Unquoted: '{}'", cmds[0].text);
-        // tree-sitter sees "git" as the command text before the redirect;
-        // this is a known limitation of AST extraction with interleaved
-        // redirections. The evaluator still catches the pattern because the
-        // original command string is evaluated by regex separately.
+        assert_eq!(
+            cmds[0].text, "git >/dev/null reset --hard",
+            "the redirected statement must be surfaced completely"
+        );
         assert!(
-            cmds[0].text == "git reset --hard" || cmds[0].text == "git",
-            "command text should be 'git reset --hard' or just 'git', got '{}'",
-            cmds[0].text
+            cmds.iter()
+                .any(|cmd| cmd.text == "git reset --hard" || cmd.text == "git"),
+            "the bare command node is still collected: {cmds:?}"
         );
 
         // Case 2: quoted redirection
