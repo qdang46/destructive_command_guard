@@ -639,7 +639,10 @@ local_out="$(unix_probe | bash -s -- "$VERSION" "$REPO_RAW" 2>&1)"
 parse_results "local" "$local_out"
 
 # --- Remote Unix hosts ------------------------------------------------------
-for host in "${UNIX_SSH_HOSTS[@]}"; do
+# Guard the expansion: under `set -u`, an empty array expands to an "unbound
+# variable" error. `${arr[@]+"${arr[@]}"}` expands to nothing when the array is
+# empty or unset (bash < 4.4), keeping `--local-only` (UNIX_SSH_HOSTS=()) safe.
+for host in ${UNIX_SSH_HOSTS[@]+"${UNIX_SSH_HOSTS[@]}"}; do
   $JSON_OUTPUT || { echo; echo "$host"; }
   if ! ssh -o ConnectTimeout=8 -o BatchMode=yes "$host" 'echo ok' >/dev/null 2>&1; then
     report skip "$host" "reachability" "ssh unreachable"
