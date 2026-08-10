@@ -417,13 +417,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
-          # Pin to the repo's known-good nightly. Unpinned `nightly` (current)
-          # regressed the libFuzzer/ASan coverage instrumentation with
-          # `rust-lld: undefined symbol: __sancov_gen_.*` link errors
-          # (commit 56dc793 pinned nightly-2026-05-25 for the same reason; the
-          # pin was lost in a later port). rust-toolchain.toml pins
-          # nightly-2026-06-06.
-          toolchain: nightly-2026-06-06
+          # Pin to the known-good nightly for libFuzzer/ASan coverage
+          # instrumentation. Unpinned `nightly` (and nightly-2026-06-06, the
+          # rust-toolchain.toml channel) regress the sancov linker with
+          # `rust-lld: undefined symbol: __sancov_gen_.*` errors. Commit
+          # 56dc793 pinned nightly-2026-05-25 for the same reason; the pin was
+          # lost in a later port.
+          toolchain: nightly-2026-05-25
           # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
           # because libFuzzer + AddressSanitizer require statically-linked
           # libc; without this target installed, the build fails with
@@ -1320,7 +1320,7 @@ jobs:
       # what the baseline says.
       - name: Absolute hook-latency gate vs shipped default budget
         run: |
-          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
+          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' crates/dcg-cli/src/perf.rs | tr -d '_')
           if [ -z "$BUDGET_MS" ]; then
             echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
             exit 1
