@@ -273,6 +273,17 @@ impl PendingExceptionStore {
             }
         }
 
+        // XDG_CONFIG_HOME, when set, is authoritative for the user config
+        // directory on every platform (the config/allowlist loaders honor it the
+        // same way). Without this, Windows resolves `dirs::home_dir()`/`config_dir()`
+        // to known-folders that ignore HOME/USERPROFILE, so a hermetic test HOME
+        // never sees the store it expects.
+        if let Ok(xdg_home) = env::var("XDG_CONFIG_HOME") {
+            if let Some(xdg_home) = crate::config::resolve_config_path_value(&xdg_home, cwd) {
+                return xdg_home.join("dcg").join(PENDING_EXCEPTIONS_FILE);
+            }
+        }
+
         // Check XDG-style path first (~/.config/dcg/), then platform-native
         let xdg_base = dirs::home_dir().map(|h| h.join(".config"));
         let xdg_path = xdg_base
@@ -574,6 +585,14 @@ impl AllowOnceStore {
         if let Ok(value) = env::var(ENV_ALLOW_ONCE_PATH) {
             if let Some(path) = resolve_config_path_value(&value, cwd) {
                 return path;
+            }
+        }
+
+        // XDG_CONFIG_HOME, when set, is authoritative for the user config
+        // directory on every platform (see PendingExceptionStore::default_path).
+        if let Ok(xdg_home) = env::var("XDG_CONFIG_HOME") {
+            if let Some(xdg_home) = crate::config::resolve_config_path_value(&xdg_home, cwd) {
+                return xdg_home.join("dcg").join(ALLOW_ONCE_FILE);
             }
         }
 

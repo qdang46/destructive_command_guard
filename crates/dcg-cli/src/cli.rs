@@ -12472,10 +12472,17 @@ fn self_update_windows(update: UpdateCommand) -> Result<(), Box<dyn std::error::
 
 /// Get the path to user-level Claude Code settings (`~/.claude/settings.json`).
 fn claude_settings_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".claude")
-        .join("settings.json")
+    // Honor $HOME / USERPROFILE before the platform-native home. The `dirs`
+    // crate reads Windows known-folders and ignores these env vars, so a hook
+    // running under a sandboxed HOME (tests, CI) would otherwise write to the
+    // real user's ~/.claude/settings.json. This mirrors the config/allowlist
+    // loaders' HOME-first resolution.
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
+        .or_else(|| dirs::home_dir())
+        .unwrap_or_default();
+    home.join(".claude").join("settings.json")
 }
 
 /// Get the path to project-level Claude Code settings (`.claude/settings.json`
