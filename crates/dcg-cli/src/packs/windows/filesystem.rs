@@ -1172,6 +1172,26 @@ fn powershell_segment_semantic_decision(
         .is_some_and(|name| matches!(name, "clear-content" | "clc"));
     let is_clear_recycle_bin = exact_name.as_deref() == Some("clear-recyclebin");
 
+    // GNU `rm` long flags are POSIX-only syntax that PowerShell's Remove-Item
+    // never accepts (`--interactive`, `--preserve-root`, `--no-preserve-root`,
+    // `--one-file-system`, `--dir`). Their presence proves this is POSIX rm
+    // (handled by core.filesystem, including interactive prompts), so the
+    // Windows pack must neither classify it as PowerShell nor fall through to
+    // the raw `remove-item-recurse` regex (which would re-read POSIX `-r` as
+    // Remove-Item). `Safe` tells the Unknown-dialect pack loop to skip the raw
+    // Windows regex too.
+    if exact_name.as_deref() == Some("rm")
+        && raw_words.iter().any(|word| {
+            word.starts_with("--interactive")
+                || word.starts_with("--preserve-root")
+                || word.starts_with("--no-preserve-root")
+                || word.starts_with("--one-file-system")
+                || word.starts_with("--dir")
+        })
+    {
+        return WindowsFilesystemSemanticDecision::Safe;
+    }
+
     // cmd.exe deletion words typed at a PowerShell prompt (#280). PowerShell
     // resolves them to Remove-Item aliases, where `/s` is a literal path
     // argument, so the classification below keys on the cmd-style `/s` switch
@@ -2199,6 +2219,21 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn gnu_rm_long_flags_are_not_powershell_remove_item() {
+        let decision = powershell_segment_semantic_decision(
+            "rm -r --force --interactive=once ./build",
+            false,
+        );
+        assert!(
+            !matches!(
+                decision,
+                WindowsFilesystemSemanticDecision::Destructive(_)
+            ),
+            "GNU rm long flags must not be classified as PowerShell Remove-Item: {decision:?}"
+        );
+    }
 
     #[test]
     fn test_pack_creation() {
