@@ -25359,6 +25359,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn database_script_files_are_bounded_and_inspected_by_their_client_pack() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -25378,7 +25379,7 @@ mod tests {
                 "TRUNCATE TABLE users;\n",
                 "safe.mysql",
                 "SELECT 1;\n",
-                "mysql app -e 'source",
+                "mysql app -e 'source ",
                 "'",
             ),
             (
@@ -25987,6 +25988,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn sed_program_files_are_inspected_for_shell_execution() {
         let temp = tempfile::tempdir().expect("tempdir");

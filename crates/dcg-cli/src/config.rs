@@ -10069,6 +10069,7 @@ low = "disabled"
         assert!(rendered.len() < 128);
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_source_outcomes_are_lazy_and_authority_aware() {
         use tempfile::TempDir;
