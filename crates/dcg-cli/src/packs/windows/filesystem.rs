@@ -1933,10 +1933,8 @@ pub(crate) fn windows_filesystem_semantic_scan_required(
     // Native cmd.exe verbs carry no escape character in their ordinary spelling
     // (`del /s /q C:\src`), so a plain `Unknown`-dialect command would skip the
     // semantic pass entirely. A protected cmd executable word forces it.
-    let has_cmd_candidate = matches!(
-        dialect,
-        ShellDialect::Cmd | ShellDialect::Unknown
-    ) && contains_cmd_protected_word(command);
+    let has_cmd_candidate = matches!(dialect, ShellDialect::Cmd | ShellDialect::Unknown)
+        && contains_cmd_protected_word(command);
     (has_relevant_escape || has_case_insensitive_powershell_candidate || has_cmd_candidate)
         && !matches!(
             windows_filesystem_semantic_decision_in_dialect(command, dialect),
