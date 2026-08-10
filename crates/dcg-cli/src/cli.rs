@@ -12480,7 +12480,7 @@ fn claude_settings_path() -> std::path::PathBuf {
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from))
-        .or_else(|| dirs::home_dir())
+        .or_else(dirs::home_dir)
         .unwrap_or_default();
     home.join(".claude").join("settings.json")
 }
