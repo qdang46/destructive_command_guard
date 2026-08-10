@@ -417,6 +417,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@nightly
         with:
+          # Pin to the repo's known-good nightly. Unpinned `nightly` (current)
+          # regressed the libFuzzer/ASan coverage instrumentation with
+          # `rust-lld: undefined symbol: __sancov_gen_.*` link errors
+          # (commit 56dc793 pinned nightly-2026-05-25 for the same reason; the
+          # pin was lost in a later port). rust-toolchain.toml pins
+          # nightly-2026-06-06.
+          toolchain: nightly-2026-06-06
           # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
           # because libFuzzer + AddressSanitizer require statically-linked
           # libc; without this target installed, the build fails with
@@ -900,7 +907,7 @@ jobs:
         id: bats
         run: |
           set +e
-          bats --tap tests/install/*.bats 2>&1 | tee bats-output.log
+          bats --tap crates/dcg-cli/tests/install/*.bats 2>&1 | tee bats-output.log
           EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
