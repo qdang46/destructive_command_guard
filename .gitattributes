@@ -18,6 +18,9 @@ tests/e2e/fixtures/** text eol=lf
 crates/dcg-cli/tests/e2e/fixtures/** text eol=lf
 # E2E shell harnesses must stay LF (they run under bash / git-bash).
 *.sh text eol=lf
+# PowerShell installer tests and install.ps1 are parsed by pwsh; keep them LF
+# so a Windows checkout (core.autocrlf) does not rewrite them.
+*.ps1 text eol=lf
 # Generated pack docs and config schema are compared exactly by tests; keep
 # them LF on every checkout.
 docs/packs/*.md text eol=lf

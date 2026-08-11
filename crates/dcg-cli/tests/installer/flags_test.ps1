@@ -5,7 +5,7 @@
 # dot-sourcing for the Write-Info / $forceConfig behavior.
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 $installPs1 = Join-Path $repoRoot 'install.ps1'
 
 $script:failures = 0

@@ -5,7 +5,7 @@
 # hook sharing an entry with dcg), and COPILOT_HOME behavior.
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
