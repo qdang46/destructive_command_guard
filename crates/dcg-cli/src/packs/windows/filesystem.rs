@@ -2222,15 +2222,10 @@ mod tests {
 
     #[test]
     fn gnu_rm_long_flags_are_not_powershell_remove_item() {
-        let decision = powershell_segment_semantic_decision(
-            "rm -r --force --interactive=once ./build",
-            false,
-        );
+        let decision =
+            powershell_segment_semantic_decision("rm -r --force --interactive=once ./build", false);
         assert!(
-            !matches!(
-                decision,
-                WindowsFilesystemSemanticDecision::Destructive(_)
-            ),
+            !matches!(decision, WindowsFilesystemSemanticDecision::Destructive(_)),
             "GNU rm long flags must not be classified as PowerShell Remove-Item: {decision:?}"
         );
     }
