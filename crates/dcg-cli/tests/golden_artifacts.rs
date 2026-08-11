@@ -160,67 +160,6 @@ fn explain_artifact(name: &str, command: &str) {
     assert_golden_json(&format!("explain/{name}.json"), &json);
 }
 
-/// Windows-platform-pack keywords that are only present when the
-/// `windows.filesystem` / `windows.system` packs are default-on (Windows
-/// host). They are not part of the cross-platform core detection contract the
-/// golden artifacts encode, so strip them for reproducibility across CI
-/// runners (the Windows packs have their own dedicated suites).
-const WINDOWS_PLATFORM_KEYWORDS: &[&str] = &[
-    ".DELETE(",
-    ".Delete(",
-    ".delete(",
-    "BCDEDIT",
-    "CIPHER",
-    "CLC",
-    "CLEAR-DISK",
-    "Clear-Content",
-    "Clear-Disk",
-    "Clear-RecycleBin",
-    "DEL",
-    "DISKPART",
-    "ERASE",
-    "FORMAT",
-    "FORMAT-VOLUME",
-    "Format-Volume",
-    "IO.DIRECTORY",
-    "IO.Directory",
-    "Initialize-Disk",
-    "Io.Directory",
-    "RD",
-    "REMOVE-ITEM",
-    "RI",
-    "RM",
-    "RMDIR",
-    "Remove-Item",
-    "Remove-Partition",
-    "Reset-PhysicalDisk",
-    "ShadowCopy",
-    "VSSADMIN",
-    "WMIC",
-    "bcdedit",
-    "cipher",
-    "clc",
-    "clear-content",
-    "clear-disk",
-    "clear-recyclebin",
-    "del",
-    "diskpart",
-    "erase",
-    "format",
-    "format-volume",
-    "initialize-disk",
-    "io.directory",
-    "rd",
-    "remove-item",
-    "remove-partition",
-    "reset-physicaldisk",
-    "ri",
-    "rmdir",
-    "shadowcopy",
-    "vssadmin",
-    "wmic",
-];
-
 fn canonicalize_explain_json(value: &mut Value) {
     replace_object_field(value, "total_duration_us", json!("<duration_us>"));
 
@@ -228,16 +167,6 @@ fn canonicalize_explain_json(value: &mut Value) {
         for step in steps {
             replace_object_field(step, "duration_us", json!("<duration_us>"));
             if let Some(details) = step.get_mut("details") {
-                if let Some(array) = details
-                    .get_mut("keywords_checked")
-                    .and_then(Value::as_array_mut)
-                {
-                    array.retain(|entry| {
-                        entry
-                            .as_str()
-                            .is_none_or(|s| !WINDOWS_PLATFORM_KEYWORDS.contains(&s))
-                    });
-                }
                 sort_string_array_field(details, "keywords_checked");
             }
         }
