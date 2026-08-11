@@ -106,7 +106,17 @@ pub struct BackupEntry {
 /// Get the path to the backup directory.
 #[must_use]
 pub fn backup_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("dcg").join("backups"))
+    // Honor XDG_DATA_HOME / APPDATA before the platform-native data dir. The
+    // `dirs` crate reads Windows known-folders and ignores these env vars, so
+    // a hermetic test/CI home (win_update_rollback.ps1 sets APPDATA/XDG_DATA_HOME)
+    // could not otherwise control where `dcg update --rollback` looks for its
+    // fabricated backups. This mirrors the config/allowlist loaders' HOME-first
+    // resolution.
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .or_else(dirs::data_dir)?;
+    Some(base.join("dcg").join("backups"))
 }
 
 fn is_valid_backup_artifact_name(name: &str) -> bool {
