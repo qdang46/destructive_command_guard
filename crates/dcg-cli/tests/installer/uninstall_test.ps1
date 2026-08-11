@@ -5,7 +5,7 @@
 # (with a coexisting hook) and asserts dcg is removed while coexisting survives.
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
+$repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)))
 . (Join-Path $repoRoot 'uninstall.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
