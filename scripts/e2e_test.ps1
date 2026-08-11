@@ -655,13 +655,16 @@ reason = "Only in CI"
 added_by = "e2e_test.ps1"
 conditions = { CI = "true" }
 "@ @{ CI = "true" }
+    # On a CI runner the `CI` env var is set to "true", which would satisfy the
+    # condition and allow the command; explicitly clear it so the condition is
+    # genuinely unmet (matching the intended "skipped" assertion).
     Test-Allowlist "git reset --hard" "block" "unmet CI condition skipped" @"
 [[allow]]
 rule = "core.git:reset-hard"
 reason = "Only in CI"
 added_by = "e2e_test.ps1"
 conditions = { CI = "true" }
-"@
+"@ @{ CI = "" }
 
 } finally {
     Set-Location $RepoRoot 2>$null
