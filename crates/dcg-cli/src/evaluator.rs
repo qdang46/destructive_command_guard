@@ -16946,7 +16946,23 @@ fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
                 }
             }
         }
-        if !in_single && !in_double && matches!(bytes[index], b'*' | b'?' | b'[' | b'{' | b'~') {
+        // `~` is a tilde-expansion (home) glob only when it begins a word
+        // (`~`, `~/...`, `~user`). An embedded `~` — e.g. `RUNNER~1` (an 8.3
+        // short name), `HEAD~1` (a git revision), or `RUNNER~1_TILDE` — is a
+        // literal byte; masking it turned the path into an unresolvable
+        // `RUNNER__DCG_GLOB_0__1_TILDE` and safe script-file inspection denied
+        // it (the Windows CI temp paths contain RUNNER~1).
+        let tilde_is_glob = if bytes[index] == b'~' {
+            index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || matches!(bytes[index - 1], b'|' | b'&' | b';' | b'(' | b'{' | b'=')
+        } else {
+            false
+        };
+        if !in_single
+            && !in_double
+            && (matches!(bytes[index], b'*' | b'?' | b'[' | b'{') || tilde_is_glob)
+        {
             let marker = unique_internal_marker(command, "GLOB", dynamic_markers.len());
             masked.push_str(&marker);
             dynamic_markers.push(marker);
