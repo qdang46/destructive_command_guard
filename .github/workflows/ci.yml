@@ -228,8 +228,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $tests = Get-ChildItem -Path tests/installer -Filter '*_test.ps1' | Sort-Object Name
-          if ($tests.Count -eq 0) { throw 'no installer pwsh tests found under tests/installer' }
+          # The workspace move put the installer pwsh tests under
+          # crates/dcg-cli/tests/installer (they were at tests/installer before
+          # the c0a6856 workspace restructure). Resolve from either location.
+          $installerDir = 'tests/installer'
+          if (-not (Test-Path $installerDir)) { $installerDir = 'crates/dcg-cli/tests/installer' }
+          $tests = Get-ChildItem -Path $installerDir -Filter '*_test.ps1' | Sort-Object Name
+          if ($tests.Count -eq 0) { throw "no installer pwsh tests found under $installerDir" }
           $failed = @()
           foreach ($t in $tests) {
             Write-Host "== $($t.Name) =="
