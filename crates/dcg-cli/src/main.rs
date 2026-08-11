@@ -370,6 +370,20 @@ fn try_deny_oversized_input(
         return false;
     };
 
+    // The oversized-scan is a security-critical path: padding a destructive
+    // command past the size limit must not skip evaluation (issue #160/#290).
+    // The caller's deadline may already be exhausted by the time we get here
+    // (self-heal, pack loading, prior evaluation), so give the window scan
+    // its own fresh budget of at least HOOK_EVALUATION_BUDGET. Otherwise a
+    // slow runner (or many enabled packs) would silently fail open on a
+    // padded destructive payload.
+    let oversized_deadline = Deadline::new(
+        deadline
+            .remaining()
+            .unwrap_or(Duration::ZERO)
+            .max(HOOK_EVALUATION_BUDGET),
+    );
+
     // The padding may live INSIDE the command string (the issue's repro
     // shape), either before or after the destructive part. Evaluating an
     // over-limit command outright would be refused as oversized, so slice it
@@ -428,7 +442,7 @@ fn try_deny_oversized_input(
         heredoc_settings,
         cwd_path: cwd_path.as_deref(),
         working_dir: &working_dir,
-        deadline,
+        deadline: &oversized_deadline,
         hook_protocol,
         history_agent_type,
         max_command_bytes,
@@ -443,7 +457,7 @@ fn try_deny_oversized_input(
     // scan. Bail out as soon as the deadline is gone — an exhausted budget
     // means fail-open, exactly as before.
     for command in &commands {
-        if deadline.is_exceeded() {
+        if oversized_deadline.is_exceeded() {
             break;
         }
         // Windows made of pure padding carry no enabled keyword; skipping
@@ -458,7 +472,7 @@ fn try_deny_oversized_input(
                 let mut history_writer = if config.history.enabled {
                     let mut writer =
                         HistoryWriter::new(history_db_path(&config.history), &config.history);
-                    writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                    writer.limit_drop_wait_to(oversized_deadline.remaining().unwrap_or_default());
                     Some(writer)
                 } else {
                     None

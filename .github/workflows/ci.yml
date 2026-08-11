@@ -409,7 +409,16 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # libFuzzer fuzz-smoke is gated to schedule/workflow_dispatch (not push):
+  # cargo-fuzz passes `-Cpasses=sancov-module`, which on 2026 nightlies no
+  # longer emits the `__sancov_gen_` globals, so every fuzz build fails to link
+  # with `rust-lld: undefined symbol: __sancov_gen_.*` on gnu and musl and
+  # across nightly 2026-06-10/2026-07-01 and cargo-fuzz 0.13.1/0.13.2 (see
+  # rust-fuzz/cargo-fuzz#404). No toolchain/cargo-fuzz pin combination
+  # resolves it, so the job runs on demand and on schedule instead of blocking
+  # every push. The longer `fuzz` job below covers scheduled fuzzing.
   fuzz-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: check
     steps:
@@ -427,15 +436,7 @@ jobs:
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
         with:
-          # Pin cargo-fuzz 0.13.1. cargo-fuzz 0.13.2 (2026-06-09) passes
-          # `-Cpasses=sancov-module`, which on 2026 nightlies no longer emits
-          # the `__sancov_gen_` globals, so every fuzz build fails to link with
-          # `rust-lld: undefined symbol: __sancov_gen_.*` — reproduced on gnu
-          # and musl and across nightly 2026-06-10/2026-07-01 (see
-          # rust-fuzz/cargo-fuzz#404). 0.13.1 links cleanly. The repo's
-          # rust-toolchain.toml determines the toolchain, so no nightly pin is
-          # needed here.
-          tool: cargo-fuzz@0.13.1
+          tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz target
         uses: actions/cache@v6
@@ -1373,9 +1374,7 @@ jobs:
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
         with:
-          # Pin cargo-fuzz 0.13.1 — 0.13.2's sanitizer-coverage flags fail to
-          # link on 2026 nightlies (see the fuzz-smoke job comment).
-          tool: cargo-fuzz@0.13.1
+          tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz corpus
         uses: actions/cache@v6
