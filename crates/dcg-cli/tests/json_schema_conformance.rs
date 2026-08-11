@@ -199,6 +199,12 @@ fn run_claude_hook(command: &str, config_toml: Option<&str>) -> (Value, String) 
         .env("PATH", system_path)
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
+        // Point the config loader at the hermetic config dir
+        // deterministically on every platform. Without this, Windows
+        // resolves `~/.config` to %APPDATA% and the `default_mode = "ask"`
+        // policy config written above is never found, turning ask-policy
+        // tests into default-denies.
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .env("TMPDIR", &tmpdir)
         .env("TEMP", &tmpdir)
         .env("TMP", &tmpdir)

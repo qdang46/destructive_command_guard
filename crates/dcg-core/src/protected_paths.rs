@@ -121,12 +121,10 @@ impl ProtectedPaths {
         if self.entries.is_empty() {
             return None;
         }
-        let canon = path.canonicalize().ok();
-        let target: &Path = canon.as_deref().unwrap_or(path);
+        let target = canonical_for_compare(path);
         self.entries.iter().find_map(|entry| {
-            let prefix_canon = entry.prefix.canonicalize().ok();
-            let prefix_target: &Path = prefix_canon.as_deref().unwrap_or(&entry.prefix);
-            if starts_with_path(target, prefix_target) {
+            let prefix_target = canonical_for_compare(&entry.prefix);
+            if starts_with_path(&target, &prefix_target) {
                 Some(entry.severity)
             } else {
                 None
@@ -141,6 +139,47 @@ impl ProtectedPaths {
     #[must_use]
     pub fn is_prompt_always(&self, path: &Path) -> bool {
         self.check_severity(path) == Some(ProtectedSeverity::PromptAlways)
+    }
+}
+
+/// Canonicalize a path for prefix comparison, tolerating a missing tail.
+///
+/// `Path::canonicalize()` fails when any component does not exist. But a
+/// protected *prefix* such as `~/.aws` may exist while the concrete child
+/// (`~/.aws/credentials`) has not been created yet — that is exactly the
+/// moment a write prompt matters. Canonicalizing only the prefix (because it
+/// exists) but not the child (because it does not) produces mismatched
+/// components on Windows: `canonicalize` returns a `\\?\` verbatim-prefixed
+/// path (`VerbatimDisk` component) while the raw child uses a plain `Disk`
+/// component, so `starts_with_path` reports a false negative and the
+/// credential path is left unprotected.
+///
+/// To keep both sides in the same form, canonicalize the deepest existing
+/// ancestor and re-append the non-existent remainder.
+fn canonical_for_compare(path: &Path) -> PathBuf {
+    if let Ok(canon) = path.canonicalize() {
+        return canon;
+    }
+    let mut ancestor = path;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match ancestor.parent() {
+            Some(parent) if parent != ancestor => {
+                if let Some(last) = ancestor.file_name() {
+                    tail.push(last.to_os_string());
+                }
+                ancestor = parent;
+            }
+            _ => break,
+        }
+    }
+    if let Ok(mut canon) = ancestor.canonicalize() {
+        for component in tail.iter().rev() {
+            canon.push(component);
+        }
+        canon
+    } else {
+        path.to_path_buf()
     }
 }
 
