@@ -10069,7 +10069,6 @@ low = "disabled"
         assert!(rendered.len() < 128);
     }
 
-    #[cfg(unix)]
     #[test]
     fn config_source_outcomes_are_lazy_and_authority_aware() {
         use tempfile::TempDir;
@@ -10091,21 +10090,49 @@ low = "disabled"
             "hot-path loading must not allocate a diagnostic outcome"
         );
 
-        let (traced_layer, traced_outcome) = Config::load_layer_from_file_with_outcome(
-            &path,
-            ConfigSource::AutoProject,
-            ConfigFileLayer::AutomaticProject,
-            ConfigFileAuthority::EnforcementOnly,
-            true,
-        );
-        assert!(traced_layer.is_some());
-        let traced_outcome = traced_outcome.expect("tracing requested");
-        assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
-        assert_eq!(
-            traced_outcome.authority,
-            ConfigFileAuthority::EnforcementOnly
-        );
-        assert_eq!(traced_outcome.path.as_deref(), Some(path.as_path()));
+        // Automatic-project config is fail-closed on non-Unix (native ACL and
+        // reparse-point validation is unavailable, so the source is refused)
+        // and loaded on Unix. Both are authority-aware behavior; assert the
+        // platform-correct outcome rather than gating the whole test.
+        #[cfg(unix)]
+        {
+            let (traced_layer, traced_outcome) = Config::load_layer_from_file_with_outcome(
+                &path,
+                ConfigSource::AutoProject,
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                true,
+            );
+            assert!(traced_layer.is_some());
+            let traced_outcome = traced_outcome.expect("tracing requested");
+            assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+            assert_eq!(
+                traced_outcome.authority,
+                ConfigFileAuthority::EnforcementOnly
+            );
+            assert_eq!(traced_outcome.path.as_deref(), Some(path.as_path()));
+        }
+        #[cfg(not(unix))]
+        {
+            let (traced_layer, traced_outcome) = Config::load_layer_from_file_with_outcome(
+                &path,
+                ConfigSource::AutoProject,
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                true,
+            );
+            assert!(
+                traced_layer.is_none(),
+                "auto-project config must be refused on non-Unix (fail-closed)"
+            );
+            let traced_outcome = traced_outcome.expect("tracing requested");
+            assert_ne!(traced_outcome.status, ConfigFileStatus::Loaded);
+            assert_eq!(
+                traced_outcome.authority,
+                ConfigFileAuthority::EnforcementOnly
+            );
+            assert_eq!(traced_outcome.path.as_deref(), Some(path.as_path()));
+        }
     }
 
     #[cfg(unix)]

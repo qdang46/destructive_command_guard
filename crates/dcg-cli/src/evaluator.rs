@@ -52,7 +52,7 @@ use crate::heredoc::{
 };
 use crate::normalize::{
     NormalizeTokenKind, PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, ShellDialect, ShellTokenDecoder,
-    ShellTokenRole, strip_wrapper_prefixes, tokenize_for_shell_dialect,
+    ShellTokenRole, strip_wrapper_prefixes, tokenize_for_normalization, tokenize_for_shell_dialect,
 };
 use crate::packs::{
     PatternSuggestion, REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_pre_normalized,
@@ -13442,9 +13442,56 @@ fn push_indirect_flow(flows: &mut Vec<IndirectInputFlow>, flow: IndirectInputFlo
     }
 }
 
+/// Restore backslashes that `shell_words::split` swallowed from unquoted
+/// Windows paths.
+///
+/// `shell_words::split` parses POSIX quoting correctly but treats every
+/// backslash as an escape, so an unquoted Windows path (`C:\Users\me\file`)
+/// decodes to `C:Usersmefile` and script-file inspection cannot resolve it.
+/// The dialect-aware tokenizer keeps backslashes intact and exposes the byte
+/// range of each word, so when a split token looks like a drive-letter path
+/// that lost its separators, replace it with the raw (backslash-preserving)
+/// spelling from the command text. Quoted paths are untouched because
+/// `shell_words` already handles them correctly.
+fn restore_windows_paths(normalized: &str, tokens: &mut [String]) {
+    // Collect the raw (backslash-preserving) word spellings in order. The
+    // tokenizer keeps backslashes intact where `shell_words` swallowed them.
+    let raw_words: Vec<&str> = tokenize_for_normalization(normalized)
+        .into_iter()
+        .filter(|t| t.kind == NormalizeTokenKind::Word)
+        .filter_map(|t| t.text(normalized))
+        .collect();
+    if raw_words.is_empty() {
+        return;
+    }
+    // Walk both lists in lockstep: each shell_words token corresponds to the
+    // next raw word (the tokenizer emits the same words for well-formed
+    // input, keeping backslashes). When a token lost its backslashes and the
+    // raw twin matches, restore it. Tokens with complex quoting are left
+    // untouched because we only accept an exact (backslash-stripped) match.
+    for (index, token) in tokens.iter_mut().enumerate() {
+        let Some(candidate) = raw_words.get(index) else {
+            break;
+        };
+        let looks_mangled = token.len() >= 3
+            && token.as_bytes()[0].is_ascii_alphabetic()
+            && token.as_bytes()[1] == b':'
+            && !token.contains('\\');
+        if looks_mangled
+            && candidate.contains('\\')
+            && candidate.starts_with(&token[..2])
+            && candidate[2..].replace('\\', "") == token[2..]
+        {
+            *token = candidate.to_string();
+        }
+    }
+}
+
 fn command_tokens(command: &str) -> Option<(String, Vec<String>)> {
     let stripped = strip_wrapper_prefixes(command);
-    let mut tokens = shell_words::split(stripped.normalized.as_ref()).ok()?;
+    let normalized = stripped.normalized.as_ref();
+    let mut tokens = shell_words::split(normalized).ok()?;
+    restore_windows_paths(normalized, &mut tokens);
     while tokens
         .first()
         .is_some_and(|token| is_shell_assignment(token) || token == "&")
@@ -25359,7 +25406,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn database_script_files_are_bounded_and_inspected_by_their_client_pack() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -25988,7 +26034,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn sed_program_files_are_inspected_for_shell_execution() {
         let temp = tempfile::tempdir().expect("tempdir");
