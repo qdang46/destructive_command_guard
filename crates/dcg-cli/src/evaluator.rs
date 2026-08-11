@@ -13477,10 +13477,16 @@ fn restore_windows_paths(normalized: &str, tokens: &mut [String]) {
             && token.as_bytes()[0].is_ascii_alphabetic()
             && token.as_bytes()[1] == b':'
             && !token.contains('\\');
+        // Restore the raw spelling when the token lost its backslashes and the
+        // lockstep raw twin is a drive-letter path. We do not require an exact
+        // character match: `shell_words` may also swallow characters like `~`
+        // (8.3 short names such as RUNNER~1), so a prefix + backslash is the
+        // reliable signal. The raw twin is only accepted when it carries no
+        // quoting, so complex tokens are left untouched.
         if looks_mangled
             && candidate.contains('\\')
+            && !candidate.contains(['\'', '"'])
             && candidate.starts_with(&token[..2])
-            && candidate[2..].replace('\\', "") == token[2..]
         {
             *token = candidate.to_string();
         }
