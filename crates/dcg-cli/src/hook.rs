@@ -772,7 +772,7 @@ fn decode_json_string_prefix(body: &str) -> Option<String> {
 /// `powershell`-named shell tool away from the unconditional Windows-shell →
 /// Codex rule.
 ///
-/// See: <https://github.com/quangdang46/destructive_command_guard/issues/77>
+/// See: <https://github.com/Dicklesworthstone/destructive_command_guard/issues/77>
 #[must_use]
 pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     let tool_name = input
@@ -1543,7 +1543,7 @@ pub(crate) fn print_colorful_warning_to(
             );
             let _ = writeln!(
                 writer,
-                "{footer_style}https://github.com/quangdang46/destructive_command_guard/issues/new?template=false_positive.yml{reset}"
+                "{footer_style}https://github.com/Dicklesworthstone/destructive_command_guard/issues/new?template=false_positive.yml{reset}"
             );
             let _ = writeln!(writer);
         }

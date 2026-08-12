@@ -65,9 +65,30 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           else
             echo "Downloading dcg from: $DOWNLOAD_URL"
-            curl -sL "$DOWNLOAD_URL" -o dcg
-            chmod +x dcg
-            sudo mv dcg /usr/local/bin/
+            curl -sL "$DOWNLOAD_URL" -o dcg-artifact
+            # Release assets are compressed archives (.tar.xz / .zip), not raw
+            # binaries. Extract the actual dcg binary from them.
+            if [[ "$DOWNLOAD_URL" == *.tar.xz ]]; then
+              tar -xJf dcg-artifact
+            elif [[ "$DOWNLOAD_URL" == *.tar.gz ]]; then
+              tar -xzf dcg-artifact
+            elif [[ "$DOWNLOAD_URL" == *.zip ]]; then
+              unzip -o dcg-artifact
+            else
+              mv dcg-artifact dcg
+            fi
+            # The archive contains a file named `dcg` (or `dcg.exe`); find it.
+            if [[ -f dcg ]]; then
+              chmod +x dcg
+              sudo mv dcg /usr/local/bin/dcg
+            elif [[ -f dcg.exe ]]; then
+              chmod +x dcg.exe
+              sudo mv dcg.exe /usr/local/bin/dcg
+            else
+              echo "::error::Extracted artifact did not contain a dcg binary"
+              ls -la
+              exit 1
+            fi
           fi
 
       - name: Verify dcg installation

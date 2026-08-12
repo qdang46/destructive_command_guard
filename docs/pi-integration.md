@@ -6,7 +6,7 @@ This document shows how to connect dcg to the [Pi coding agent](https://github.c
 (`earendil-works/pi`). Pi is not auto-configured by dcg's installer — Pi's
 guardrails are deliberately user-authored as small TypeScript *extensions* — so
 this is the official "directed implementation" recipe requested in
-[issue #133](https://github.com/quangdang46/destructive_command_guard/issues/133).
+[issue #133](https://github.com/Dicklesworthstone/destructive_command_guard/issues/133).
 Drop in the extension below and Pi will route every shell command through dcg
 before it runs.
 
