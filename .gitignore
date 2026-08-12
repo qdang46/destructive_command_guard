@@ -89,3 +89,6 @@ e2e_*.log
 # DCG temporary/backup files
 .dcg/
 alex
+
+# Local CI/debug artifacts (downloaded job logs, e2e/perf artifacts, temp probes)
+.ci_logs/
