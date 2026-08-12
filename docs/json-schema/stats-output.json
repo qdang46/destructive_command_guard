@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/stats-output.json",
+  "$id": "https://github.com/quangdang46/destructive_command_guard/docs/json-schema/stats-output.json",
   "title": "DCG Statistics Output",
   "description": "JSON output format for 'dcg stats' command, which displays aggregated statistics from dcg log files over a configurable time period.",
   "type": "object",

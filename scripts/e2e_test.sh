@@ -927,7 +927,7 @@ PY
 
     # Test: Verify badge URL is accessible (non-blocking - badge may not exist yet)
     log_test_start "Codecov badge accessible"
-    local badge_url="https://codecov.io/gh/Dicklesworthstone/destructive_command_guard/branch/main/graph/badge.svg"
+    local badge_url="https://codecov.io/gh/quangdang46/destructive_command_guard/branch/main/graph/badge.svg"
     if command -v curl &>/dev/null; then
         if curl -sf --max-time 5 "$badge_url" >/dev/null 2>&1; then
             log_pass "Codecov badge accessible"

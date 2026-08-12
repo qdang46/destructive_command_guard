@@ -7,8 +7,8 @@ authors = [
     "Dowwie <dowwie@gmail.com>",
 ]
 description = "Core library for Destructive Command Guard: permission modes, effect-tagged rules, and tool-aware command evaluation"
-repository = "https://github.com/Dicklesworthstone/destructive_command_guard"
-homepage = "https://github.com/Dicklesworthstone/destructive_command_guard"
+repository = "https://github.com/quangdang46/destructive_command_guard"
+homepage = "https://github.com/quangdang46/destructive_command_guard"
 license = "MIT"
 keywords = ["security", "permissions", "agent", "guard", "library"]
 categories = ["development-tools", "command-line-utilities"]

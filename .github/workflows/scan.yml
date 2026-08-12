@@ -12,7 +12,7 @@
 #   - fail-on: error (default), warning, or none
 #   - redact: none, quoted, or aggressive (for sensitive commands)
 #
-# For more information: https://github.com/Dicklesworthstone/destructive_command_guard
+# For more information: https://github.com/quangdang46/destructive_command_guard
 
 name: scan
 

@@ -589,7 +589,7 @@ pub(crate) struct ConfigLoadReport {
 
 /// Canonical published location of dcg's committed JSON Schema. Editors point
 /// their `config.toml` here (or at a local copy) to get autocomplete/validation.
-pub const CONFIG_SCHEMA_ID: &str = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json";
+pub const CONFIG_SCHEMA_ID: &str = "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/config.schema.json";
 
 /// Build the JSON Schema for [`Config`] as a [`serde_json::Value`].
 ///
@@ -5510,7 +5510,7 @@ impl Config {
     #[allow(clippy::too_many_lines)]
     pub fn generate_sample_config() -> String {
         r#"# dcg configuration
-# https://github.com/Dicklesworthstone/destructive_command_guard
+# https://github.com/quangdang46/destructive_command_guard
 
 [general]
 # Color output: "auto" | "always" | "never"

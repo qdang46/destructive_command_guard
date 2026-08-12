@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/scan-results.json",
+  "$id": "https://github.com/quangdang46/destructive_command_guard/docs/json-schema/scan-results.json",
   "title": "DCG Scan Results",
   "description": "JSON output format for 'dcg scan' command, which scans codebases for potentially destructive commands embedded in scripts, makefiles, and other files.",
   "type": "object",

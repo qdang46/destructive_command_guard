@@ -3,7 +3,7 @@
 # dcg uninstaller
 #
 # One-liner uninstall:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/uninstall.sh | bash
 #
 # Options:
 #   --yes            Skip confirmation prompt
@@ -1091,7 +1091,7 @@ main() {
             echo
             log "${YELLOW}Cannot read confirmation (no TTY available).${NC}"
             log "${YELLOW}Re-run with --yes to skip the prompt, e.g.:${NC}"
-            log "    curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh | bash -s -- --yes"
+            log "    curl -fsSL https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/uninstall.sh | bash -s -- --yes"
             return 1
         fi
         case "$response" in

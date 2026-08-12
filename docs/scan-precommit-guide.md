@@ -125,7 +125,7 @@ jobs:
         with:
           fetch-depth: 0
       - run: |
-          curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh | bash
+          curl -fsSL https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh | bash
       - run: dcg scan --git-diff origin/${{ github.base_ref }}...HEAD --fail-on error
 ```
 

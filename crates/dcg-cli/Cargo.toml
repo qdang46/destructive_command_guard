@@ -7,8 +7,8 @@ authors = [
     "Dowwie <dowwie@gmail.com>",
 ]
 description = "An AI coding agent hook that blocks destructive commands before they execute (CLI + binary; pairs with dcg-core library)"
-repository = "https://github.com/Dicklesworthstone/destructive_command_guard"
-homepage = "https://github.com/Dicklesworthstone/destructive_command_guard"
+repository = "https://github.com/quangdang46/destructive_command_guard"
+homepage = "https://github.com/quangdang46/destructive_command_guard"
 license = "MIT"
 keywords = ["destructive", "safety", "claude", "hook", "guard"]
 categories = ["command-line-utilities", "development-tools"]

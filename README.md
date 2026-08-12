@@ -6,7 +6,7 @@
 
 <div align="center">
 
-[![Coverage](https://img.shields.io/codecov/c/github/Dicklesworthstone/destructive_command_guard?label=coverage)](https://codecov.io/gh/Dicklesworthstone/destructive_command_guard)
+[![Coverage](https://img.shields.io/codecov/c/github/quangdang46/destructive_command_guard?label=coverage)](https://codecov.io/gh/quangdang46/destructive_command_guard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 </div>
@@ -19,7 +19,7 @@ A high-performance hook for AI coding agents that blocks destructive commands be
 <h3>Quick Install</h3>
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
 <p><em>Works on Linux, macOS, and Windows via WSL. Auto-detects your platform, downloads the right binary, and configures supported agent hooks including Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, VS Code Copilot Chat (through VS Code's Claude-hook compatibility), Cursor IDE, Hermes Agent, and Grok (xAI) (via <code>dcg install --grok</code> for a native <code>~/.grok/hooks/dcg.json</code>, or via the Claude compatibility layer automatically picked up by Grok). For native Windows, use the PowerShell installer below.</em></p>
@@ -27,7 +27,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 <h4>Windows (native, PowerShell)</h4>
 
 ```powershell
-& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
+& ([scriptblock]::Create((irm "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.ps1"))) -EasyMode -Verify
 ```
 
 <p><em>Installs native <code>dcg.exe</code>, verifies the SHA256 checksum (and the Sigstore/cosign signature when <code>cosign</code> is present), adds it to your User <code>PATH</code> (<code>-EasyMode</code>), runs a self-test (<code>-Verify</code>), and configures detected agent hooks for Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent. Copilot is configured at the user level under <code>%COPILOT_HOME%\hooks</code> (or <code>%USERPROFILE%\.copilot\hooks</code>) so every workspace is protected. On Windows the <code>windows.filesystem</code> and <code>windows.system</code> packs are on by default, so <code>del /s</code>, <code>rd /s</code>, <code>Remove-Item -Recurse -Force</code>, <code>format</code>, and <code>vssadmin delete shadows</code> are blocked out of the box. Pin a version with <code>-Version vX.Y.Z</code>.</em></p>
@@ -806,7 +806,7 @@ review where the hook protocol supports it and otherwise blocks.
 The easiest way to install is using the install script, which downloads a prebuilt binary for your platform:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --easy-mode
 ```
 
 Easy mode auto-detects your platform, downloads the right binary, verifies SHA256 checksums, configures all supported AI agent hooks (Claude Code, Codex CLI, Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent, Aider), and updates your PATH. For Codex CLI 0.125.0+, the installer merges a `PreToolUse` Bash hook into `~/.codex/hooks.json`; invalid JSON or malformed existing Codex hook shapes are left unchanged and reported instead of being overwritten.
@@ -816,31 +816,31 @@ Easy mode auto-detects your platform, downloads the right binary, verifies SHA25
 Interactive mode (prompts for each step):
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh?$(date +%s)" | bash
 ```
 
 Install specific version:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.5.0
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --version v0.5.0
 ```
 
 Install to /usr/local/bin (system-wide, requires sudo):
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | sudo bash -s -- --system
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh?$(date +%s)" | sudo bash -s -- --system
 ```
 
 Build from source instead of downloading binary:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --from-source
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --from-source
 ```
 
 Download/install only (skip agent hook configuration):
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --no-configure
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh?$(date +%s)" | bash -s -- --no-configure
 ```
 
 > **Note:** If you have [gum](https://github.com/charmbracelet/gum) installed, the installer will use it for fancy terminal formatting.
@@ -875,13 +875,13 @@ This project uses Rust Edition 2024 features and requires the nightly toolchain.
 rustup install nightly
 
 # Install directly from GitHub
-cargo +nightly install --git https://github.com/Dicklesworthstone/destructive_command_guard destructive_command_guard
+cargo +nightly install --git https://github.com/quangdang46/destructive_command_guard destructive_command_guard
 ```
 
 ### Manual build
 
 ```bash
-git clone https://github.com/Dicklesworthstone/destructive_command_guard
+git clone https://github.com/quangdang46/destructive_command_guard
 cd destructive_command_guard
 # rust-toolchain.toml automatically selects nightly
 cargo build --release
@@ -916,7 +916,7 @@ Prebuilt binaries are available for:
 - Windows x64 (`x86_64-pc-windows-msvc`)
 - Windows ARM64 (`aarch64-pc-windows-msvc`)
 
-Download from [GitHub Releases](https://github.com/Dicklesworthstone/destructive_command_guard/releases) and verify the SHA256 checksum.
+Download from [GitHub Releases](https://github.com/quangdang46/destructive_command_guard/releases) and verify the SHA256 checksum.
 If you have cosign installed, each release also includes a Sigstore bundle (`.sigstore.json`) so you can verify provenance with `cosign verify-blob`.
 
 ## Uninstalling
@@ -924,13 +924,13 @@ If you have cosign installed, each release also includes a Sigstore bundle (`.si
 Remove dcg and all its hooks from AI agents:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/uninstall.sh | bash
 ```
 
 On Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/uninstall.ps1 | iex
 ```
 
 The Unix uninstaller:
@@ -1245,7 +1245,7 @@ $ git checkout -- .        # now allowed, permit consumed
 $ git push
 ```
 
-See issue [#104](https://github.com/Dicklesworthstone/destructive_command_guard/issues/104) for background.
+See issue [#104](https://github.com/quangdang46/destructive_command_guard/issues/104) for background.
 
 The `--version` output includes build metadata for debugging:
 
@@ -1554,7 +1554,7 @@ jobs:
 
       - name: Install dcg
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh" | bash
+          curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh" | bash
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
       - name: Scan changed files
@@ -1570,7 +1570,7 @@ jobs:
 scan:
   stage: test
   script:
-    - curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.sh" | bash
+    - curl -fsSL "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.sh" | bash
     - ~/.local/bin/dcg scan --git-diff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME..HEAD --fail-on error
   rules:
     - if: $CI_MERGE_REQUEST_ID
@@ -2289,7 +2289,7 @@ While dcg provides comprehensive protection across many tools and platforms, som
 - **Committed but unpushed work**: The hook doesn't prevent loss of local-only commits
 - **Bugs in allowed commands**: A `git commit` that accidentally includes wrong files
 - **Commands in scripts**: If an agent runs `./deploy.sh`, we don't inspect what's inside the script
-- **Stdin/pipe/redirection data-flow into REPL binaries** ([#191](https://github.com/Dicklesworthstone/destructive_command_guard/issues/191)): dcg evaluates the *command line*, and heredocs / here-strings (`redis-cli <<< FLUSHALL`) / inline-code flags (`bash -c`, `python -c`). It does **not** yet trace a dangerous payload that reaches a stdin-driven REPL tool (`redis-cli`, `psql`, `mysql`, `mongosh`, `sqlite3`, …) indirectly — via a pipe from another producer (`echo FLUSHALL | redis-cli`), input redirection (`redis-cli < file`), or command substitution used as an argument (`redis-cli $(echo FLUSHALL)`). The direct forms (`redis-cli FLUSHALL`) and here-strings are still blocked. Extending context classification to follow this data flow is tracked for a focused fix; until then, treat stdin-fed REPL invocations as unguarded.
+- **Stdin/pipe/redirection data-flow into REPL binaries** ([#191](https://github.com/quangdang46/destructive_command_guard/issues/191)): dcg evaluates the *command line*, and heredocs / here-strings (`redis-cli <<< FLUSHALL`) / inline-code flags (`bash -c`, `python -c`). It does **not** yet trace a dangerous payload that reaches a stdin-driven REPL tool (`redis-cli`, `psql`, `mysql`, `mongosh`, `sqlite3`, …) indirectly — via a pipe from another producer (`echo FLUSHALL | redis-cli`), input redirection (`redis-cli < file`), or command substitution used as an argument (`redis-cli $(echo FLUSHALL)`). The direct forms (`redis-cli FLUSHALL`) and here-strings are still blocked. Extending context classification to follow this data flow is tracked for a focused fix; until then, treat stdin-fed REPL invocations as unguarded.
 
 ### Threat Model
 

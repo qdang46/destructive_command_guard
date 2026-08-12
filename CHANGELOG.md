@@ -7,7 +7,7 @@ Versions marked **[Pre-release]** are GitHub prereleases that were not promoted
 to latest.
 Versions marked **[Tag]** are git tags only (no binaries published).
 
-Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
+Repository: <https://github.com/quangdang46/destructive_command_guard>
 
 ---
 

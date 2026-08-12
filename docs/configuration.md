@@ -250,7 +250,7 @@ Install the **Even Better TOML** extension, then either add a schema directive
 comment at the top of your `config.toml`:
 
 ```toml
-#:schema https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json
+#:schema https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/config.schema.json
 
 [packs]
 enabled = ["kubernetes"]
@@ -261,8 +261,8 @@ or associate the schema in your VS Code `settings.json`:
 ```json
 {
   "evenBetterToml.schema.associations": {
-    "**/dcg/config.toml": "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json",
-    "**/.dcg.toml": "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json"
+    "**/dcg/config.toml": "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/config.schema.json",
+    "**/.dcg.toml": "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/config.schema.json"
   }
 }
 ```
@@ -276,7 +276,7 @@ Point taplo at the schema in a `.taplo.toml` at your repo root:
 include = ["**/dcg/config.toml", "**/.dcg.toml"]
 
 [rule.schema]
-path = "https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/config.schema.json"
+path = "https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/config.schema.json"
 ```
 
 ### Regenerating the schema

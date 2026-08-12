@@ -21,7 +21,7 @@ pub const SARIF_SCHEMA: &str = "https://raw.githubusercontent.com/oasis-tcs/sari
 pub const SARIF_VERSION: &str = "2.1.0";
 
 /// DCG tool information URI.
-pub const DCG_INFO_URI: &str = "https://github.com/Dicklesworthstone/destructive_command_guard";
+pub const DCG_INFO_URI: &str = "https://github.com/quangdang46/destructive_command_guard";
 
 /// Top-level SARIF report structure.
 #[derive(Debug, Clone, Serialize)]
@@ -403,7 +403,7 @@ impl SarifReport {
                 short_description: finding.reason.as_ref().map(SarifMessage::text),
                 full_description: None,
                 help_uri: Some(format!(
-                    "https://github.com/Dicklesworthstone/destructive_command_guard/blob/main/docs/rules/{}.md",
+                    "https://github.com/quangdang46/destructive_command_guard/blob/main/docs/rules/{}.md",
                     rule_id.replace([':', '.'], "/")
                 )),
                 default_configuration: Some(SarifReportingConfiguration {

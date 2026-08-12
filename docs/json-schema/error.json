@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/error.json",
+  "$id": "https://github.com/quangdang46/destructive_command_guard/docs/json-schema/error.json",
   "title": "DCG Error Response",
   "description": "JSON error format used by dcg CLI commands when errors occur. Errors are typically written to stderr, but some commands include error fields in their JSON output.",
   "type": "object",

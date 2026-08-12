@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 pub const CACHE_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// GitHub repository owner.
-const REPO_OWNER: &str = "Dicklesworthstone";
+const REPO_OWNER: &str = "quangdang46";
 
 /// GitHub repository name.
 const REPO_NAME: &str = "destructive_command_guard";
@@ -996,11 +996,11 @@ mod tests {
     fn test_release_url_for_version_uses_canonical_v_tag() {
         assert_eq!(
             release_url_for_version("v2.1.0"),
-            "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v2.1.0"
+            "https://github.com/quangdang46/destructive_command_guard/releases/tag/v2.1.0"
         );
         assert_eq!(
             release_url_for_version("2.1.0"),
-            "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v2.1.0"
+            "https://github.com/quangdang46/destructive_command_guard/releases/tag/v2.1.0"
         );
     }
 
@@ -1008,7 +1008,7 @@ mod tests {
     fn test_release_url_for_version_empty_uses_latest() {
         assert_eq!(
             release_url_for_version(""),
-            "https://github.com/Dicklesworthstone/destructive_command_guard/releases/latest"
+            "https://github.com/quangdang46/destructive_command_guard/releases/latest"
         );
     }
 

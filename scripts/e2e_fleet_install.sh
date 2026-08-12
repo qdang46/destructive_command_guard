@@ -37,7 +37,7 @@ HOSTS_OVERRIDE=""
 JSON_OUTPUT=false
 INCLUDE_WINDOWS=true
 LOCAL_ONLY=false
-REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main"
+REPO_RAW="https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,7 +53,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$VERSION" ]]; then
-  VERSION="$(gh release view -R Dicklesworthstone/destructive_command_guard \
+  VERSION="$(gh release view -R quangdang46/destructive_command_guard \
     --json tagName --jq .tagName 2>/dev/null)"
   [[ -z "$VERSION" ]] && { echo "error: --version required (could not query latest)" >&2; exit 2; }
 fi

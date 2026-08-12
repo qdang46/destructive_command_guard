@@ -37,7 +37,7 @@
 //! `0.6.0-rc.1` — Phase A (core API + Session + tests). The pack-rule
 //! evaluation layer will be wired in during Phase 2 (see project plan).
 //!
-//! [dcg]: https://github.com/Dicklesworthstone/destructive_command_guard
+//! [dcg]: https://github.com/quangdang46/destructive_command_guard
 
 #![forbid(unsafe_code)]
 

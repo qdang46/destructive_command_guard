@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/Dicklesworthstone/destructive_command_guard/docs/json-schema/hook-output.json",
+  "$id": "https://github.com/quangdang46/destructive_command_guard/docs/json-schema/hook-output.json",
   "title": "DCG Hook Output",
   "description": "JSON output format for dcg when used as a Claude Code PreToolUse hook. Emitted when a command is denied or policy requests operator review; allowed and warn-only commands produce no output.",
   "type": "object",

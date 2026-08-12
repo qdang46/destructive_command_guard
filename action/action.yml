@@ -4,16 +4,16 @@
 # GitHub Actions workflows, and other executable contexts.
 #
 # USAGE:
-#   - uses: Dicklesworthstone/destructive_command_guard/action@v0
+#   - uses: quangdang46/destructive_command_guard/action@v0
 #     with:
 #       fail-on: error
 #       paths: .
 #
-# For more information: https://github.com/Dicklesworthstone/destructive_command_guard
+# For more information: https://github.com/quangdang46/destructive_command_guard
 
 name: 'Destructive Command Guard Scan'
 description: 'Scan repository for destructive commands in executable contexts'
-author: 'Dicklesworthstone'
+author: 'quangdang46'
 
 branding:
   icon: 'shield'
@@ -86,7 +86,7 @@ runs:
 
         if [ "$VERSION" = "latest" ]; then
           # Get latest release tag
-          VERSION=$(curl -sL https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/latest | jq -r '.tag_name // "v0.2.7"')
+          VERSION=$(curl -sL https://api.github.com/repos/quangdang46/destructive_command_guard/releases/latest | jq -r '.tag_name // "v0.2.7"')
         fi
 
         echo "Installing DCG version: $VERSION"
@@ -104,7 +104,7 @@ runs:
         esac
 
         # Download and extract
-        DOWNLOAD_URL="https://github.com/Dicklesworthstone/destructive_command_guard/releases/download/${VERSION}/dcg-${PLATFORM}.tar.gz"
+        DOWNLOAD_URL="https://github.com/quangdang46/destructive_command_guard/releases/download/${VERSION}/dcg-${PLATFORM}.tar.gz"
 
         echo "Downloading from: $DOWNLOAD_URL"
 
@@ -119,7 +119,7 @@ runs:
           fi
           if [ $i -eq 3 ]; then
             echo "::warning::Could not download pre-built binary, falling back to cargo install"
-            cargo install --git https://github.com/Dicklesworthstone/destructive_command_guard --tag "$VERSION" || cargo install --git https://github.com/Dicklesworthstone/destructive_command_guard
+            cargo install --git https://github.com/quangdang46/destructive_command_guard --tag "$VERSION" || cargo install --git https://github.com/quangdang46/destructive_command_guard
             echo "dcg_path=$(which dcg)" >> $GITHUB_OUTPUT
             exit 0
           fi

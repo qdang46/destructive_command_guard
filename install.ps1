@@ -1,7 +1,7 @@
 # dcg PowerShell installer
 #
 # Usage:
-#   irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.ps1 | iex
 #
 # Options:
 #   -Version vX.Y.Z   Install specific version (default: latest)
@@ -16,7 +16,7 @@
 Param(
   [string]$Version = "",
   [string]$Dest = "$HOME\.local\bin",
-  [string]$Owner = "Dicklesworthstone",
+  [string]$Owner = "quangdang46",
   [string]$Repo = "destructive_command_guard",
   [string]$Checksum = "",
   [string]$ChecksumUrl = "",
@@ -1061,7 +1061,7 @@ if ($Help) {
 dcg PowerShell installer
 
 Usage:
-  irm https://raw.githubusercontent.com/Dicklesworthstone/destructive_command_guard/main/install.ps1 | iex
+  irm https://raw.githubusercontent.com/quangdang46/destructive_command_guard/main/install.ps1 | iex
   & ([scriptblock]::Create((irm "<install.ps1 URL>"))) -EasyMode -Verify
 
 Options:

@@ -679,7 +679,7 @@ If CI thresholds change, update this section in the same change. The
 `coverage_threshold_docs` test checks that these documented values stay in sync
 with the workflow.
 
-Coverage is uploaded to Codecov for trend tracking. Dashboard: https://codecov.io/gh/Dicklesworthstone/destructive_command_guard
+Coverage is uploaded to Codecov for trend tracking. Dashboard: https://codecov.io/gh/quangdang46/destructive_command_guard
 
 ### Memory Tests Job
 

@@ -24,4 +24,4 @@ pulling in CLI/TUI/MCP dependencies.
 - Stable, semver-compatible API
 - Suitable for embedding in any Rust agent framework
 
-[dcg]: https://github.com/Dicklesworthstone/destructive_command_guard
+[dcg]: https://github.com/quangdang46/destructive_command_guard

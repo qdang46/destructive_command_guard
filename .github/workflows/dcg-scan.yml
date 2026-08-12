@@ -46,9 +46,9 @@ jobs:
       - name: Download dcg binary
         run: |
           if [ "$DCG_VERSION" = "latest" ]; then
-            RELEASE_URL="https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/latest"
+            RELEASE_URL="https://api.github.com/repos/quangdang46/destructive_command_guard/releases/latest"
           else
-            RELEASE_URL="https://api.github.com/repos/Dicklesworthstone/destructive_command_guard/releases/tags/$DCG_VERSION"
+            RELEASE_URL="https://api.github.com/repos/quangdang46/destructive_command_guard/releases/tags/$DCG_VERSION"
           fi
 
           # Get download URL for Linux x86_64 binary

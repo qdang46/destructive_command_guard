@@ -18,7 +18,7 @@ jobs:
       pull-requests: write  # Required for PR comments
     steps:
       - uses: actions/checkout@v4
-      - uses: Dicklesworthstone/destructive_command_guard/action@v0
+      - uses: quangdang46/destructive_command_guard/action@v0
         with:
           fail-on: error
 ```
@@ -54,7 +54,7 @@ jobs:
 Scan only changed files in a pull request:
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: quangdang46/destructive_command_guard/action@v0
   with:
     git-diff: ${{ github.event.pull_request.base.sha }}...HEAD
     comment-on-pr: true
@@ -65,7 +65,7 @@ Scan only changed files in a pull request:
 Scan the entire repository:
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: quangdang46/destructive_command_guard/action@v0
   with:
     paths: .
     fail-on: warning
@@ -74,7 +74,7 @@ Scan the entire repository:
 ### Scan Specific Directories
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: quangdang46/destructive_command_guard/action@v0
   with:
     paths: scripts/ .github/workflows/
 ```
@@ -82,7 +82,7 @@ Scan the entire repository:
 ### Use Results in Subsequent Steps
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: quangdang46/destructive_command_guard/action@v0
   id: scan
   with:
     fail-on: none  # Don't fail, just report
@@ -97,7 +97,7 @@ Scan the entire repository:
 ### Pin to Specific Version
 
 ```yaml
-- uses: Dicklesworthstone/destructive_command_guard/action@v0
+- uses: quangdang46/destructive_command_guard/action@v0
   with:
     dcg-version: v0.2.7
 ```
