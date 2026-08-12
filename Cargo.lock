@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "dcg-cli"
-version = "0.10.0"
+version = "0.1.2"
 dependencies = [
  "aho-corasick",
  "assert_cmd",

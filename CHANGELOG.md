@@ -11,6 +11,33 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.1.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.1.2) -- 2026-08-12 [Release]
+
+CI hardening and Windows correctness fixes:
+
+- **Windows paths in `command_tokens`**: `shell_words::split` treated every
+  backslash as a POSIX escape, so an unquoted Windows path (`C:\Users\me\file`)
+  decoded to `C:Usersmefile` and script-file inspection could not resolve it.
+  Split tokens are now restored from their raw, backslash-preserving form, and
+  the sed/database script-file tests run on Windows instead of being gated off.
+- **Tilde glob only at word start**: an embedded `~` (8.3 short names like
+  `RUNNER~1`, or git revisions like `HEAD~1`) is literal; only `~`, `~/...`,
+  `~user` at a word start are treated as tilde-expansion globs. Fixes safe-file
+  inspection on Windows CI temp paths and `git reset --hard HEAD~1` detection.
+- **mysql `source <file>` is a file reference**, not stdin code: `mysql -e
+  'source <path>'` no longer fails closed with `stdin-unverified` for benign
+  files.
+- **`backup_dir` honors `XDG_DATA_HOME`/`APPDATA`** so `dcg update --rollback`
+  works under hermetic test/CI homes.
+- **`protected_paths`** canonicalize the deepest existing ancestor, fixing
+  `~/.aws/credentials` PromptAlways detection on Windows.
+- **windows.filesystem**: detect plain cmd verbs (`del /s`, `rd /s`, `format`)
+  that carry no escape char; GNU rm long flags (`--interactive`,
+  `--preserve-root`) are not PowerShell `Remove-Item`.
+- **CI**: bats/perf/installer path fixes for the workspace restructure,
+  fuzz-smoke gated to schedule (upstream cargo-fuzz sancov breakage), and e2e
+  contracts aligned with the hardened severity model.
+
 ## [v0.10.0](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.10.0) -- 2026-08-07 [Release]
 
 A large correctness, feature, and hardening release from a full issue-triage
