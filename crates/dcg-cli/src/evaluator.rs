@@ -13497,7 +13497,13 @@ fn command_tokens(command: &str) -> Option<(String, Vec<String>)> {
     let stripped = strip_wrapper_prefixes(command);
     let normalized = stripped.normalized.as_ref();
     let mut tokens = shell_words::split(normalized).ok()?;
-    restore_windows_paths(normalized, &mut tokens);
+    // Fast path: only re-tokenize to restore Windows backslash paths when the
+    // command actually contains a backslash (a POSIX command with no `\` can
+    // never have a mangled path). This keeps the hot deny path allocation-free
+    // for the vast majority of commands.
+    if normalized.contains('\\') {
+        restore_windows_paths(normalized, &mut tokens);
+    }
     while tokens
         .first()
         .is_some_and(|token| is_shell_assignment(token) || token == "&")
