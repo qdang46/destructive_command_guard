@@ -16306,6 +16306,21 @@ fn command_argument_payloads(
 
     let mut flows = Vec::new();
     for (pack_id, value) in code_argument_slots(&executable, &args) {
+        // A mysql/mariadb `source <file>` (or `\. <file>`) code value is a
+        // file reference, not stdin code: it is handled separately by
+        // `file_argument_slots` below. Emitting it as a StaticProducer here
+        // would run the raw `source C:\...` text through the SQL analysis,
+        // which cannot classify it and fails closed with stdin-unverified —
+        // even when the sourced file is benign. Skip it; the file flow is the
+        // authoritative one.
+        if matches!(executable.as_str(), "mysql" | "mariadb")
+            && pack_id == "database.mysql"
+            && mysql_code_file_references(value)
+                .iter()
+                .any(|operand| matches!(operand, CommandFileOperand::Path(_)))
+        {
+            continue;
+        }
         let replacements: Vec<_> = masked
             .substitutions
             .iter()
