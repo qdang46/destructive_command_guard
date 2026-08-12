@@ -85,9 +85,16 @@ jobs:
               chmod +x dcg.exe
               sudo mv dcg.exe /usr/local/bin/dcg
             else
-              echo "::error::Extracted artifact did not contain a dcg binary"
-              ls -la
-              exit 1
+              # The archive may put the binary in a subdirectory; locate it.
+              found=$(find . -maxdepth 3 -type f \( -name dcg -o -name dcg.exe \) 2>/dev/null | head -1)
+              if [[ -n "$found" ]]; then
+                chmod +x "$found"
+                sudo mv "$found" /usr/local/bin/dcg
+              else
+                echo "::error::Extracted artifact did not contain a dcg binary"
+                ls -laR
+                exit 1
+              fi
             fi
           fi
 
