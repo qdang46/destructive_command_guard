@@ -10,8 +10,19 @@
 # CRLF-robust) — these rules cover snapshots and any raw-text fixture/golden
 # comparison so Windows and Unix CI agree regardless of git's autocrlf setting.
 tests/golden/** text eol=lf
+crates/dcg-cli/tests/golden/** text eol=lf
 *.snap text eol=lf
 tests/snapshots/** text eol=lf
+crates/dcg-cli/tests/snapshots/** text eol=lf
 tests/e2e/fixtures/** text eol=lf
+crates/dcg-cli/tests/e2e/fixtures/** text eol=lf
 # E2E shell harnesses must stay LF (they run under bash / git-bash).
 *.sh text eol=lf
+# PowerShell installer tests and install.ps1 are parsed by pwsh; keep them LF
+# so a Windows checkout (core.autocrlf) does not rewrite them.
+*.ps1 text eol=lf
+# Generated pack docs and config schema are compared exactly by tests; keep
+# them LF on every checkout.
+docs/packs/*.md text eol=lf
+config.schema.json text eol=lf
+docs/cli-versions.yaml text eol=lf

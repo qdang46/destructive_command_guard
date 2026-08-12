@@ -228,8 +228,13 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $tests = Get-ChildItem -Path tests/installer -Filter '*_test.ps1' | Sort-Object Name
-          if ($tests.Count -eq 0) { throw 'no installer pwsh tests found under tests/installer' }
+          # The workspace move put the installer pwsh tests under
+          # crates/dcg-cli/tests/installer (they were at tests/installer before
+          # the c0a6856 workspace restructure). Resolve from either location.
+          $installerDir = 'tests/installer'
+          if (-not (Test-Path $installerDir)) { $installerDir = 'crates/dcg-cli/tests/installer' }
+          $tests = Get-ChildItem -Path $installerDir -Filter '*_test.ps1' | Sort-Object Name
+          if ($tests.Count -eq 0) { throw "no installer pwsh tests found under $installerDir" }
           $failed = @()
           foreach ($t in $tests) {
             Write-Host "== $($t.Name) =="
@@ -409,7 +414,16 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # libFuzzer fuzz-smoke is gated to schedule/workflow_dispatch (not push):
+  # cargo-fuzz passes `-Cpasses=sancov-module`, which on 2026 nightlies no
+  # longer emits the `__sancov_gen_` globals, so every fuzz build fails to link
+  # with `rust-lld: undefined symbol: __sancov_gen_.*` on gnu and musl and
+  # across nightly 2026-06-10/2026-07-01 and cargo-fuzz 0.13.1/0.13.2 (see
+  # rust-fuzz/cargo-fuzz#404). No toolchain/cargo-fuzz pin combination
+  # resolves it, so the job runs on demand and on schedule instead of blocking
+  # every push. The longer `fuzz` job below covers scheduled fuzzing.
   fuzz-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: check
     steps:
@@ -900,7 +914,7 @@ jobs:
         id: bats
         run: |
           set +e
-          bats --tap tests/install/*.bats 2>&1 | tee bats-output.log
+          bats --tap crates/dcg-cli/tests/install/*.bats 2>&1 | tee bats-output.log
           EXIT_CODE=${PIPESTATUS[0]}
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
@@ -1313,7 +1327,7 @@ jobs:
       # what the baseline says.
       - name: Absolute hook-latency gate vs shipped default budget
         run: |
-          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
+          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' crates/dcg-cli/src/perf.rs | tr -d '_')
           if [ -z "$BUDGET_MS" ]; then
             echo "::error::could not read HOOK_EVALUATION_BUDGET_MS from src/perf.rs"
             exit 1

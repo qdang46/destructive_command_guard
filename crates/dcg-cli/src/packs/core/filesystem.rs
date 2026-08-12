@@ -2641,12 +2641,19 @@ fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
 const LITERAL_TEMP_PREFIXES: [&str; 4] =
     ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"];
 
-fn path_is_safe_unquoted(path: &str) -> bool {
+/// Whether a path is a literal POSIX temp-tree subpath with a static suffix
+/// (`/tmp/<x>`, `/var/tmp/<x>`, …). Shared with the Windows pack so the
+/// Unknown-dialect PowerShell detector does not misread a plain
+/// `rm -r -f /tmp/test` as a Remove-Item recurse-force delete.
+pub(crate) fn literal_temp_prefix_any(path: &str) -> bool {
     LITERAL_TEMP_PREFIXES
         .iter()
         .find_map(|prefix| path.strip_prefix(prefix))
         .is_some_and(temp_path_suffix_is_static_unquoted)
-        || windows_literal_user_temp_subpath(path)
+}
+
+fn path_is_safe_unquoted(path: &str) -> bool {
+    literal_temp_prefix_any(path) || windows_literal_user_temp_subpath(path)
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {

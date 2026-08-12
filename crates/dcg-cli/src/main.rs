@@ -46,7 +46,7 @@ use dcg_cli::packs::{DecisionMode, EnabledKeywordIndex, REGISTRY};
 use dcg_cli::pending_exceptions::{
     MaintenanceRecheck, PendingExceptionStore, PersistBudget, log_maintenance,
 };
-use dcg_cli::perf::{Deadline, HOOK_EVALUATION_BUDGET};
+use dcg_cli::perf::{Deadline, HOOK_EVALUATION_BUDGET, HOOK_EVALUATION_BUDGET_MS};
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use dcg_cli::hook::HookInput;
@@ -370,6 +370,25 @@ fn try_deny_oversized_input(
         return false;
     };
 
+    // The oversized-scan is a security-critical path: padding a destructive
+    // command past the size limit must not skip evaluation (issue #160/#290).
+    // The caller's deadline may already be exhausted by the time we get here
+    // (self-heal, pack loading, prior evaluation), so give the window scan
+    // its own fresh budget. A padded payload can require scanning many 64 KiB
+    // windows to reach a destructive command buried at the end (up to ~2 MiB
+    // of padding = ~34 windows), and on a slow runner each window evaluation
+    // with the full enabled-pack set is non-trivial — so the budget must be a
+    // few multiples of the ordinary hook budget or a slow runner silently
+    // fails open on a padded destructive payload. 3x bounds runaway scans
+    // while giving the security-critical path real headroom.
+    const OVERSIZED_SCAN_BUDGET: Duration = Duration::from_millis(3 * HOOK_EVALUATION_BUDGET_MS);
+    let oversized_deadline = Deadline::new(
+        deadline
+            .remaining()
+            .unwrap_or(Duration::ZERO)
+            .max(OVERSIZED_SCAN_BUDGET),
+    );
+
     // The padding may live INSIDE the command string (the issue's repro
     // shape), either before or after the destructive part. Evaluating an
     // over-limit command outright would be refused as oversized, so slice it
@@ -428,7 +447,7 @@ fn try_deny_oversized_input(
         heredoc_settings,
         cwd_path: cwd_path.as_deref(),
         working_dir: &working_dir,
-        deadline,
+        deadline: &oversized_deadline,
         hook_protocol,
         history_agent_type,
         max_command_bytes,
@@ -443,7 +462,7 @@ fn try_deny_oversized_input(
     // scan. Bail out as soon as the deadline is gone — an exhausted budget
     // means fail-open, exactly as before.
     for command in &commands {
-        if deadline.is_exceeded() {
+        if oversized_deadline.is_exceeded() {
             break;
         }
         // Windows made of pure padding carry no enabled keyword; skipping
@@ -458,7 +477,7 @@ fn try_deny_oversized_input(
                 let mut history_writer = if config.history.enabled {
                     let mut writer =
                         HistoryWriter::new(history_db_path(&config.history), &config.history);
-                    writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                    writer.limit_drop_wait_to(oversized_deadline.remaining().unwrap_or_default());
                     Some(writer)
                 } else {
                     None

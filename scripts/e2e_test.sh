@@ -526,11 +526,13 @@ test_command_with_packs() {
             return 0
             ;;
         warn)
-            if has_permission_decision "$result" "ask" && has_dcg_warning "$err"; then
+            # Warn-severity emits `dcg WARNING` on stderr and no block JSON on
+            # stdout (the hook never serializes `permissionDecision: "ask"`).
+            if has_dcg_warning "$err"; then
                 log_pass "WARNED (pack=$packs): $desc"
                 return 0
             fi
-            log_fail "Should WARN with pack=$packs: $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${result:-<empty>} | stderr=${err:-<empty>}"
+            log_fail "Should WARN with pack=$packs: $desc" "stderr contains dcg WARNING" "stdout=${result:-<empty>} | stderr=${err:-<empty>}"
             return 0
             ;;
         allow)
@@ -591,14 +593,23 @@ test_default_severity_behavior() {
 
     case "$expected" in
         warn)
-            if has_permission_decision "$out" "ask" && has_dcg_warning "$err"; then
+            # Warn-severity emits `dcg WARNING` on stderr and no block JSON on
+            # stdout (the hook never serializes `permissionDecision: "ask"`).
+            if has_dcg_warning "$err"; then
                 log_pass "WARNED (default severity): $desc"
             else
-                log_fail "Should WARN (default severity): $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+                log_fail "Should WARN (default severity): $desc" "stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+            fi
+            ;;
+        block)
+            if has_permission_decision "$out" "deny"; then
+                log_pass "BLOCKED (default severity): $desc"
+            else
+                log_fail "Should BLOCK (default severity): $desc" "JSON with permissionDecision: deny" "${out:-<empty>}"
             fi
             ;;
         *)
-            log_fail "Invalid expected mode: $desc" "warn" "$expected"
+            log_fail "Invalid expected mode: $desc" "warn|block" "$expected"
             ;;
     esac
 }
@@ -648,10 +659,12 @@ test_command_with_policy() {
             fi
             ;;
         warn)
-            if has_permission_decision "$out" "ask" && has_dcg_warning "$err"; then
+            # Warn-severity emits `dcg WARNING` on stderr and no block JSON on
+            # stdout (the hook never serializes `permissionDecision: "ask"`).
+            if has_dcg_warning "$err"; then
                 log_pass "WARNED (policy=$policy_mode): $desc"
             else
-                log_fail "Should WARN (policy=$policy_mode): $desc" "JSON with permissionDecision: ask; stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
+                log_fail "Should WARN (policy=$policy_mode): $desc" "stderr contains dcg WARNING" "stdout=${out:-<empty>} | stderr=${err:-<empty>}"
             fi
             ;;
         silent)
@@ -969,11 +982,12 @@ test_command '"/usr/bin/git" reset --hard' "block" '"/usr/bin/git" reset --hard 
 
 log_section "Decision Mode Policy (warn/log behavior)"
 
-# Medium severity patterns default to warn (recoverable operations)
-# These use the new test helper that doesn't set DCG_POLICY_DEFAULT_MODE
-test_default_severity_behavior "git branch -D feature" "warn" "default: git branch -D warns (Medium severity)"
+# git branch delete forms (including -d) and stash drop are blocked by default:
+# the branch-force-delete rule (#209) and stash-drop rule ask before every
+# delete form. Recoverable operations are WARNed only under DCG_POLICY_DEFAULT_MODE=warn.
+test_default_severity_behavior "git branch -D feature" "block" "default: git branch -D blocks (branch deletion requires approval)"
 test_default_severity_behavior "git stash drop" "warn" "default: git stash drop warns (Medium severity)"
-test_default_severity_behavior "git stash drop stash@{0}" "warn" "default: git stash drop stash@{0} warns (Medium severity)"
+test_default_severity_behavior "git stash drop stash@{0}" "warn" "default: git stash drop <ref> warns (Medium severity)"
 
 # Medium severity rule respects explicit policy overrides
 test_command_with_policy "git branch -D feature" "warn" "warn" "policy warn: git branch -D feature"
@@ -1029,7 +1043,7 @@ test_command "git pull" "allow" "git pull"
 test_command "git fetch" "allow" "git fetch"
 test_command "git fetch --all" "allow" "git fetch --all"
 test_command "git branch -a" "allow" "git branch -a"
-test_command "git branch -d feature" "allow" "git branch -d feature"
+test_command "git branch -d feature" "block" "git branch -d feature (branch deletion requires approval, #209)"
 test_command "git checkout main" "allow" "git checkout main"
 test_command "git checkout -b feature" "allow" "git checkout -b feature"
 test_command "git checkout --orphan gh-pages" "allow" "git checkout --orphan gh-pages"
@@ -1059,12 +1073,12 @@ test_command "rm -r -f /tmp/test" "allow" "rm -r -f /tmp/test"
 test_command "rm -f -r /tmp/test" "allow" "rm -f -r /tmp/test"
 test_command "rm --recursive --force /tmp/test" "allow" "rm --recursive --force /tmp/test"
 test_command "rm --force --recursive /tmp/test" "allow" "rm --force --recursive /tmp/test"
-test_command 'rm -rf $TMPDIR/test' "allow" 'rm -rf $TMPDIR/test'
-test_command 'rm -rf ${TMPDIR}/test' "allow" 'rm -rf ${TMPDIR}/test'
-test_command 'rm -rf "$TMPDIR/test"' "allow" 'rm -rf "$TMPDIR/test"'
+test_command 'rm -rf $TMPDIR/test' "block" 'rm -rf $TMPDIR/test (dynamic temp root blocked for review)'
+test_command 'rm -rf ${TMPDIR}/test' "block" 'rm -rf ${TMPDIR}/test (dynamic temp root blocked for review)'
+test_command 'rm -rf "$TMPDIR/test"' "block" 'rm -rf "$TMPDIR/test" (dynamic temp root blocked for review)'
 test_command "rm file.txt" "allow" "rm file.txt (no -rf)"
 test_command "rm -f file.txt" "allow" "rm -f file.txt (force only)"
-test_command "rm -r directory" "allow" "rm -r directory (recursive only)"
+test_command "rm -r directory" "block" "rm -r directory (recursive deletion requires approval)"
 test_command "rm -i file.txt" "allow" "rm -i file.txt (interactive)"
 
 log_section "Non-Git/Rm Commands (should ALLOW via quick reject)"
@@ -1378,6 +1392,9 @@ test_command_with_allowlist() {
     (cd "$tmpdir" && git init -q) 2>/dev/null || true
     mkdir -p "$tmpdir/.dcg"
     echo "$allowlist_content" > "$tmpdir/.dcg/allowlist.toml"
+    # The project layer only activates when the repository is explicitly
+    # trusted (v0.6.9 security model): write .dcg.toml and select via DCG_CONFIG.
+    printf '[general]\nfail_closed = true\n' > "$tmpdir/.dcg.toml"
 
     # Create JSON input and base64 encode it
     local escaped_cmd
@@ -1392,6 +1409,7 @@ test_command_with_allowlist() {
         HOME="$TEST_ENV_HOME" \
         XDG_CONFIG_HOME="$TEST_ENV_XDG" \
         DCG_ALLOWLIST_SYSTEM_PATH="" \
+        DCG_CONFIG=.dcg.toml \
         "$BINARY" 2>/dev/null || true)
 
     # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.
@@ -1530,6 +1548,9 @@ test_command_with_allowlist_and_env() {
     (cd "$tmpdir" && git init -q) 2>/dev/null || true
     mkdir -p "$tmpdir/.dcg"
     echo "$allowlist_content" > "$tmpdir/.dcg/allowlist.toml"
+    # The project layer only activates when the repository is explicitly
+    # trusted (v0.6.9 security model): write .dcg.toml and select via DCG_CONFIG.
+    printf '[general]\nfail_closed = true\n' > "$tmpdir/.dcg.toml"
 
     local escaped_cmd
     escaped_cmd=$(json_escape "$cmd")
@@ -1542,6 +1563,7 @@ test_command_with_allowlist_and_env() {
         HOME="$TEST_ENV_HOME" \
         XDG_CONFIG_HOME="$TEST_ENV_XDG" \
         DCG_ALLOWLIST_SYSTEM_PATH="" \
+        DCG_CONFIG=.dcg.toml \
         $env_vars "$BINARY" 2>/dev/null || true)
 
     # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.
@@ -1607,13 +1629,18 @@ test_command_with_layered_allowlists() {
     if [[ -n "$project_allowlist" ]]; then
         mkdir -p "$project_dir/.dcg"
         echo "$project_allowlist" > "$project_dir/.dcg/allowlist.toml"
+        # The project layer only activates when the repository is explicitly
+        # trusted: write a `.dcg.toml` and select it via DCG_CONFIG (matching
+        # the v0.6.9 security model).
+        printf '[general]\nfail_closed = true\n' > "$project_dir/.dcg.toml"
     fi
 
     if [[ -n "$user_allowlist" ]]; then
-        # Write to $HOME/.config/dcg/allowlist.toml as that's what the code checks first
-        local home_config_dir="$home_dir/.config/dcg"
-        mkdir -p "$home_config_dir"
-        echo "$user_allowlist" > "$home_config_dir/allowlist.toml"
+        # The code prefers $XDG_CONFIG_HOME/dcg/allowlist.toml when XDG_CONFIG_HOME
+        # is set (user_allowlist_path). XDG_CONFIG_HOME points at $user_config_dir.
+        local user_dcg_dir="$user_config_dir/dcg"
+        mkdir -p "$user_dcg_dir"
+        echo "$user_allowlist" > "$user_dcg_dir/allowlist.toml"
     fi
 
     if [[ -n "$system_allowlist" ]]; then
@@ -1631,6 +1658,7 @@ test_command_with_layered_allowlists() {
         HOME="$home_dir" \
         XDG_CONFIG_HOME="$user_config_dir" \
         DCG_ALLOWLIST_SYSTEM_PATH="$system_path" \
+        ${project_allowlist:+DCG_CONFIG=.dcg.toml} \
         $env_vars "$BINARY" 2>/dev/null || true)
 
     # Note: do not delete tmpdir here; destructive cleanup is intentionally avoided.

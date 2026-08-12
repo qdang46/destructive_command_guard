@@ -5,7 +5,7 @@
 # the installer runs with no network (hermetic CI smoke / offline install).
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)))
 . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 $script:failures = 0

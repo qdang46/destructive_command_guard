@@ -59,6 +59,18 @@ fn run_dcg(args: &[&str]) -> DcgOutput {
         .expect("create XDG_CONFIG_HOME/dcg under isolated HOME");
     std::fs::create_dir_all(home.path().join("tmp")).expect("create isolated TMPDIR");
 
+    // Golden artifacts encode the cross-platform core detection contract. On a
+    // Windows host the windows.filesystem / windows.system packs are default-on
+    // and change `keywords_checked` / `first_match` (e.g. a python heredoc gets
+    // denied as windows-filesystem-semantic-unverified instead of matching
+    // heredoc.python). Disable them here so the artifacts are reproducible on
+    // every runner; the Windows packs have their own dedicated suites.
+    std::fs::write(
+        home.path().join(".config/dcg/config.toml"),
+        "[packs]\ndisabled = [\"windows.filesystem\", \"windows.system\"]\n",
+    )
+    .expect("write deterministic config");
+
     let mut cmd = Command::new(dcg_binary());
     cmd.args(args).env_clear();
     if let Ok(path) = std::env::var("PATH") {

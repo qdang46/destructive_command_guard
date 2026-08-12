@@ -90,6 +90,9 @@ impl TestEnv {
 
         // Create config that points to our history database
         // The CLI reads database_path from config file via DCG_CONFIG env var
+        // Windows paths contain backslashes, which are invalid TOML escapes;
+        // replace them with forward slashes (Windows APIs accept both).
+        let db_path_toml = self.history_path.display().to_string().replace('\\', "/");
         fs::write(
             &self.config_path,
             format!(
@@ -97,7 +100,7 @@ impl TestEnv {
 enabled = true
 database_path = "{}"
 "#,
-                self.history_path.display()
+                db_path_toml
             ),
         )
         .expect("Failed to write config");

@@ -1170,7 +1170,18 @@ pub fn diff_snapshots(expected: &EvalSnapshot, actual: &EvalSnapshot) -> Option<
 pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Result<(), String> {
     // Get both snapshot (for most checks) and full result (for reason_contains check)
     let config = Config::default();
-    let enabled_packs = config.enabled_pack_ids();
+    // The corpus encodes the core, platform-independent detection contract
+    // (git/rm/docker/npm …). On a Windows host the windows.filesystem /
+    // windows.system packs are default-on and legitimately fail-closed on
+    // unresolved shell syntax such as `$(echo hello)` (windows-filesystem-
+    // semantic-unverified), which would make the corpus's `allow` expectations
+    // machine-dependent. The Windows packs have their own dedicated unit and
+    // e2e suites; exclude them here so the corpus is reproducible everywhere.
+    let enabled_packs: std::collections::HashSet<String> = config
+        .enabled_pack_ids()
+        .into_iter()
+        .filter(|id| !matches!(id.as_str(), "windows.filesystem" | "windows.system"))
+        .collect();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
     let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);

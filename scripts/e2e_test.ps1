@@ -163,11 +163,17 @@ function Resolve-DcgBinary {
 }
 
 function Assert-BinaryVersionFresh { param([string]$Bin)
-    $cargoToml = Join-Path $RepoRoot "Cargo.toml"
+    # The workspace root Cargo.toml is a virtual manifest (no version field);
+    # the binary version lives in the dcg-cli member crate.
+    $memberToml = Join-Path (Join-Path $RepoRoot "crates\dcg-cli") "Cargo.toml"
+    $cargoToml = if (Test-Path $memberToml) { $memberToml } else { Join-Path $RepoRoot "Cargo.toml" }
     if (-not (Test-Path $cargoToml)) { return }
-    $expected = (Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+    $m = (Select-String -Path $cargoToml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1)
+    $expected = if ($m) { $m.Matches.Groups[1].Value } else { $null }
     if (-not $expected) { return }
-    $verOut = (& $Bin --version 2>&1 | Out-String).Trim()
+    # The version banner goes to stderr; capture it through cmd.exe so
+    # PowerShell does not surface the stderr stream as a NativeCommandError.
+    $verOut = (cmd /c "`"$Bin`" --version 2>&1" | Out-String).Trim()
     if ($verOut -notmatch [regex]::Escape($expected)) {
         Write-Line "WARNING: binary version ($verOut) != Cargo.toml ($expected); may be STALE. Rebuild for accurate results." "Yellow"
     }
@@ -183,20 +189,34 @@ function Invoke-Dcg { param([string]$Json, [hashtable]$EnvOverrides = @{})
         [Environment]::SetEnvironmentVariable($k, $EnvOverrides[$k])
     }
     $errFile = [System.IO.Path]::GetTempFileName()
+    $outFile = [System.IO.Path]::GetTempFileName()
+    $inFile = [System.IO.Path]::GetTempFileName()
     try {
-        $stdout = ($Json | & $script:Bin 2>$errFile | Out-String)
+        # The binary writes its human WARNING to stderr; PowerShell 5.1 surfaces
+        # that as a NativeCommandError that cannot be redirected away inline.
+        # Drive it through cmd.exe (which performs the redirection natively and
+        # exits 0 regardless of stderr content) with stdin read from a temp file.
+        [System.IO.File]::WriteAllText($inFile, $Json, [System.Text.Encoding]::UTF8)
+        $cmdLine = "`"$script:Bin`" < `"$inFile`" > `"$outFile`" 2> `"$errFile`""
+        $null = cmd.exe /c $cmdLine
+        $stdout = (Get-Content -Raw -LiteralPath $outFile -ErrorAction SilentlyContinue)
         $stderr = (Get-Content -Raw -LiteralPath $errFile -ErrorAction SilentlyContinue)
+        if ($null -eq $stdout) { $stdout = "" }
         if ($null -eq $stderr) { $stderr = "" }
     } finally {
         Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $inFile -Force -ErrorAction SilentlyContinue
         foreach ($k in $EnvOverrides.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
     }
-    [pscustomobject]@{ StdOut = $stdout; StdErr = $stderr }
+    [pscustomobject]@{ StdOut = [string]$stdout; StdErr = [string]$stderr }
 }
 
-function New-HookJson { param([string]$Command)
+function New-HookJson { param([string]$Command, [string]$ToolName = "Bash")
     # ConvertTo-Json handles all JSON escaping correctly (quotes, backslashes, newlines).
-    [pscustomobject]@{ tool_name = "Bash"; tool_input = [pscustomobject]@{ command = $Command } } |
+    # The tool name selects the shell dialect the evaluator assumes; Windows-native
+    # tests pass "cmd"/"powershell" so the command is analyzed in the right dialect.
+    [pscustomobject]@{ tool_name = $ToolName; tool_input = [pscustomobject]@{ command = $Command } } |
         ConvertTo-Json -Compress -Depth 5
 }
 
@@ -216,13 +236,13 @@ function Get-BaseEnv {
 # ---------------------------------------------------------------------------
 # verdict: 'block' | 'allow' | 'warn' | 'silent'
 function Test-Verdict {
-    param([string]$Cmd, [string]$Verdict, [string]$Desc, [string]$Packs, [string]$Policy)
+    param([string]$Cmd, [string]$Verdict, [string]$Desc, [string]$Packs, [string]$Policy, [string]$ToolName = "Bash")
     Log-TestStart $Desc
     if ($Verbose -and -not $Json) { Write-Host "  Command: $(Get-Truncated $Cmd)" -ForegroundColor Cyan }
     $env = Get-BaseEnv
     if ($Packs) { $env["DCG_PACKS"] = $Packs }
     if ($Policy) { $env["DCG_POLICY_DEFAULT_MODE"] = $Policy }
-    $r = Invoke-Dcg -Json (New-HookJson $Cmd) -EnvOverrides $env
+    $r = Invoke-Dcg -Json (New-HookJson $Cmd $ToolName) -EnvOverrides $env
     $out = $r.StdOut; $err = $r.StdErr
     switch ($Verdict) {
         "block" {
@@ -234,8 +254,10 @@ function Test-Verdict {
             else { Log-Fail "Should ALLOW: $Desc" "<empty output>" $out.Trim() }
         }
         "warn" {
-            if (($out -match '"ask"') -and ($err -match "dcg WARNING")) { Log-Pass "WARNED: $Desc" }
-            else { Log-Fail "Should WARN: $Desc" 'stdout "ask" + stderr "dcg WARNING"' "stdout=$($out.Trim()) stderr=$($err.Trim())" }
+            # Warn-severity emits `dcg WARNING` on stderr and no block JSON on
+            # stdout (the hook never serializes `permissionDecision: "ask"`).
+            if ($err -match "dcg WARNING") { Log-Pass "WARNED: $Desc" }
+            else { Log-Fail "Should WARN: $Desc" 'stderr contains "dcg WARNING"' "stdout=$($out.Trim()) stderr=$($err.Trim())" }
         }
         "silent" {
             if ([string]::IsNullOrWhiteSpace($out) -and ($err -notmatch "dcg WARNING")) { Log-Pass "SILENT: $Desc" }
@@ -273,10 +295,14 @@ function Test-Allowlist {
             $dcgDir = Join-Path $proj ".dcg"
             New-Item -ItemType Directory -Path $dcgDir -Force | Out-Null
             Set-Content -Path (Join-Path $dcgDir "allowlist.toml") -Value $AllowlistToml -Encoding utf8
+            # The project layer only activates when the repository is explicitly
+            # trusted (v0.6.9 security model): write .dcg.toml and select via DCG_CONFIG.
+            Set-Content -Path (Join-Path $proj ".dcg.toml") -Value "[general]`nfail_closed = true`n" -Encoding utf8
         }
         & git -C $proj init --quiet 2>$null | Out-Null
         Set-Location $proj
         $env = Get-BaseEnv
+        if ($AllowlistToml) { $env["DCG_CONFIG"] = ".dcg.toml" }
         foreach ($k in $ExtraEnv.Keys) { $env[$k] = $ExtraEnv[$k] }
         $r = Invoke-Dcg -Json (New-HookJson $Cmd) -EnvOverrides $env
         $out = $r.StdOut
@@ -327,11 +353,14 @@ try {
     Log-Section "Safe Git (should ALLOW)"
     $safeGit = @(
         "git status", "git log", "git diff", "git add .", "git commit -m 'test'", "git push",
-        "git push --force-with-lease", "git branch -d feature", "git checkout main", "git checkout -b feature",
+        "git push --force-with-lease", "git checkout main", "git checkout -b feature",
         "git restore --staged file.txt", "git clean -n", "git clean --dry-run", "git merge feature",
         "git rebase main", "git reset --soft HEAD~1", "git reset --mixed HEAD", "git reset HEAD"
     )
     foreach ($c in $safeGit) { Test-Verdict $c "allow" $c }
+
+    # Branch deletion (including -d) requires approval (#209); it is not a safe op.
+    Test-Verdict "git branch -d feature" "block" "git branch -d feature (branch deletion requires approval, #209)"
 
     # -----------------------------------------------------------------------
     # Destructive filesystem (BLOCK) — flag ordering & path-traversal variants
@@ -356,10 +385,16 @@ try {
         "rm -rf /tmp/build", "rm -rf /tmp/test-dir", "rm -rf /tmp/foo..bar", "rm -rf /var/tmp/cache",
         "rm -fr /tmp/stuff", "rm -Rf /tmp/more", "rm -r -f /tmp/test", "rm -f -r /tmp/test",
         "rm --recursive --force /tmp/test", "rm --force --recursive /tmp/test",
-        'rm -rf $TMPDIR/test', 'rm -rf ${TMPDIR}/test', 'rm -rf "$TMPDIR/test"',
-        "rm file.txt", "rm -f file.txt", "rm -r directory", "rm -i file.txt"
+        "rm file.txt", "rm -f file.txt", "rm -i file.txt"
     )
     foreach ($c in $safeRm) { Test-Verdict $c "allow" $c }
+
+    # Dynamic temp roots ($TMPDIR and friends) are blocked for review; recursive
+    # deletion of an arbitrary directory requires approval too.
+    Test-Verdict 'rm -rf $TMPDIR/test' "block" 'rm -rf $TMPDIR/test (dynamic temp root blocked for review)'
+    Test-Verdict 'rm -rf ${TMPDIR}/test' "block" 'rm -rf ${TMPDIR}/test (dynamic temp root blocked for review)'
+    Test-Verdict 'rm -rf "$TMPDIR/test"' "block" 'rm -rf "$TMPDIR/test" (dynamic temp root blocked for review)'
+    Test-Verdict "rm -r directory" "block" "rm -r directory (recursive deletion requires approval)"
 
     # -----------------------------------------------------------------------
     # Non-git/rm quick-reject (ALLOW)
@@ -415,12 +450,12 @@ try {
     Test-MalformedInput '{"invalid json' "invalid JSON syntax"
 
     # -----------------------------------------------------------------------
-    # Default severity (Medium -> WARN by default; no policy override)
+    # Default severity (Medium -> WARN by default; High -> block; no policy override)
     # -----------------------------------------------------------------------
-    Log-Section "Default severity (Medium -> WARN)"
-    Test-Verdict "git branch -D feature" "warn" "git branch -D (default warn)"
-    Test-Verdict "git stash drop" "warn" "git stash drop (default warn)"
-    Test-Verdict "git stash drop stash@{0}" "warn" "git stash drop <ref> (default warn)"
+    Log-Section "Default severity"
+    Test-Verdict "git branch -D feature" "block" "git branch -D blocks by default (branch deletion requires approval, #209)"
+    Test-Verdict "git stash drop" "warn" "git stash drop (Medium, default warn)"
+    Test-Verdict "git stash drop stash@{0}" "warn" "git stash drop <ref> (Medium, default warn)"
 
     # -----------------------------------------------------------------------
     # Policy override (deny/warn/log); Critical always blocks
@@ -514,14 +549,16 @@ try {
     # -----------------------------------------------------------------------
     Log-Section "Windows-native packs (positive: every destructive rule)"
     $winAll = "core,windows.filesystem,windows.system,windows.misc,windows.powershell"
-    $winBlock = @(
-        # cmd.exe verbs
+    # cmd.exe verbs run under a cmd tool; PowerShell cmdlets under a powershell tool.
+    $winCmdBlock = @(
         "del /s /q C:\src", "rd /s /q C:\src", "rmdir /s /q C:\src", "format C: /q",
         "reg delete HKLM\Software\Foo /f", "net user attacker /delete", "robocopy C:\src C:\dst /MIR",
         "sc delete MyService", "cipher /w:C:\",
         "bcdedit /delete {current}", "vssadmin delete shadows /all /quiet", "wmic shadowcopy delete",
-        "wsl --unregister Ubuntu", "diskpart /s clean.txt",
-        # PowerShell cmdlets + aliases
+        "wsl --unregister Ubuntu", "diskpart /s clean.txt"
+    )
+    foreach ($c in $winCmdBlock) { Test-Verdict $c "block" "win: $c" $winAll $null "cmd" }
+    $winPsBlock = @(
         "Remove-Item -Recurse -Force C:\src", "Clear-Content C:\important.txt",
         "Clear-Disk -Number 1 -RemoveData", "Format-Volume -DriveLetter D",
         "Remove-Partition -DriveLetter D", "Initialize-Disk -Number 1", "Disable-ComputerRestore C:\",
@@ -529,25 +566,27 @@ try {
         "Remove-Item HKLM:\Software\Foo", "Remove-ItemProperty -Path HKLM:\Foo -Name Bar",
         "Remove-LocalUser -Name attacker"
     )
-    foreach ($c in $winBlock) { Test-Verdict $c "block" "win: $c" $winAll }
+    foreach ($c in $winPsBlock) { Test-Verdict $c "block" "win: $c" $winAll $null "powershell" }
 
     # Reversible / less-catastrophic verbs WARN (medium) rather than block.
-    $winWarn = @(
-        "schtasks /delete /tn MyTask /f", "Clear-RecycleBin -Force", "Stop-Computer -Force",
+    $winCmdWarn = @("schtasks /delete /tn MyTask /f")
+    foreach ($c in $winCmdWarn) { Test-Verdict $c "warn" "win-warn: $c" $winAll $null "cmd" }
+    $winPsWarn = @(
+        "Clear-RecycleBin -Force", "Stop-Computer -Force",
         "Remove-AppxPackage Microsoft.Foo", "Remove-PSDrive -Name X",
         'Unregister-ScheduledTask -TaskName Foo -Confirm:$false'
     )
-    foreach ($c in $winWarn) { Test-Verdict $c "warn" "win-warn: $c" $winAll }
+    foreach ($c in $winPsWarn) { Test-Verdict $c "warn" "win-warn: $c" $winAll $null "powershell" }
 
     Log-Section "Windows-native packs (wrapped: cmd /c|/k, iex, -EncodedCommand)"
-    Test-Verdict 'cmd /c "del /s /q C:\src"' "block" "wrapped: cmd /c del" $winAll
-    Test-Verdict 'cmd /k "format C: /q"' "block" "wrapped: cmd /k format" $winAll
-    Test-Verdict 'cmd /s /c "rd /s /q C:\Windows"' "block" "wrapped: cmd /s /c rd" $winAll
-    Test-Verdict 'powershell -Command "Remove-Item -Recurse -Force C:\src"' "block" "wrapped: powershell -Command" $winAll
-    Test-Verdict "pwsh -c 'rd /s /q C:\src'" "block" "wrapped: pwsh -c rd" $winAll
-    Test-Verdict 'iex "Remove-Item -Recurse -Force C:\src"' "block" "wrapped: iex" $winAll
-    Test-Verdict 'Invoke-Expression "rd /s /q C:\src"' "block" "wrapped: Invoke-Expression" $winAll
-    Test-Verdict 'powershell -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=' "block" "wrapped: -EncodedCommand" $winAll
+    Test-Verdict 'cmd /c "del /s /q C:\src"' "block" "wrapped: cmd /c del" $winAll $null "cmd"
+    Test-Verdict 'cmd /k "format C: /q"' "block" "wrapped: cmd /k format" $winAll $null "cmd"
+    Test-Verdict 'cmd /s /c "rd /s /q C:\Windows"' "block" "wrapped: cmd /s /c rd" $winAll $null "cmd"
+    Test-Verdict 'powershell -Command "Remove-Item -Recurse -Force C:\src"' "block" "wrapped: powershell -Command" $winAll $null "powershell"
+    Test-Verdict "pwsh -c 'rd /s /q C:\src'" "block" "wrapped: pwsh -c rd" $winAll $null "powershell"
+    Test-Verdict 'iex "Remove-Item -Recurse -Force C:\src"' "block" "wrapped: iex" $winAll $null "powershell"
+    Test-Verdict 'Invoke-Expression "rd /s /q C:\src"' "block" "wrapped: Invoke-Expression" $winAll $null "powershell"
+    Test-Verdict 'powershell -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=' "block" "wrapped: -EncodedCommand" $winAll $null "powershell"
     Test-Verdict 'powershell -enc UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=' "block" "wrapped: -enc abbreviation" $winAll
     # value-taking flags before the encoded/command flag (canonical obfuscation)
     Test-Verdict 'powershell -ExecutionPolicy Bypass -EncodedCommand UgBlAG0AbwB2AGUALQBJAHQAZQBtACAALQBSAGUAYwB1AHIAcwBlACAALQBGAG8AcgBjAGUAIABDADoAXABzAHIAYwA=' "block" "wrapped: -ExecutionPolicy Bypass -EncodedCommand" $winAll
@@ -616,13 +655,16 @@ reason = "Only in CI"
 added_by = "e2e_test.ps1"
 conditions = { CI = "true" }
 "@ @{ CI = "true" }
+    # On a CI runner the `CI` env var is set to "true", which would satisfy the
+    # condition and allow the command; explicitly clear it so the condition is
+    # genuinely unmet (matching the intended "skipped" assertion).
     Test-Allowlist "git reset --hard" "block" "unmet CI condition skipped" @"
 [[allow]]
 rule = "core.git:reset-hard"
 reason = "Only in CI"
 added_by = "e2e_test.ps1"
 conditions = { CI = "true" }
-"@
+"@ @{ CI = "" }
 
 } finally {
     Set-Location $RepoRoot 2>$null

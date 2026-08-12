@@ -452,7 +452,12 @@ fn test_allowlist_add_defaults_to_user_and_untrusted_project_write_is_refused() 
     let refusal = format!("{}{}", stdout_text(&refused), stderr_text(&refused));
     assert!(refusal.contains("Project allowlists are inactive"));
     assert!(refusal.contains("--path"));
-    assert!(refusal.contains("/**"));
+    // The suggested path glob uses the host separator (`/**` on POSIX,
+    // `\**` on Windows), so match the `**` glob marker only.
+    assert!(
+        refusal.contains("/**") || refusal.contains("\\**"),
+        "refusal should suggest a recursive path glob, got:\n{refusal}"
+    );
     assert!(!repo.path().join(".dcg/allowlist.toml").exists());
 }
 
@@ -702,6 +707,7 @@ allow = ["git reset --hard"]
 }
 
 #[test]
+#[cfg(unix)]
 fn test_untrusted_project_config_can_enable_builtin_protection() {
     let repo = tempfile::tempdir().expect("temp repo");
     std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
@@ -979,7 +985,10 @@ fn test_test_subcommand_help_text_includes_key_flags() {
         stdout_text(&output),
         stderr_text(&output)
     );
-    assert!(combined.contains("Usage: dcg test [OPTIONS] [COMMAND]"));
+    assert!(
+        combined.contains("Usage: dcg test [OPTIONS] [COMMAND]")
+            || combined.contains("Usage: dcg.exe test [OPTIONS] [COMMAND]")
+    );
     assert!(combined.contains("--stdin"));
     assert!(combined.contains("--config"));
     assert!(combined.contains("--with-packs"));
@@ -999,7 +1008,10 @@ fn test_subcommand_help_flag_is_not_hijacked_by_top_level_help() {
         stdout_text(&output),
         stderr_text(&output)
     );
-    assert!(combined.contains("Usage: dcg simulate [OPTIONS]"));
+    assert!(
+        combined.contains("Usage: dcg simulate [OPTIONS]")
+            || combined.contains("Usage: dcg.exe simulate [OPTIONS]")
+    );
     assert!(combined.contains("--max-command-bytes"));
 }
 
@@ -1015,7 +1027,10 @@ fn test_update_version_flag_is_not_hijacked_by_top_level_version() {
         stdout_text(&output),
         stderr_text(&output)
     );
-    assert!(combined.contains("Usage: dcg update [OPTIONS]"));
+    assert!(
+        combined.contains("Usage: dcg update [OPTIONS]")
+            || combined.contains("Usage: dcg.exe update [OPTIONS]")
+    );
     assert!(combined.contains("--version <VERSION>"));
     assert!(!stdout_text(&output).starts_with(env!("CARGO_PKG_VERSION")));
 }

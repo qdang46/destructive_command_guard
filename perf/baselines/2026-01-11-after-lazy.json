@@ -86,10 +86,90 @@
         "throughput_per_s": 580.3689461105844
       },
       "trace": null
+    },
+    {
+      "command": "echo hi 2>/dev/null",
+      "description": "Redirect keyword forces full evaluation (#245 case C)",
+      "env": {},
+      "id": "full_eval_redirect",
+      "metrics": {
+        "max_rss_kb": 18784,
+        "mean_ms": 160.228321725,
+        "p50_ms": 160.1791135,
+        "p95_ms": 161.441825,
+        "p99_ms": 161.886935,
+        "sample_count": 80,
+        "throughput_per_s": 6.241093891729708
+      },
+      "trace": null
+    },
+    {
+      "command": "cp report.txt backup.txt",
+      "description": "cp keyword forces full evaluation without a match",
+      "env": {},
+      "id": "full_eval_copy",
+      "metrics": {
+        "max_rss_kb": 18992,
+        "mean_ms": 159.9555954375,
+        "p50_ms": 159.83458000000002,
+        "p95_ms": 161.137865,
+        "p99_ms": 161.565294,
+        "sample_count": 80,
+        "throughput_per_s": 6.251735034744273
+      },
+      "trace": null
+    },
+    {
+      "command": "[ -f x ]",
+      "description": "POSIX test builtin probe (#246 measured 491ms on 0.7.8)",
+      "env": {},
+      "id": "posix_test_probe",
+      "metrics": {
+        "max_rss_kb": 11488,
+        "mean_ms": 5.7473976625,
+        "p50_ms": 5.7466165,
+        "p95_ms": 5.820034,
+        "p99_ms": 5.84454,
+        "sample_count": 80,
+        "throughput_per_s": 173.9917887576654
+      },
+      "trace": null
+    },
+    {
+      "command": "cat repos.txt | xargs -P12 -I{} sh -c 'cd {} && git status'",
+      "description": "Pipeline consumer with fixed -I template (recursive evaluation)",
+      "env": {},
+      "id": "xargs_fixed_template",
+      "metrics": {
+        "max_rss_kb": 16856,
+        "mean_ms": 31.6779433375,
+        "p50_ms": 31.6191505,
+        "p95_ms": 32.159932,
+        "p99_ms": 32.339188,
+        "sample_count": 80,
+        "throughput_per_s": 31.56770593803705
+      },
+      "trace": null
+    },
+    {
+      "command": "d=/tmp/gt2\nmkdir -p \"$d\"; cd \"$d\"\ngit init -q . 2>/dev/null; git config user.email t@t.t\necho hi > a.txt; git add a.txt; git commit -qm init 2>&1 | head -2\nam guard install gt2 \"$d\" 2>&1 | head -20\nls -la .git/hooks/ | grep -vE \"sample\"",
+      "description": "The #245 deterministic-abort reproducer shape",
+      "env": {},
+      "id": "multi_construct_245",
+      "metrics": {
+        "max_rss_kb": 23560,
+        "mean_ms": 231.36770548750002,
+        "p50_ms": 230.79438249999998,
+        "p95_ms": 233.437819,
+        "p99_ms": 237.237272,
+        "sample_count": 80,
+        "throughput_per_s": 4.322124377267624
+      },
+      "trace": null
     }
   ],
   "errors": [],
-  "generated_at": "2026-01-11T10:06:37Z",
+  "generated_at": "2026-08-10T00:00:00Z",
   "host": {
     "arch": "x86_64",
     "os": "Linux",

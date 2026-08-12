@@ -863,7 +863,18 @@ fn powershell_literal_target_is_user_temp(raw: &str) -> bool {
     } else {
         (!raw.contains(['$', '`', '\'', '"'])).then_some(raw)
     };
-    literal.is_some_and(crate::packs::core::filesystem::windows_literal_user_temp_subpath)
+    let Some(literal) = literal else {
+        return false;
+    };
+    // A POSIX literal temp prefix (`/tmp/<x>`, `/var/tmp/<x>`) is safe too.
+    // When a Bash-tool command reaches this pack through the Unknown dialect
+    // (Windows host), a plain `rm -r -f /tmp/test` must not be misread as a
+    // PowerShell Remove-Item recurse-force delete; the literal temp carve-out
+    // mirrors core.filesystem's `LITERAL_TEMP_PREFIXES`.
+    if crate::packs::core::filesystem::literal_temp_prefix_any(literal) {
+        return true;
+    }
+    crate::packs::core::filesystem::windows_literal_user_temp_subpath(literal)
 }
 
 /// Return whether a statically resolved Remove-Item value parameter names
@@ -1160,6 +1171,26 @@ fn powershell_segment_semantic_decision(
         .as_deref()
         .is_some_and(|name| matches!(name, "clear-content" | "clc"));
     let is_clear_recycle_bin = exact_name.as_deref() == Some("clear-recyclebin");
+
+    // GNU `rm` long flags are POSIX-only syntax that PowerShell's Remove-Item
+    // never accepts (`--interactive`, `--preserve-root`, `--no-preserve-root`,
+    // `--one-file-system`, `--dir`). Their presence proves this is POSIX rm
+    // (handled by core.filesystem, including interactive prompts), so the
+    // Windows pack must neither classify it as PowerShell nor fall through to
+    // the raw `remove-item-recurse` regex (which would re-read POSIX `-r` as
+    // Remove-Item). `Safe` tells the Unknown-dialect pack loop to skip the raw
+    // Windows regex too.
+    if exact_name.as_deref() == Some("rm")
+        && raw_words.iter().any(|word| {
+            word.starts_with("--interactive")
+                || word.starts_with("--preserve-root")
+                || word.starts_with("--no-preserve-root")
+                || word.starts_with("--one-file-system")
+                || word.starts_with("--dir")
+        })
+    {
+        return WindowsFilesystemSemanticDecision::Safe;
+    }
 
     // cmd.exe deletion words typed at a PowerShell prompt (#280). PowerShell
     // resolves them to Remove-Item aliases, where `/s` is a literal path
@@ -1686,6 +1717,25 @@ fn contains_powershell_protected_word_case_insensitive(command: &str) -> bool {
         })
 }
 
+/// Case-insensitive candidate check for the native cmd.exe verbs.
+///
+/// `del /s /q C:\src` carries no backtick/`$`/`&` escape that would trip the
+/// `Unknown`-dialect relevance gate, so the semantic pass was never reached and
+/// a plain recursive delete slipped through. Any protected cmd executable word
+/// (or its `.exe`/`.com` spelling) forces the bounded semantic decision.
+fn contains_cmd_protected_word(command: &str) -> bool {
+    command
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        })
+        .any(|word| {
+            let base = word.trim_end_matches(['.', 'e', 'x', 'c', 'o', 'm']);
+            CMD_PROTECTED_EXECUTABLES
+                .iter()
+                .any(|candidate| base.eq_ignore_ascii_case(candidate))
+        })
+}
+
 /// Case-insensitive candidate check for the .NET directory-delete surface.
 ///
 /// PowerShell type literals resolve case-insensitively while the shared
@@ -1900,7 +1950,12 @@ pub(crate) fn windows_filesystem_semantic_scan_required(
         matches!(dialect, ShellDialect::PowerShell | ShellDialect::Unknown)
             && (contains_powershell_protected_word_case_insensitive(command)
                 || contains_dotnet_directory_word_case_insensitive(command));
-    (has_relevant_escape || has_case_insensitive_powershell_candidate)
+    // Native cmd.exe verbs carry no escape character in their ordinary spelling
+    // (`del /s /q C:\src`), so a plain `Unknown`-dialect command would skip the
+    // semantic pass entirely. A protected cmd executable word forces it.
+    let has_cmd_candidate = matches!(dialect, ShellDialect::Cmd | ShellDialect::Unknown)
+        && contains_cmd_protected_word(command);
+    (has_relevant_escape || has_case_insensitive_powershell_candidate || has_cmd_candidate)
         && !matches!(
             windows_filesystem_semantic_decision_in_dialect(command, dialect),
             WindowsFilesystemSemanticDecision::NoMatch
@@ -2164,6 +2219,16 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn gnu_rm_long_flags_are_not_powershell_remove_item() {
+        let decision =
+            powershell_segment_semantic_decision("rm -r --force --interactive=once ./build", false);
+        assert!(
+            !matches!(decision, WindowsFilesystemSemanticDecision::Destructive(_)),
+            "GNU rm long flags must not be classified as PowerShell Remove-Item: {decision:?}"
+        );
+    }
 
     #[test]
     fn test_pack_creation() {
@@ -2693,6 +2758,43 @@ mod tests {
             assert!(
                 windows_filesystem_semantic_scan_required(command, ShellDialect::Cmd),
                 "escaped executable must override keyword candidate selection: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_cmd_verbs_are_scanned_without_escapes() {
+        // A plain `del /s /q C:\src` carries no caret/percent/bang escape, so
+        // the Unknown-dialect relevance gate used to skip the semantic pass and
+        // the destructive delete slipped through. A protected cmd executable
+        // word must force the scan.
+        let expected_rule = |command: &str| {
+            if command.starts_with("format") {
+                "format-drive"
+            } else if command.starts_with("rd") || command.starts_with("rmdir") {
+                "rd-recursive"
+            } else {
+                "del-recursive"
+            }
+        };
+        for command in [
+            "del /s /q C:\\src",
+            "erase /s C:\\data",
+            "rd /s /q C:\\src",
+            "rmdir /s C:\\build",
+            "format C: /q",
+        ] {
+            assert!(
+                windows_filesystem_semantic_scan_required(command, ShellDialect::Unknown),
+                "plain cmd verb must be scanned: {command}"
+            );
+            assert!(
+                matches!(
+                    windows_filesystem_semantic_decision_in_dialect(command, ShellDialect::Unknown),
+                    WindowsFilesystemSemanticDecision::Destructive(rule)
+                        if rule == expected_rule(command)
+                ),
+                "plain cmd verb must be classified as destructive: {command}"
             );
         }
     }

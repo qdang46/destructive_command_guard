@@ -52,7 +52,7 @@ use crate::heredoc::{
 };
 use crate::normalize::{
     NormalizeTokenKind, PATH_NORMALIZER, QUOTED_PATH_NORMALIZER, ShellDialect, ShellTokenDecoder,
-    ShellTokenRole, strip_wrapper_prefixes, tokenize_for_shell_dialect,
+    ShellTokenRole, strip_wrapper_prefixes, tokenize_for_normalization, tokenize_for_shell_dialect,
 };
 use crate::packs::{
     PatternSuggestion, REGISTRY, pack_aware_quick_reject, pack_aware_quick_reject_pre_normalized,
@@ -13442,9 +13442,62 @@ fn push_indirect_flow(flows: &mut Vec<IndirectInputFlow>, flow: IndirectInputFlo
     }
 }
 
+/// Restore backslashes that `shell_words::split` swallowed from unquoted
+/// Windows paths.
+///
+/// `shell_words::split` parses POSIX quoting correctly but treats every
+/// backslash as an escape, so an unquoted Windows path (`C:\Users\me\file`)
+/// decodes to `C:Usersmefile` and script-file inspection cannot resolve it.
+/// The dialect-aware tokenizer keeps backslashes intact and exposes the byte
+/// range of each word, so when a split token looks like a drive-letter path
+/// that lost its separators, replace it with the raw (backslash-preserving)
+/// spelling from the command text. Quoted paths are untouched because
+/// `shell_words` already handles them correctly.
+fn restore_windows_paths(normalized: &str, tokens: &mut [String]) {
+    // Collect the raw (backslash-preserving) word spellings in order. The
+    // tokenizer keeps backslashes intact where `shell_words` swallowed them.
+    let raw_words: Vec<&str> = tokenize_for_normalization(normalized)
+        .into_iter()
+        .filter(|t| t.kind == NormalizeTokenKind::Word)
+        .filter_map(|t| t.text(normalized))
+        .collect();
+    if raw_words.is_empty() {
+        return;
+    }
+    // Walk both lists in lockstep: each shell_words token corresponds to the
+    // next raw word (the tokenizer emits the same words for well-formed
+    // input, keeping backslashes). When a token lost its backslashes and the
+    // raw twin matches, restore it. Tokens with complex quoting are left
+    // untouched because we only accept an exact (backslash-stripped) match.
+    for (index, token) in tokens.iter_mut().enumerate() {
+        let Some(candidate) = raw_words.get(index) else {
+            break;
+        };
+        let looks_mangled = token.len() >= 3
+            && token.as_bytes()[0].is_ascii_alphabetic()
+            && token.as_bytes()[1] == b':'
+            && !token.contains('\\');
+        // Restore the raw spelling when the token lost its backslashes and the
+        // lockstep raw twin is a drive-letter path. We do not require an exact
+        // character match: `shell_words` may also swallow characters like `~`
+        // (8.3 short names such as RUNNER~1), so a prefix + backslash is the
+        // reliable signal. The raw twin is only accepted when it carries no
+        // quoting, so complex tokens are left untouched.
+        if looks_mangled
+            && candidate.contains('\\')
+            && !candidate.contains(['\'', '"'])
+            && candidate.starts_with(&token[..2])
+        {
+            *token = candidate.to_string();
+        }
+    }
+}
+
 fn command_tokens(command: &str) -> Option<(String, Vec<String>)> {
     let stripped = strip_wrapper_prefixes(command);
-    let mut tokens = shell_words::split(stripped.normalized.as_ref()).ok()?;
+    let normalized = stripped.normalized.as_ref();
+    let mut tokens = shell_words::split(normalized).ok()?;
+    restore_windows_paths(normalized, &mut tokens);
     while tokens
         .first()
         .is_some_and(|token| is_shell_assignment(token) || token == "&")
@@ -16253,6 +16306,21 @@ fn command_argument_payloads(
 
     let mut flows = Vec::new();
     for (pack_id, value) in code_argument_slots(&executable, &args) {
+        // A mysql/mariadb `source <file>` (or `\. <file>`) code value is a
+        // file reference, not stdin code: it is handled separately by
+        // `file_argument_slots` below. Emitting it as a StaticProducer here
+        // would run the raw `source C:\...` text through the SQL analysis,
+        // which cannot classify it and fails closed with stdin-unverified —
+        // even when the sourced file is benign. Skip it; the file flow is the
+        // authoritative one.
+        if matches!(executable.as_str(), "mysql" | "mariadb")
+            && pack_id == "database.mysql"
+            && mysql_code_file_references(value)
+                .iter()
+                .any(|operand| matches!(operand, CommandFileOperand::Path(_)))
+        {
+            continue;
+        }
         let replacements: Vec<_> = masked
             .substitutions
             .iter()
@@ -16893,7 +16961,23 @@ fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
                 }
             }
         }
-        if !in_single && !in_double && matches!(bytes[index], b'*' | b'?' | b'[' | b'{' | b'~') {
+        // `~` is a tilde-expansion (home) glob only when it begins a word
+        // (`~`, `~/...`, `~user`). An embedded `~` — e.g. `RUNNER~1` (an 8.3
+        // short name), `HEAD~1` (a git revision), or `RUNNER~1_TILDE` — is a
+        // literal byte; masking it turned the path into an unresolvable
+        // `RUNNER__DCG_GLOB_0__1_TILDE` and safe script-file inspection denied
+        // it (the Windows CI temp paths contain RUNNER~1).
+        let tilde_is_glob = if bytes[index] == b'~' {
+            index == 0
+                || bytes[index - 1].is_ascii_whitespace()
+                || matches!(bytes[index - 1], b'|' | b'&' | b';' | b'(' | b'{' | b'=')
+        } else {
+            false
+        };
+        if !in_single
+            && !in_double
+            && (matches!(bytes[index], b'*' | b'?' | b'[' | b'{') || tilde_is_glob)
+        {
             let marker = unique_internal_marker(command, "GLOB", dynamic_markers.len());
             masked.push_str(&marker);
             dynamic_markers.push(marker);
@@ -25378,7 +25462,7 @@ mod tests {
                 "TRUNCATE TABLE users;\n",
                 "safe.mysql",
                 "SELECT 1;\n",
-                "mysql app -e 'source",
+                "mysql app -e 'source ",
                 "'",
             ),
             (
